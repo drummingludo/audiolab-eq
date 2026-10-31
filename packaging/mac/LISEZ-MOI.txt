@@ -1,0 +1,32 @@
+AUDIO LAB EQ — Mac (Apple Silicon et Intel)
+Transversal Studio · Audio Lab « Chimiste du son »
+
+INSTALLATION
+1. Double-cliquez sur « Installer.command ».
+   Si macOS refuse de l'ouvrir (« développeur non identifié ») :
+   - clic droit sur Installer.command > Ouvrir > Ouvrir ;
+   - ou, sur macOS 15 et plus récent : Réglages Système > Confidentialité et sécurité,
+     tout en bas, bouton « Ouvrir quand même ».
+2. Relancez votre logiciel de musique.
+
+Le plugin apparaît sous le nom « Audio Lab EQ » (fabricant : Transversal Studio) :
+- Logic Pro, GarageBand : format AU (Audio Units > Transversal Studio)
+- Ableton Live, FL Studio, Cubase, Reaper, Studio One, Bitwig : format VST3
+
+PRISE EN MAIN
+- Clic dans la courbe : nouvelle bande (près des bords : coupe-bas / coupe-haut)
+- Glisser une poignée : fréquence et gain (Maj : réglage fin)
+- Molette sur une poignée : largeur (Q) · Alt + molette : plage de l'EQ dynamique
+- Alt + clic maintenu sur une poignée : écouter seulement cette bande
+- Double-clic : activer / désactiver la bande · Clic droit : forme, pente, Mid/Side…
+- Glisser dans le vide : sélectionner plusieurs bandes
+- « Dessiner » : tracez la courbe voulue, les bandes sont placées au relâchement
+- Cmd+Z / Cmd+Maj+Z : annuler / rétablir · Effacer : supprimer la sélection
+
+INSTALLATION MANUELLE (sans le script)
+- Audio Lab EQ.vst3      → ~/Library/Audio/Plug-Ins/VST3/
+- Audio Lab EQ.component → ~/Library/Audio/Plug-Ins/Components/
+
+NON COMPATIBLE : Pro Tools (format AAX uniquement).
+
+Code source et licence (AGPLv3) : https://github.com/drummingludo/audiolab-eq

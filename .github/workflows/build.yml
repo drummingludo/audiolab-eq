@@ -1,0 +1,130 @@
+name: Fabrication Mac et Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: Tests DSP et plugin (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libfreetype-dev libfontconfig1-dev ninja-build
+      - name: Compiler les tests
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DALEQ_TESTS=ON
+          cmake --build build --target ALEQDspTest ALEQProcessorTest
+      - name: Lancer les tests
+        run: |
+          ./build/ALEQDspTest_artefacts/Release/ALEQDspTest
+          ./build/ALEQProcessorTest_artefacts/Release/ALEQProcessorTest
+
+  mac:
+    name: Mac (VST3 + AU, Apple Silicon et Intel)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compiler
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target AudioLabEQ_VST3 AudioLabEQ_AU -j 4
+
+      - name: Signer (signature locale, sans compte Apple)
+        run: |
+          A=build/AudioLabEQ_artefacts/Release
+          codesign --force --deep --sign - "$A/VST3/Audio Lab EQ.vst3"
+          codesign --force --deep --sign - "$A/AU/Audio Lab EQ.component"
+          lipo -info "$A/VST3/Audio Lab EQ.vst3/Contents/MacOS/Audio Lab EQ"
+
+      - name: Valider (auval + pluginval)
+        run: |
+          A=build/AudioLabEQ_artefacts/Release
+          mkdir -p ~/Library/Audio/Plug-Ins/Components ~/Library/Audio/Plug-Ins/VST3
+          cp -R "$A/AU/Audio Lab EQ.component" ~/Library/Audio/Plug-Ins/Components/
+          cp -R "$A/VST3/Audio Lab EQ.vst3" ~/Library/Audio/Plug-Ins/VST3/
+          killall -9 AudioComponentRegistrar || true
+          sleep 3
+          auval -v aufx AlEq Trsv
+          curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+          unzip -q pv.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process --skip-gui-tests --validate ~/Library/Audio/Plug-Ins/VST3/"Audio Lab EQ.vst3"
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process --skip-gui-tests --validate ~/Library/Audio/Plug-Ins/Components/"Audio Lab EQ.component"
+
+      - name: Préparer le paquet Mac
+        run: |
+          A=build/AudioLabEQ_artefacts/Release
+          P="Audio Lab EQ - Mac"
+          mkdir -p "$P"
+          cp -R "$A/VST3/Audio Lab EQ.vst3" "$A/AU/Audio Lab EQ.component" "$P/"
+          cp packaging/mac/Installer.command packaging/mac/LISEZ-MOI.txt "$P/"
+          chmod +x "$P/Installer.command"
+          ditto -c -k --sequesterRsrc --keepParent "$P" AudioLabEQ-Mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioLabEQ-Mac
+          path: AudioLabEQ-Mac.zip
+
+  windows:
+    name: Windows (VST3)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compiler
+        run: |
+          cmake -B build -A x64
+          cmake --build build --config Release --target AudioLabEQ_VST3
+
+      - name: Valider (pluginval)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pv.zip
+          Expand-Archive pv.zip -DestinationPath pv
+          .\pv\pluginval.exe --strictness-level 10 --validate-in-process --skip-gui-tests --validate "build\AudioLabEQ_artefacts\Release\VST3\Audio Lab EQ.vst3"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Préparer le paquet Windows
+        shell: pwsh
+        run: |
+          $P = "Audio Lab EQ - Windows"
+          New-Item -ItemType Directory -Force -Path $P | Out-Null
+          Copy-Item -Recurse "build\AudioLabEQ_artefacts\Release\VST3\Audio Lab EQ.vst3" $P
+          Copy-Item packaging\windows\LISEZ-MOI.txt $P
+          Compress-Archive -Path $P -DestinationPath AudioLabEQ-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioLabEQ-Windows
+          path: AudioLabEQ-Windows.zip
+
+  publier:
+    name: Publier la version
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tests, mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Audio Lab EQ ${{ github.ref_name }}
+          files: |
+            AudioLabEQ-Mac.zip
+            AudioLabEQ-Windows.zip
+          body: |
+            Égaliseur paramétrique 24 bandes d'Audio Lab (Transversal Studio).
+            - Mac : VST3 + AU, Apple Silicon et Intel (AudioLabEQ-Mac.zip)
+            - Windows : VST3 64 bits (AudioLabEQ-Windows.zip)
+            Mode d'emploi dans le fichier LISEZ-MOI de chaque archive.

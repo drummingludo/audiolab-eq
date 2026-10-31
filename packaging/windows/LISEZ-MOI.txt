@@ -1,0 +1,15 @@
+AUDIO LAB EQ - Windows (VST3, 64 bits)
+Transversal Studio - Audio Lab "Chimiste du son"
+
+INSTALLATION
+1. Copiez le dossier "Audio Lab EQ.vst3" dans :
+   C:\Program Files\Common Files\VST3
+   (Windows demande une autorisation administrateur : acceptez.)
+2. Relancez votre logiciel de musique et lancez une recherche de plugins si besoin.
+
+Le plugin apparait sous le nom "Audio Lab EQ" (fabricant : Transversal Studio)
+dans Ableton Live, FL Studio, Cubase, Reaper, Studio One, Bitwig...
+
+NON COMPATIBLE : Pro Tools (format AAX uniquement).
+
+Code source et licence (AGPLv3) : https://github.com/drummingludo/audiolab-eq
