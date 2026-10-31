@@ -34,16 +34,16 @@ Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme
 
 ## Télécharger
 
-Chaque fabrication produit deux archives (onglet **Actions** > dernière fabrication > *Artifacts*) :
+Dernière version : page **[Releases](https://github.com/drummingludo/audiolab-eq/releases/latest)** du dépôt. Deux archives :
 - `AudioLabEQ-Mac.zip` : VST3 + AU, Apple Silicon et Intel, avec un installateur en un double-clic.
 - `AudioLabEQ-Windows.zip` : VST3 64 bits.
 
-Pour une version durable sur la page **Releases**, créer un tag `v…` : la fabrication y dépose alors les deux archives.
+Chaque envoi sur `main` met à jour la version indiquée dans `CMakeLists.txt` (`project(AudioLabEQ VERSION …)`) : changer ce numéro crée une nouvelle version.
 Mode d'emploi : fichier `LISEZ-MOI.txt` dans chaque archive. Pro Tools n'est pas compatible (format AAX).
 
 ## Fabrication et tests
 
-Chaque envoi sur `main` déclenche les tests (Linux), puis la fabrication sur des machines Mac et Windows de GitHub et la validation automatique (`auval` pour l'AU, `pluginval` niveau 10 pour tous les formats). Un tag `v…` publie la version.
+Chaque envoi sur `main` déclenche les tests (Linux), puis la fabrication sur des machines Mac et Windows de GitHub, la validation automatique (`auval` pour l'AU, `pluginval` niveau 10 pour tous les formats) et la publication sur la page Releases.
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release

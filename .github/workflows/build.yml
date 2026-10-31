@@ -109,17 +109,25 @@ jobs:
           path: AudioLabEQ-Windows.zip
 
   publier:
+    # Chaque envoi sur main publie (ou met à jour) la version indiquée dans CMakeLists.txt
     name: Publier la version
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [tests, mac, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+      - name: Numéro de version
+        id: version
+        run: echo "tag=v$(grep -oP 'project\(AudioLabEQ VERSION \K[0-9.]+' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          name: Audio Lab EQ ${{ github.ref_name }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Audio Lab EQ ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || steps.version.outputs.tag }}
+          overwrite_files: true
           files: |
             AudioLabEQ-Mac.zip
             AudioLabEQ-Windows.zip
