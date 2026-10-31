@@ -60,6 +60,12 @@ jobs:
           ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process --skip-gui-tests --validate ~/Library/Audio/Plug-Ins/VST3/"Audio Lab EQ.vst3"
           ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process --skip-gui-tests --validate ~/Library/Audio/Plug-Ins/Components/"Audio Lab EQ.component"
 
+      - name: Ouvrir l'interface (pluginval, tests de fenêtre)
+        continue-on-error: true
+        run: |
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate-in-process --validate ~/Library/Audio/Plug-Ins/Components/"Audio Lab EQ.component"
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate-in-process --validate ~/Library/Audio/Plug-Ins/VST3/"Audio Lab EQ.vst3"
+
       - name: Préparer le paquet Mac
         run: |
           A=build/AudioLabEQ_artefacts/Release
