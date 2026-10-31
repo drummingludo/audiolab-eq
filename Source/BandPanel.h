@@ -34,6 +34,14 @@ inline void headphones (juce::Graphics& g, juce::Rectangle<float> r, juce::Colou
     g.fillRoundedRectangle (r.getRight() - 4.2f, r.getY() + 7.5f, 3.2f, 5, 1.2f);
 }
 
+inline void cross (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour c)
+{
+    const auto m = r.getCentre();
+    g.setColour (c);
+    g.drawLine (m.x - 4, m.y - 4, m.x + 4, m.y + 4, 1.5f);
+    g.drawLine (m.x + 4, m.y - 4, m.x - 4, m.y + 4, 1.5f);
+}
+
 inline void trash (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour c)
 {
     r = r.withSizeKeepingCentre (12, 13);
@@ -50,19 +58,22 @@ inline void trash (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour c)
 class BandPanel : public juce::Component
 {
 public:
-    static constexpr int panelW = 540, singleH = 182, multiH = 78;
+    static constexpr int panelW = 560, singleH = 172, multiH = 78;
 
     BandPanel (Theme& t, AudioLabEqProcessor& p, EqDisplay& d)
         : theme (t), proc (p), display (d),
           onBtn (t, PillButton::Style::ibtn, {}), soloBtn (t, PillButton::Style::ibtn, {}),
-          delBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String::fromUTF8 ("Dynamique"))
+          delBtn (t, PillButton::Style::rst, {}), closeBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String::fromUTF8 ("Dynamique"))
     {
         namespace P = params;
         setInterceptsMouseClicks (true, true);
         onBtn.icon = icons::power;      onBtn.iconOnly = true;
         soloBtn.icon = icons::headphones; soloBtn.iconOnly = true;
         delBtn.icon = icons::trash;     delBtn.iconOnly = true;
-        for (auto* b : { &onBtn, &soloBtn, &delBtn, &dynBtn }) b->raised = true;
+        closeBtn.icon = icons::cross;   closeBtn.iconOnly = true;
+        for (auto* b : { &onBtn, &soloBtn, &delBtn, &closeBtn, &dynBtn }) b->raised = true;
+        closeBtn.setTooltip (fr ("Fermer le panneau (Échap)"));
+        closeBtn.onClick = [this] { display.clearSelection(); };
         onBtn.setTooltip (fr ("Activer / désactiver la bande (double-clic sur la poignée)"));
         soloBtn.setTooltip (fr ("Écouter seulement la zone du spectre traitée par la bande (ou Alt + clic maintenu sur la poignée)"));
         delBtn.setTooltip (fr ("Supprimer la bande (touche Effacer)"));
@@ -104,7 +115,7 @@ public:
         placeBox.onChange = [this] { applyChoice (placeBox, params::fPlace); };
 
         for (juce::Component* c : { (juce::Component*) &onBtn, (juce::Component*) &soloBtn, (juce::Component*) &delBtn,
-                                    (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox,
+                                    (juce::Component*) &closeBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox,
                                     (juce::Component*) &placeBox })
             addChildComponent (c);
         setVisible (false);
@@ -123,7 +134,7 @@ public:
         kFreq.reset(); kGain.reset(); kQ.reset(); kThr.reset(); kRange.reset(); vAtt.reset(); vRel.reset();
 
         const bool single = count == 1, any = count >= 1;
-        for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &placeBox }) c->setVisible (any);
+        for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &closeBtn, (juce::Component*) &placeBox }) c->setVisible (any);
         for (auto* c : { (juce::Component*) &soloBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox })
             c->setVisible (single);
 
@@ -214,11 +225,10 @@ public:
         }
         g.setColour (p.text); g.setFont (theme.ui (14, 600));
         g.drawText (title, juce::Rectangle<float> (x, 12, count == 1 ? 66.0f : 200.0f, 28), juce::Justification::centredLeft, false);
-        if (count == 1)
-        {
-            g.setColour (p.dark ? juce::Colours::white.withAlpha (0.1f) : juce::Colours::black.withAlpha (0.08f));
-            g.fillRect (sepX, 50.0f, 1.0f, 70.0f);
-        }
+        const auto sepCol = p.dark ? juce::Colours::white.withAlpha (0.1f) : juce::Colours::black.withAlpha (0.08f);
+        g.setColour (sepCol);
+        g.fillRect (sepCloseX, 17.0f, 1.0f, 18.0f);   // avant la croix de fermeture
+        if (count == 1) g.fillRect (sepX, 50.0f, 1.0f, 70.0f);
         else
         {
             g.setColour (p.muted); g.setFont (theme.ui (11.5f));
@@ -230,15 +240,18 @@ public:
 private:
     void layout()
     {
+        // ligne 1 : … · active · écouter · supprimer | fermer
         const int y1 = 12, h1 = 28, right = getWidth() - 14;
-        delBtn.setBounds (right - 28, y1, 28, h1);
+        closeBtn.setBounds (right - 28, y1, 28, h1);
+        sepCloseX = (float) right - 28 - 7;
+        delBtn.setBounds (right - 28 - 14 - 28, y1, 28, h1);
         if (count == 1)
         {
-            soloBtn.setBounds (right - 28 - 6 - 28, y1, 28, h1);
-            onBtn.setBounds (right - 3 * 28 - 12, y1, 28, h1);
-            shapeBox.setBounds (106, y1, 108, h1);
-            slopeBox.setBounds (220, y1, 100, h1);
-            placeBox.setBounds (326, y1, 88, h1);
+            soloBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
+            onBtn.setBounds (soloBtn.getX() - 4 - 28, y1, 28, h1);
+            shapeBox.setBounds (106, y1, 104, h1);
+            slopeBox.setBounds (216, y1, 96, h1);
+            placeBox.setBounds (318, y1, onBtn.getX() - 8 - 318, h1);
 
             const int y2 = 50, kw = 70, kh = 76;
             int x = 14;
@@ -253,7 +266,7 @@ private:
         }
         else
         {
-            onBtn.setBounds (right - 2 * 28 - 6, y1, 28, h1);
+            onBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
             placeBox.setBounds (220, y1, 104, h1);
         }
     }
@@ -282,8 +295,8 @@ private:
     EqDisplay& display;
     int band = -1, count = 0;
     juce::String title;
-    float sepX = 246;
-    PillButton onBtn, soloBtn, delBtn, dynBtn;
+    float sepX = 246, sepCloseX = 0;
+    PillButton onBtn, soloBtn, delBtn, closeBtn, dynBtn;
     juce::ComboBox shapeBox, slopeBox, placeBox;
     std::unique_ptr<ArcKnob> kFreq, kGain, kQ, kThr, kRange;
     std::unique_ptr<ValueBox> vAtt, vRel;

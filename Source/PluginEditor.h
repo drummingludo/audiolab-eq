@@ -56,7 +56,6 @@ private:
     Shadow shadow { *this };
     audiolab::BandPanel panel;
     audiolab::Toast toast { theme };
-    bool panelOnTop = false;
 
     // barre du bas
     audiolab::SegButtons phaseSeg { theme, { juce::String::fromUTF8 ("Zéro latence"), juce::String::fromUTF8 ("Linéaire") } };

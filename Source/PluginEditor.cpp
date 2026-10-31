@@ -132,28 +132,14 @@ void AudioLabEqEditor::placePanel()
         shadow.repaint();
         return;
     }
-    // Centré sous les poignées sélectionnées, calé dans la courbe (marges de 24 px).
-    // Si le panneau cacherait une poignée sélectionnée, il passe en haut de la courbe.
+    // Comme Pro-Q : toujours en bas de la courbe, il suit la bande de gauche à droite.
     const auto r = display.plot().translated ((float) display.getX(), (float) display.getY());
-    juce::Array<juce::Point<float>> pts;
     float cx = 0;
-    for (int b : display.getSelection())
-    {
-        const auto pt = display.nodePos (b) + display.getPosition().toFloat();
-        pts.add (pt); cx += pt.x;
-    }
-    cx /= (float) pts.size();
+    for (int b : display.getSelection()) cx += display.nodePos (b).x;
+    cx = cx / (float) display.getSelection().size() + (float) display.getX();
     const int w = panel.getWidth(), h = panel.getHeight();
-    const int x = juce::jlimit (juce::roundToInt (r.getX()) + 24, juce::roundToInt (r.getRight()) - 24 - w, juce::roundToInt (cx - w * 0.5f));
-    const juce::Rectangle<int> bottom (x, juce::roundToInt (r.getBottom()) - 28 - h, w, h), top (x, juce::roundToInt (r.getY()) + 28, w, h);
-    auto hides = [&pts] (juce::Rectangle<int> box, float margin)
-    {
-        for (auto& pt : pts) if (box.toFloat().expanded (margin).contains (pt)) return true;
-        return false;
-    };
-    if (! panelOnTop && hides (bottom, 14) && ! hides (top, 14)) panelOnTop = true;
-    else if (panelOnTop && (! hides (bottom, 40) || hides (top, 14))) panelOnTop = false;
-    const auto nb = panelOnTop ? top : bottom;
+    const int x = juce::jlimit (juce::roundToInt (r.getX()) + 12, juce::roundToInt (r.getRight()) - 12 - w, juce::roundToInt (cx - w * 0.5f));
+    const juce::Rectangle<int> nb (x, juce::roundToInt (r.getBottom()) - 12 - h, w, h);
     if (panel.getBounds() != nb) { panel.setBounds (nb); shadow.repaint(); }
 }
 

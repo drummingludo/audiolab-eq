@@ -45,6 +45,9 @@ public:
 
     static constexpr double fMin = 20.0, fMax = 20000.0;
     static constexpr float rightGutter = 48.0f, bottomGutter = 24.0f;
+    // Échelle dB comme Pro-Q : +plage en haut, −plage au-dessus de la zone du panneau de bande
+    // (le 0 dB est donc plus haut que le milieu ; sous −plage, la grille continue derrière le panneau).
+    static constexpr float curveTop = 12.0f, panelZone = 200.0f;
 
     juce::Rectangle<float> plot() const;
     juce::Point<float> nodePos (int band) const;

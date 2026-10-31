@@ -64,13 +64,15 @@ double EqDisplay::fOf (float x) const
 }
 float EqDisplay::yOf (double db) const
 {
-    auto r = plot().reduced (0, 12);
-    return r.getCentreY() - (float) (db / range()) * r.getHeight() * 0.5f;
+    auto r = plot();
+    const float top = r.getY() + curveTop, bot = r.getBottom() - panelZone;
+    return top + (float) ((range() - db) / (2.0 * range())) * (bot - top);
 }
 double EqDisplay::dbOf (float y) const
 {
-    auto r = plot().reduced (0, 12);
-    return (r.getCentreY() - y) / (r.getHeight() * 0.5f) * range();
+    auto r = plot();
+    const float top = r.getY() + curveTop, bot = r.getBottom() - panelZone;
+    return range() - (double) ((y - top) / (bot - top)) * 2.0 * range();
 }
 float EqDisplay::yAn (double db) const
 {
@@ -255,7 +257,7 @@ void EqDisplay::paint (juce::Graphics& g)
     }
     const double rg = range();
     const double stepDb = rg <= 3 ? 1 : rg <= 6 ? 2 : rg <= 12 ? 3 : 6;
-    for (double db = -rg; db <= rg + 1e-6; db += stepDb)
+    for (double db = rg; yOf (db) <= r.getBottom() + 0.5f; db -= stepDb)   // la grille continue sous −plage
     {
         g.setColour (std::abs (db) < 1e-6 ? p.grid2 : p.grid.withAlpha (0.7f));
         g.drawHorizontalLine (juce::roundToInt (yOf (db)), r.getX(), r.getRight());
@@ -817,7 +819,7 @@ void EqDisplay::mouseDrag (const juce::MouseEvent& e)
     const float fine = e.mods.isShiftDown() ? 0.15f : 1.0f;
     const float dx = (e.position.x - downPos.x) * fine, dy = (e.position.y - downPos.y) * fine;
     const double octPerPx = std::log (fMax / fMin) / r.getWidth();
-    const double dbPerPx = 2.0 * range() / (r.getHeight() - 24.0);
+    const double dbPerPx = (yOf (0) - yOf (range())) > 0 ? range() / (yOf (0) - yOf (range())) : 0.1;
     const double sc = std::max (0.01, proc.gainScale());
     const bool lockF = e.mods.isCommandDown() && ! e.mods.isAltDown();   // Cmd : verticale seulement
     for (const auto& st : starts)
