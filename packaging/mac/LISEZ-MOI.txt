@@ -20,7 +20,7 @@ PRISE EN MAIN
 - Alt + clic maintenu sur une poignée : écouter seulement cette bande
 - Double-clic : activer / désactiver la bande · Clic droit : forme, pente, Mid/Side…
 - Glisser dans le vide : sélectionner plusieurs bandes
-- « Dessiner » : tracez la courbe voulue, les bandes sont placées au relâchement
+- Clic droit dans le vide › Dessiner la courbe : les bandes sont placées au relâchement
 - Cmd+Z / Cmd+Maj+Z : annuler / rétablir · Effacer : supprimer la sélection
 
 INSTALLATION MANUELLE (sans le script)

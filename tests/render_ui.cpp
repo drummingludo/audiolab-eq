@@ -60,10 +60,30 @@ int main (int argc, char** argv)
         for (int i = 0; i < (int) l.size(); ++i) if (juce::String::fromUTF8 (l[(size_t) i].name).startsWith (juce::String::fromUTF8 (name))) proc->applyPreset (i);
     };
 
+    auto& P_phase = *proc->apvts.getParameter (audiolab::params::phase);
     steps.push_back ({ 0,    [&] { theme ("light"); preset ("Voix — clarté"); rebuild(); ed->getDisplay().select (2); } });
-    steps.push_back ({ 1800, [&] { shot ("01_clair_voix_clarte"); theme ("dark"); preset ("Mid/Side"); rebuild(); ed->getDisplay().select (1); ed->getDisplay().testHover (1); } });
-    steps.push_back ({ 1500, [&] { shot ("02_sombre_mid_side_survol"); preset ("Voix — de-esser"); rebuild(); ed->getDisplay().select (1); } });
-    steps.push_back ({ 1800, [&] { shot ("03_sombre_deesser_dynamique"); theme ("light"); rebuild();
+    steps.push_back ({ 1800, [&] { shot ("01_clair_bande3"); theme ("dark"); preset ("Voix — de-esser"); rebuild(); ed->getDisplay().select (1); } });
+    steps.push_back ({ 1800, [&] { shot ("02_sombre_dynamique"); theme ("light"); preset ("Défaut"); rebuild(); } });
+    auto click = [&] (juce::Point<float> pos)
+    {
+        auto& d = ed->getDisplay();
+        auto src = juce::Desktop::getInstance().getMainMouseSource();
+        const auto now = juce::Time::getCurrentTime();
+        juce::MouseEvent down (src, pos, {}, juce::MouseInputSource::defaultPressure, 0, 0, 0, 0, &d, &d, now, pos, now, 1, false);
+        juce::MouseEvent up (src, pos, {}, juce::MouseInputSource::defaultPressure, 0, 0, 0, 0, &d, &d, now, pos, now, 1, false);
+        d.mouseDown (down); d.mouseUp (up);
+    };
+    steps.push_back ({ 1200, [&] { shot ("03_clair_vide_aide");
+        // gestes : croix de l'aide, puis clic dans la courbe → nouvelle bande + panneau
+        auto& d = ed->getDisplay();
+        const auto r = d.plot();
+        click ({ r.getRight() - 16 - 16 - 11, r.getY() + 16 + 12 + 11 });
+        std::printf ("aide masquée : %s\n", (bool) proc->ui.getProperty ("helpHidden", false) ? "oui" : "NON");
+        click ({ r.getX() + r.getWidth() * 0.5f, r.getY() + 120 });
+        int used = 0; for (int b = 0; b < audiolab::eq::maxBands; ++b) used += proc->isUsed (b) ? 1 : 0;
+        std::printf ("clic dans la courbe : %d bande(s), sélection %d\n", used, d.getSelection().size());
+        proc->ui.setProperty ("helpHidden", false, nullptr);
+        preset ("Défaut"); d.clearSelection();
         ed->getDisplay().testSketch ([] (double f) {
             double v = 5.0 * std::exp (-std::pow (std::log2 (f / 3000.0) / 0.6, 2));
             v += -4.0 / (1 + std::pow (10000.0 / f, 3));
@@ -71,11 +91,13 @@ int main (int argc, char** argv)
             return (float) std::max (-12.0, v);
         }); } });
     steps.push_back ({ 1500, [&] { shot ("04_clair_dessin_ajuste"); ed->getDisplay().selectAll(); } });
-    steps.push_back ({ 800,  [&] { shot ("05_clair_multi_selection"); proc->apvts.getParameter (audiolab::params::phase)->setValueNotifyingHost (1.0f);
-                                   preset ("Kick"); ed->getDisplay().clearSelection(); ed->getDisplay().select (2); } });
-    steps.push_back ({ 1800, [&] { shot ("06_clair_phase_lineaire_kick"); proc->apvts.getParameter (audiolab::params::phase)->setValueNotifyingHost (0.0f);
-                                   preset ("Défaut"); theme ("dark"); rebuild(); ed->setSize (AudioLabEqEditor::baseW * 7 / 10, AudioLabEqEditor::baseH * 7 / 10); } });
-    steps.push_back ({ 1200, [&] { shot ("07_sombre_defaut_petite_taille"); juce::MessageManager::getInstance()->stopDispatchLoop(); } });
+    steps.push_back ({ 800,  [&] { shot ("05_clair_multi_selection"); preset ("Kick"); ed->getDisplay().clearSelection(); ed->getDisplay().select (2); } });
+    steps.push_back ({ 1500, [&] { shot ("06_clair_panneau_en_haut"); P_phase.setValueNotifyingHost (1.0f); preset ("Mid/Side"); theme ("dark");
+                                   rebuild(); ed->getDisplay().select (1); ed->getDisplay().testHover (1); } });
+    steps.push_back ({ 1800, [&] { shot ("07_sombre_mid_side_lineaire"); P_phase.setValueNotifyingHost (0.0f); preset ("Défaut");
+                                   proc->ui.setProperty ("helpHidden", true, nullptr); rebuild();
+                                   ed->setSize (AudioLabEqEditor::baseW * 7 / 10, AudioLabEqEditor::baseH * 7 / 10); } });
+    steps.push_back ({ 1200, [&] { shot ("08_sombre_vide_petite_taille"); juce::MessageManager::getInstance()->stopDispatchLoop(); } });
 
     std::function<void (size_t)> next = [&] (size_t i)
     {

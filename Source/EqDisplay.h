@@ -41,8 +41,13 @@ public:
     std::function<void (bool)> onSketchModeChanged;
 
     void refresh() { dirty = true; repaint(); }
+    std::function<void()> onCurvesChanged;   // poignées déplacées : le panneau flottant suit
 
-    static constexpr double fMin = 10.0, fMax = 30000.0;
+    static constexpr double fMin = 20.0, fMax = 20000.0;
+    static constexpr float rightGutter = 48.0f, bottomGutter = 24.0f;
+
+    juce::Rectangle<float> plot() const;
+    juce::Point<float> nodePos (int band) const;
 
     // Outils de test (captures hors DAW)
     void testSketch (const std::function<float (double)>& curve)
@@ -63,8 +68,11 @@ private:
     void beginEdit();
     void endEdit();
 
-    juce::Rectangle<float> plot() const;
     juce::Rectangle<float> pianoArea() const;
+    juce::Rectangle<float> helpCard() const;
+    juce::Rectangle<float> helpClose() const;
+    bool helpShown() const;
+    void paintEmpty (juce::Graphics&);
     juce::Rectangle<float> rangeButton() const;
     float xOf (double f) const;
     double fOf (float x) const;
@@ -74,7 +82,6 @@ private:
     double range() const;
 
     int hitBand (juce::Point<float> p) const;
-    juce::Point<float> nodePos (int band) const;
     void paintAnalyzer (juce::Graphics&, const std::vector<float>& col, juce::Colour c, bool fill);
     void paintPiano (juce::Graphics&);
     void paintReadout (juce::Graphics&, int band);

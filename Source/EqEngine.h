@@ -74,6 +74,7 @@ struct DynSettings
 {
     bool on = false;
     double thrDb = -30.0, rangeDb = -6.0;
+    double attackMs = 10.0, releaseMs = 150.0;
 };
 
 class Engine
@@ -86,13 +87,6 @@ public:
         fs = sampleRate;
         for (auto& b : bands) b.reset();
         soloWet = 0; soloBandCur = -1;
-        updateEnvCoefs();
-    }
-
-    void setDynTimes (double attackMs, double releaseMs)
-    {
-        atkMs = attackMs; relMs = releaseMs;
-        updateEnvCoefs();
     }
 
     // Cibles venant des paramètres (bloc audio). scale : échelle de gain (1 = 100 %).
@@ -102,6 +96,13 @@ public:
         b.target = spec;
         b.dyn = dyn;
         b.scale = scale;
+        if (dyn.attackMs != b.coefAtk || dyn.releaseMs != b.coefRel)
+        {
+            // temps propres à chaque bande
+            b.coefAtk = dyn.attackMs; b.coefRel = dyn.releaseMs;
+            b.envA = std::exp (-1.0 / (std::max (0.1, dyn.attackMs) * 0.001 * fs));
+            b.envR = std::exp (-1.0 / (std::max (1.0, dyn.releaseMs) * 0.001 * fs));
+        }
     }
 
     void setSolo (int band) { soloTarget = band; }
@@ -202,10 +203,12 @@ private:
         SectionRT det;
         double detSt[2][2] {};
         double env = 0, dynOffset = 0;
+        double envA = 0.99, envR = 0.999, coefAtk = -1, coefRel = -1;
         std::atomic<float> dynOut { 0.0f };
 
         void reset()
         {
+            coefAtk = coefRel = -1;
             init = false; structure = false; wet = 0; wetTarget = 0; wetStart = 0; nsec = 0; detValid = false;
             env = 0; dynOffset = 0; dynOut.store (0.0f);
             clearStates();
@@ -291,16 +294,10 @@ private:
         }
     };
 
-    void updateEnvCoefs()
-    {
-        envA = std::exp (-1.0 / (std::max (0.1, atkMs) * 0.001 * fs));
-        envR = std::exp (-1.0 / (std::max (1.0, relMs) * 0.001 * fs));
-    }
-
-    inline void follow (Band& b, double d)
+    static inline void follow (Band& b, double d)
     {
         const double x = std::abs (d);
-        b.env = x > b.env ? envA * b.env + (1.0 - envA) * x : envR * b.env + (1.0 - envR) * x;
+        b.env = x > b.env ? b.envA * b.env + (1.0 - b.envA) * x : b.envR * b.env + (1.0 - b.envR) * x;
     }
 
     // Courbe de réponse de la dynamique : genou doux de 6 dB, gain qui suit le dépassement
@@ -392,7 +389,7 @@ private:
         }
     }
 
-    double fs = 48000.0, atkMs = 10.0, relMs = 150.0, envA = 0.99, envR = 0.999;
+    double fs = 48000.0;
     std::array<Band, maxBands> bands;
     std::atomic<int> soloTarget { -1 };
     int soloBandCur = -1;

@@ -9,7 +9,10 @@ struct Pal
 {
     bool dark = false;
     juce::Colour bg, bg2, bg3, bg4, text, dim, muted, border, accent, green, red, orange, yellow, teal,
-                 cv, cv2, grid, grid2, txt, txt2;
+                 cv, cv2, grid, grid2, txt, txt2, win, panel;
+    // fond des commandes : « raised » = posées sur le panneau flottant (plus clair en thème sombre)
+    juce::Colour ctl (bool raised) const { return raised && dark ? bg4 : bg3; }
+    juce::Colour ctlHover (bool raised) const { return raised && dark ? juce::Colour (0xFF48484A) : bg4; }
 };
 
 inline Pal lightPal()
@@ -22,7 +25,8 @@ inline Pal lightPal()
     p.accent = C (0xFF007AFF); p.green = C (0xFF34C759); p.red = C (0xFFFF3B30); p.orange = C (0xFFFF9500);
     p.yellow = C (0xFFFFCC00); p.teal = C (0xFF5AC8FA);
     p.cv = C (0xFFFAFAFC); p.cv2 = C (0xFFF2F2F7); p.grid = C (0xFFE5E5EA); p.grid2 = C (0xFFD1D1D6);
-    p.txt = C (0xFF8E8E93); p.txt2 = C (0xFF3A3A3C);
+    p.txt = C (0xFF6E6E73); p.txt2 = C (0xFF3A3A3C);
+    p.win = C (0xFFFFFFFF); p.panel = C (0xF7FFFFFF);
     return p;
 }
 
@@ -37,6 +41,7 @@ inline Pal darkPal()
     p.yellow = C (0xFFFFD60A); p.teal = C (0xFF64D2FF);
     p.cv = C (0xFF1C1C1E); p.cv2 = C (0xFF2C2C2E); p.grid = C (0xFF3A3A3C); p.grid2 = C (0xFF48484A);
     p.txt = C (0xFF8E8E93); p.txt2 = C (0xFFD1D1D6);
+    p.win = C (0xFF161618); p.panel = C (0xFF2C2C2E);
     return p;
 }
 

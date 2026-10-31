@@ -2,7 +2,10 @@
 #include "PluginProcessor.h"
 #include "Widgets.h"
 #include "EqDisplay.h"
+#include "BandPanel.h"
 
+// Fenêtre v2 : la courbe occupe tout le haut, le panneau de la bande flotte sous la courbe,
+// les réglages généraux sont dans la barre du bas.
 class AudioLabEqEditor : public juce::AudioProcessorEditor,
                          private juce::Timer,
                          private juce::DarkModeSettingListener
@@ -15,7 +18,7 @@ public:
     void resized() override;
     bool keyPressed (const juce::KeyPress&) override;
 
-    static constexpr int baseW = 1160, baseH = 700;
+    static constexpr int baseW = 1120, baseH = 624;
 
     audiolab::EqDisplay& getDisplay() { return display; }   // tests
 
@@ -29,13 +32,20 @@ private:
         AudioLabEqEditor& ed;
     };
 
+    // Ombre du panneau flottant, peinte au-dessus de la courbe
+    class Shadow : public juce::Component
+    {
+    public:
+        explicit Shadow (AudioLabEqEditor& e) : ed (e) { setInterceptsMouseClicks (false, false); }
+        void paint (juce::Graphics& g) override;
+        AudioLabEqEditor& ed;
+    };
+
     void timerCallback() override;
     void darkModeSettingChanged() override { applyTheme(); }
     void applyTheme();
-    void rebuildBandPanel();
-    void syncBandPanel();
-    void layoutBandPanel();
-    juce::Rectangle<int> panelArea() const { return { 16, 532, baseW - 32, 154 }; }
+    void rebuildPanel();
+    void placePanel();
 
     AudioLabEqProcessor& proc;
     audiolab::Theme theme;
@@ -43,26 +53,18 @@ private:
     juce::TooltipWindow tooltips { nullptr, 700 };
     Content content { *this };
     audiolab::EqDisplay display;
+    Shadow shadow { *this };
+    audiolab::BandPanel panel;
     audiolab::Toast toast { theme };
+    bool panelOnTop = false;
 
-    // barre du haut
-    juce::ComboBox presetBox, analyzerBox;
-    audiolab::PillButton undoBtn, redoBtn, abA, abB, abCopy, drawBtn, bypassBtn;
+    // barre du bas
     audiolab::SegButtons phaseSeg { theme, { juce::String::fromUTF8 ("Zéro latence"), juce::String::fromUTF8 ("Linéaire") } };
-    std::unique_ptr<juce::ParameterAttachment> bypassAtt;
-    bool bypassed = false;
-
-    // panneau de bande
-    int panelBand = -1, panelCount = 0;
-    juce::String panelTitle;
-    audiolab::PillButton onBtn, soloBtn, delBtn, dynBtn;
-    juce::ComboBox shapeBox, slopeBox;
-    audiolab::SegButtons placeSeg { theme, audiolab::params::placeShort() };
-    std::unique_ptr<audiolab::ArcKnob> kFreq, kGain, kQ, kThr, kRange;
-
-    // réglages généraux
-    std::unique_ptr<audiolab::ArcKnob> kOut, kScale, kAtk, kRel;
+    juce::ComboBox analyzerBox;
+    std::unique_ptr<audiolab::ValueBox> vScale, vOut;
     audiolab::PillButton autoBtn;
+
+    std::unique_ptr<juce::ParameterAttachment> bypassAtt;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioLabEqEditor)
 };

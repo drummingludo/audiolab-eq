@@ -1,4 +1,4 @@
-// Paramètres d'Audio Lab EQ : 24 bandes + réglages généraux, presets d'usine.
+// Paramètres d'Audio Lab EQ : 24 bandes + réglages généraux, réglages types (tests, rendus).
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "EqMath.h"
@@ -21,17 +21,20 @@ constexpr const char* fPlace = "place";
 constexpr const char* fDyn   = "dyn";
 constexpr const char* fThr   = "thr";
 constexpr const char* fRange = "range";
-constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange };
-constexpr int numBandFields = 11;
+constexpr const char* fAtt   = "att";
+constexpr const char* fRel   = "rel";
+constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange, fAtt, fRel };
+constexpr int numBandFields = 13;
 
 constexpr const char* outGain   = "out_gain";
 constexpr const char* gainScale = "gain_scale";
 constexpr const char* phase     = "phase";
 constexpr const char* autoGain  = "auto_gain";
-constexpr const char* attack    = "dyn_attack";
-constexpr const char* release   = "dyn_release";
 constexpr const char* bypass    = "bypass";
-constexpr const char* globalIds[] = { outGain, gainScale, phase, autoGain, attack, release };
+constexpr const char* globalIds[] = { outGain, gainScale, phase, autoGain };
+// Réglages globaux de la v1.0 (remplacés par Attaque / Retour par bande), relus à l'ouverture d'anciens projets
+constexpr const char* legacyAttack  = "dyn_attack";
+constexpr const char* legacyRelease = "dyn_release";
 
 inline juce::String U (const char* s) { return juce::String::fromUTF8 (s); }
 
@@ -86,7 +89,10 @@ inline juce::NormalisableRange<float> logRange (float lo, float hi)
              [] (float a, float b, float v) { return std::log (v / a) / std::log (b / a); },
              [] (float a, float b, float v) { return juce::jlimit (a, b, v); } };
 }
-inline juce::NormalisableRange<float> freqRange() { return logRange (10.0f, 30000.0f); }
+inline juce::NormalisableRange<float> freqRange() { return logRange (20.0f, 20000.0f); }
+inline juce::NormalisableRange<float> attackRange()  { juce::NormalisableRange<float> r (0.5f, 200.0f, 0.1f); r.setSkewForCentre (15.0f); return r; }
+inline juce::NormalisableRange<float> releaseRange() { juce::NormalisableRange<float> r (10.0f, 2000.0f, 1.0f); r.setSkewForCentre (200.0f); return r; }
+inline juce::String fmtMs (float v) { return v < 10 ? juce::String (v, 1) + " ms" : juce::String (juce::roundToInt (v)) + " ms"; }
 inline juce::NormalisableRange<float> qRange()    { return logRange (0.025f, 40.0f); }
 
 // ── Création ────────────────────────────────────────────────────────────
@@ -94,7 +100,7 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 {
     using namespace juce;
     AudioProcessorValueTreeState::ParameterLayout layout;
-    auto pid = [] (const String& id) { return ParameterID { id, 1 }; };
+    auto pid = [] (const String& id, int version = 1) { return ParameterID { id, version }; };
 
     for (int b = 0; b < maxBands; ++b)
     {
@@ -116,6 +122,10 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return juce::String (v, 1); })));
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRange)), pre + U ("Plage dynamique"), NormalisableRange<float> (-30.0f, 30.0f, 0.01f), -6.0f,
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return fmtDb (v, 1); })));
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fAtt), 2), pre + U ("Attaque"), attackRange(), 10.0f,
+            AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRel), 2), pre + U ("Retour"), releaseRange(), 150.0f,
+            AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
         layout.add (std::move (grp));
     }
 
@@ -125,16 +135,6 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
         AudioParameterFloatAttributes().withLabel ("%").withStringFromValueFunction ([] (float v, int) { return String (juce::roundToInt (v)); })));
     layout.add (std::make_unique<AudioParameterChoice> (pid (phase), U ("Mode de phase"), phaseNames(), 0));
     layout.add (std::make_unique<AudioParameterBool> (pid (autoGain), U ("Gain auto"), false));
-    {
-        NormalisableRange<float> r (0.5f, 200.0f, 0.1f); r.setSkewForCentre (15.0f);
-        layout.add (std::make_unique<AudioParameterFloat> (pid (attack), U ("Attaque (dynamique)"), r, 10.0f,
-            AudioParameterFloatAttributes().withLabel ("ms")));
-    }
-    {
-        NormalisableRange<float> r (10.0f, 2000.0f, 1.0f); r.setSkewForCentre (200.0f);
-        layout.add (std::make_unique<AudioParameterFloat> (pid (release), U ("Relâchement (dynamique)"), r, 150.0f,
-            AudioParameterFloatAttributes().withLabel ("ms")));
-    }
     layout.add (std::make_unique<AudioParameterBool> (pid (bypass), "Bypass", false));
     return layout;
 }

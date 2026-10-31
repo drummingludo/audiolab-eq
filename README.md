@@ -5,13 +5,14 @@ L'égaliseur d'**Audio Lab** (« Chimiste du son », Transversal Studio) en plug
 Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme pour l'apprentissage :
 
 - **24 bandes**, chacune : cloche, low shelf, high shelf, coupe-bas, coupe-haut, notch, passe-bande ou tilt ; pentes de 6 à 96 dB/octave pour les coupes.
-- **EQ dynamique par bande** : seuil et plage (positive ou négative), attaque / retour communs. Exemples : de-esser, anti-résonances qui ne creusent que lorsque c'est nécessaire.
+- **EQ dynamique par bande** : seuil, plage (positive ou négative), attaque et retour propres à chaque bande. Exemples : de-esser, anti-résonances qui ne creusent que lorsque c'est nécessaire.
 - **Placement par bande** : stéréo, gauche, droite, **Mid** ou **Side** ; deux courbes s'affichent quand le traitement diffère entre Mid et Side (ou gauche et droite).
 - **Deux modes de phase** : *Zéro latence* (filtres analogiques modélisés, sans latence) et *Phase linéaire* (FIR symétriques, aucune rotation de phase, latence compensée par le logiciel).
 - **Analyseur de spectre** avant / après (pente d'affichage de 4,5 dB/octave), **clavier de piano** sous la courbe et nom de la note de chaque bande.
-- **Mode « Dessiner »** : tracez la courbe voulue, les bandes sont placées et réglées automatiquement au relâchement.
+- **Dessiner la courbe** (clic droit dans la courbe) : tracez la courbe voulue, les bandes sont placées et réglées automatiquement au relâchement.
 - **Écoute d'une bande** (Alt + clic maintenu ou bouton *Écouter*) pour entendre seulement la zone traitée.
-- Annuler / rétablir, comparaison **A/B**, **échelle de gain** (0–200 %), **gain auto** pour comparer à niveau égal, 13 presets d'usine, thème clair / sombre qui suit l'ordinateur, fenêtre redimensionnable.
+- Interface épurée : la courbe occupe toute la fenêtre, les réglages de la bande sélectionnée apparaissent dans un **panneau flottant** sous la courbe.
+- Annuler / rétablir (Cmd+Z), **échelle de gain** (0–200 %), **gain auto** pour comparer à niveau égal, thème clair / sombre qui suit l'ordinateur, fenêtre redimensionnable.
 - Le réglage par défaut est **neutre** : aucune bande, le son passe sans modification.
 
 ## Prise en main
@@ -25,7 +26,8 @@ Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme
 | Alt + molette | Plage de l'EQ dynamique |
 | Alt + clic maintenu | Écouter seulement cette bande |
 | Double-clic sur une poignée | Activer / désactiver la bande |
-| Clic droit | Forme, pente, placement, dynamique, suppression |
+| Clic droit sur une poignée | Forme, pente, placement, dynamique, suppression |
+| Clic droit dans le vide | Ajouter une bande d'une forme précise, dessiner la courbe, afficher l'aide |
 | Glisser dans le vide | Sélectionner plusieurs bandes, puis les déplacer ensemble |
 | Effacer | Supprimer la sélection |
 | Cmd+Z / Cmd+Maj+Z | Annuler / rétablir |
@@ -56,7 +58,7 @@ Tests (Linux ou Mac) :
 cmake -B build -DALEQ_TESTS=ON -DALEQ_STANDALONE=ON
 cmake --build build --target ALEQDspTest ALEQProcessorTest ALEQRenderUI
 ./build/ALEQDspTest_artefacts/Release/ALEQDspTest            # réponse mesurée = courbe affichée, Mid/Side, dynamique, phase linéaire
-./build/ALEQProcessorTest_artefacts/Release/ALEQProcessorTest  # presets, annuler, A/B, état, latence, mono, charge CPU
+./build/ALEQProcessorTest_artefacts/Release/ALEQProcessorTest  # réglages types, annuler, état, projets v1.0, latence, mono, charge CPU
 ./build/ALEQRenderUI_artefacts/Release/ALEQRenderUI /tmp       # captures PNG de l'interface
 ```
 

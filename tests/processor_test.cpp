@@ -62,6 +62,31 @@ int main()
                && juce::roundToInt (q.bandValue (1, P::fPlace)) == (int) audiolab::eq::Place::side, "état rechargé");
         std::printf ("5. Sauvegarde / rechargement de l'état : %d octets\n", (int) mb.getSize());
 
+        // Attaque / Retour propres à chaque bande, conservés à la sauvegarde
+        p.setBandValue (0, P::fAtt, 2.0f); p.setBandValue (1, P::fRel, 900.0f);
+        juce::MemoryBlock mb2; p.getStateInformation (mb2);
+        AudioLabEqProcessor q2; q2.setStateInformation (mb2.getData(), (int) mb2.getSize());
+        CHECK (std::abs (q2.bandValue (0, P::fAtt) - 2.0f) < 0.05f && std::abs (q2.bandValue (1, P::fRel) - 900.0f) < 1.0f
+               && std::abs (q2.bandValue (1, P::fAtt) - 10.0f) < 0.05f, "attaque / retour par bande rechargés");
+
+        // Projet v1.0 : réglages communs « dyn_attack / dyn_release » reportés sur chaque bande
+        {
+            auto st = juce::ValueTree::fromXml (*juce::AudioProcessor::getXmlFromBinary (mb.getData(), (int) mb.getSize()));
+            for (int i = st.getNumChildren(); --i >= 0;)
+            {
+                const auto id = st.getChild (i).getProperty ("id").toString();
+                if (id.endsWith ("_att") || id.endsWith ("_rel")) st.removeChild (i, nullptr);
+            }
+            juce::ValueTree a ("PARAM"); a.setProperty ("id", "dyn_attack", nullptr); a.setProperty ("value", 25.0f, nullptr);
+            juce::ValueTree r ("PARAM"); r.setProperty ("id", "dyn_release", nullptr); r.setProperty ("value", 400.0f, nullptr);
+            st.appendChild (a, nullptr); st.appendChild (r, nullptr);
+            juce::MemoryBlock old; juce::AudioProcessor::copyXmlToBinary (*st.createXml(), old);
+            AudioLabEqProcessor q3; q3.setStateInformation (old.getData(), (int) old.getSize());
+            CHECK (std::abs (q3.bandValue (5, P::fAtt) - 25.0f) < 0.1f && std::abs (q3.bandValue (0, P::fRel) - 400.0f) < 1.0f,
+                   "projet v1.0 : attaque %.1f / retour %.1f", q3.bandValue (5, P::fAtt), q3.bandValue (0, P::fRel));
+            std::printf ("   attaque / retour par bande, projet v1.0 relu : OK si aucun échec\n");
+        }
+
         // phase linéaire : latence et alignement du bypass
         p.applyPreset (0);
         p.setValue (p.apvts.getParameter (P::outGain), 0.0f);

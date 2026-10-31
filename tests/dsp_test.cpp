@@ -125,10 +125,10 @@ int main()
     {
         const double fs = 48000;
         BandSpec s; s.active = true; s.shape = Shape::bell; s.freq = 1000; s.gainDb = 0; s.q = 2;
-        DynSettings dyn; dyn.on = true; dyn.thrDb = -30; dyn.rangeDb = -10;
+        DynSettings dyn; dyn.on = true; dyn.thrDb = -30; dyn.rangeDb = -10; dyn.attackMs = 5; dyn.releaseMs = 50;
         for (double lev : { -10.0, -25.0, -45.0 })
         {
-            eng.prepare (fs); eng.setDynTimes (5, 50);
+            eng.prepare (fs);
             for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
             eng.setBand (0, s, dyn, 1.0);
             const int n = 96000;
@@ -144,6 +144,22 @@ int main()
             else if (lev > -30) CHECK (red > 4.0 && red < 10.0, "près du seuil : réduction partielle attendue (%.2f)", red);
             else CHECK (std::abs (red) < 0.1, "sous le seuil : aucun changement attendu (%.2f)", red);
         }
+        // Attaque propre à chaque bande : après 10 ms de signal fort, 1 ms a déjà réagi, 200 ms à peine
+        double off[2] {};
+        for (int k = 0; k < 2; ++k)
+        {
+            DynSettings d = dyn; d.attackMs = k == 0 ? 1.0 : 200.0;
+            eng.prepare (fs);
+            for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+            eng.setBand (0, s, d, 1.0);
+            const int n = 480;
+            std::vector<float> l ((size_t) n), r ((size_t) n);
+            for (int i = 0; i < n; ++i) l[(size_t) i] = r[(size_t) i] = (float) (0.3 * std::sin (2 * pi * 1000 * i / fs));
+            eng.process (l.data(), r.data(), n, false);
+            off[k] = eng.getDynOffset (0);
+        }
+        std::printf ("   attaque 1 ms → %.2f dB, attaque 200 ms → %.2f dB après 10 ms\n", off[0], off[1]);
+        CHECK (off[0] < -8.0 && off[1] > -3.0, "attaque par bande (%.2f / %.2f)", off[0], off[1]);
     }
 
     std::printf ("4. Phase linéaire\n");

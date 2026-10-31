@@ -23,12 +23,28 @@ EqDisplay::~EqDisplay() { stopTimer(); endEdit(); if (soloHeld) proc.setSolo (-1
 // ── Géométrie ───────────────────────────────────────────────────────────
 juce::Rectangle<float> EqDisplay::plot() const
 {
-    return { 0.0f, 0.0f, (float) getWidth() - 50.0f, (float) getHeight() - 24.0f };
+    return { 0.0f, 0.0f, (float) getWidth() - rightGutter, (float) getHeight() - bottomGutter };
 }
 juce::Rectangle<float> EqDisplay::pianoArea() const
 {
     auto r = plot();
-    return { r.getX(), r.getBottom() + 5.0f, r.getWidth(), 17.0f };
+    return { r.getX(), r.getBottom() + 6.0f, r.getWidth(), 17.0f };
+}
+// Aide affichée tant qu'aucune bande n'existe (croix pour la masquer)
+juce::Rectangle<float> EqDisplay::helpCard() const
+{
+    auto r = plot();
+    return { r.getRight() - 16.0f - 360.0f, r.getY() + 16.0f, 360.0f, 282.0f };
+}
+juce::Rectangle<float> EqDisplay::helpClose() const
+{
+    auto c = helpCard();
+    return { c.getRight() - 16.0f - 22.0f, c.getY() + 12.0f, 22.0f, 22.0f };
+}
+bool EqDisplay::helpShown() const
+{
+    for (auto v : bandShown) if (v) return false;
+    return ! sketchMode && ! (bool) proc.ui.getProperty ("helpHidden", false);
 }
 juce::Rectangle<float> EqDisplay::rangeButton() const
 {
@@ -101,7 +117,7 @@ void EqDisplay::timerCallback()
     key.push_back (proc.isLinearPhase() ? 1.0f : 0.0f);
     key.push_back ((float) range());
     if (key != lastKey) { lastKey = std::move (key); dirty = true; }
-    if (dirty) { updateCurves(); dirty = false; repaint(); }
+    if (dirty) { updateCurves(); dirty = false; repaint(); if (onCurvesChanged) onCurvesChanged(); }
 
     updateAnalyzer();
 
@@ -222,23 +238,15 @@ void EqDisplay::paint (juce::Graphics& g)
 {
     const auto& p = theme.pal();
     auto r = plot();
-    const double fs = proc.getSampleRateSafe();
 
     juce::Path bgPath; bgPath.addRoundedRectangle (r, 10);
     g.setColour (p.cv); g.fillPath (bgPath);
     g.saveState();
     g.reduceClipRegion (bgPath);
 
-    // zone au-delà de Nyquist
-    if (0.5 * fs < fMax)
-    {
-        const float xn = xOf (0.5 * fs);
-        g.setColour (p.cv2); g.fillRect (xn, r.getY(), r.getRight() - xn, r.getHeight());
-    }
-
     // grille
-    const double freqs[] = { 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
-                             2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 20000 };
+    const double freqs[] = { 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+                             2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000 };
     for (double f : freqs)
     {
         const bool major = f == 100 || f == 1000 || f == 10000;
@@ -266,8 +274,11 @@ void EqDisplay::paint (juce::Graphics& g)
     for (double f : { 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0 })
     {
         const float x = xOf (f);
-        g.drawText (f >= 1000 ? String ((int) (f / 1000)) + "k" : String ((int) f), juce::Rectangle<float> (x + 3, r.getBottom() - 16, 40, 14),
-                    juce::Justification::centredLeft, false);
+        const String t = f >= 1000 ? String ((int) (f / 1000)) + "k" : String ((int) f);
+        if (x > r.getRight() - 30)   // 20 kHz : calé sur le bord droit
+            g.drawText (t, juce::Rectangle<float> (r.getRight() - 44, r.getBottom() - 16, 40, 14), juce::Justification::centredRight, false);
+        else
+            g.drawText (t, juce::Rectangle<float> (std::max (r.getX() + 4, x + 3), r.getBottom() - 16, 40, 14), juce::Justification::centredLeft, false);
     }
 
     const float y0 = yOf (0);
@@ -314,9 +325,8 @@ void EqDisplay::paint (juce::Graphics& g)
         g.setColour (p.orange.withAlpha (0.9f)); g.fillPath (dashed);
     }
     {
-        juce::Path line, fill;
-        curvePath (totalCurve, line, &fill);
-        g.setColour (p.accent.withAlpha (p.dark ? 0.14f : 0.10f)); g.fillPath (fill);
+        juce::Path line;
+        curvePath (totalCurve, line, nullptr);
         g.setColour (curveColour);
         g.strokePath (line, juce::PathStrokeType (2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
     }
@@ -413,12 +423,7 @@ void EqDisplay::paint (juce::Graphics& g)
     {
         bool any = false;
         for (auto v : bandShown) any = any || v;
-        if (! any)
-        {
-            g.setColour (p.muted); g.setFont (theme.ui (13));
-            g.drawText (U ("Cliquez pour ajouter une bande · Glissez pour sélectionner · Alt+clic sur une bande : écouter"),
-                        r.withSizeKeepingCentre (r.getWidth(), 24).translated (0, -40), juce::Justification::centred, false);
-        }
+        if (! any) paintEmpty (g);
     }
 
     // valeurs de la bande survolée / déplacée
@@ -433,7 +438,7 @@ void EqDisplay::paint (juce::Graphics& g)
     {
         if (std::abs (db - rg) < 1e-6) continue;
         g.setColour (std::abs (db) < 1e-6 ? p.dim : p.txt);
-        g.drawText ((db > 0 ? "+" : "") + String ((int) db), juce::Rectangle<float> (r.getRight() + 4, yOf (db) - 7, 26, 14),
+        g.drawText ((db > 0 ? "+" : "") + String ((int) db), juce::Rectangle<float> (r.getRight() + 6, yOf (db) - 7, 26, 14),
                     juce::Justification::centredLeft, false);
     }
     auto rbx = rangeButton();
@@ -481,8 +486,8 @@ void EqDisplay::paintPiano (juce::Graphics& g)
     juce::Path clip; clip.addRoundedRectangle (pa, 4);
     g.saveState(); g.reduceClipRegion (clip);
     g.setColour (p.dark ? juce::Colour (0xFFD1D1D6) : juce::Colours::white); g.fillRect (pa);
-    // touches blanches (A0 = 21 → C8 = 108)
-    for (int m = 21; m <= 108; ++m)
+    // toutes les touches entre 20 Hz et 20 kHz (C1 … C10)
+    for (int m = 12; m <= 136; ++m)
     {
         const int pc = m % 12;
         const bool black = pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
@@ -496,9 +501,9 @@ void EqDisplay::paintPiano (juce::Graphics& g)
         else if (pc == 0 || pc == 5)
         {
             g.setColour (p.grid2); g.drawVerticalLine (juce::roundToInt (x0), pa.getY(), pa.getBottom());
-            if (pc == 0)
+            if (pc == 0 && x0 >= pa.getX())
             {
-                g.setColour (p.muted); g.setFont (theme.ui (7.5f));
+                g.setColour (p.dark ? juce::Colour (0xFF48484A) : p.txt); g.setFont (theme.ui (7.5f));
                 g.drawText ("C" + String (m / 12 - 1), juce::Rectangle<float> (x0 + 1, pa.getBottom() - 9, 16, 9), juce::Justification::centredLeft, false);
             }
         }
@@ -519,7 +524,7 @@ void EqDisplay::paintMeters (juce::Graphics& g)
 {
     const auto& p = theme.pal();
     auto r = plot();
-    const float x = r.getRight() + 34, w = 4, top = r.getY() + 26, bot = r.getBottom();
+    const float x = r.getRight() + 38, w = 4, top = r.getY() + 26, bot = r.getBottom();
     auto yM = [&] (float db) { return bot - (bot - top) * juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 66.0f); };
     for (int ch = 0; ch < 2; ++ch)
     {
@@ -532,8 +537,69 @@ void EqDisplay::paintMeters (juce::Graphics& g)
             g.fillRoundedRectangle (xx, yv, w, bot - yv, 2);
         }
     }
-    g.setColour (p.txt); g.setFont (theme.ui (8));
-    g.drawText ("0", juce::Rectangle<float> (x - 12, yM (0) - 5, 10, 10), juce::Justification::centredRight, false);
+}
+
+void EqDisplay::paintEmpty (juce::Graphics& g)
+{
+    const auto& p = theme.pal();
+    auto r = plot();
+    const bool help = helpShown();
+    // consigne sous la ligne 0 dB (à gauche de l'aide quand elle est ouverte)
+    auto hint = help ? juce::Rectangle<float> (r.getX() + 60, yOf (0) + 30, 560, 40)
+                     : juce::Rectangle<float> (r.getX(), yOf (0) + 30, r.getWidth(), 40);
+    const String l1 = U ("Cliquez dans la courbe pour ajouter une bande"), l2 = U ("ou clic droit › Dessiner la courbe");
+    {
+        // voile discret derrière la consigne pour la lire par-dessus l'analyseur
+        juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (14, 600), l1, 0, 0);
+        const float w = ga.getBoundingBox (0, -1, true).getWidth() + 28;
+        g.setColour (p.cv.withAlpha (0.82f));
+        g.fillRoundedRectangle (hint.withSizeKeepingCentre (w, 46).translated (0, 0.0f), 10);
+    }
+    g.setColour (p.text); g.setFont (theme.ui (14, 600));
+    g.drawText (l1, hint.removeFromTop (20), juce::Justification::centred, false);
+    g.setColour (p.txt); g.setFont (theme.ui (12));
+    g.drawText (l2, hint.withTrimmedTop (2), juce::Justification::centredTop, false);
+    if (! help) return;
+
+    auto c = helpCard();
+    juce::Path box; box.addRoundedRectangle (c, 14);
+    juce::DropShadow (juce::Colours::black.withAlpha (p.dark ? 0.5f : 0.18f), 32, { 0, 10 }).drawForPath (g, box);
+    g.setColour (p.dark ? p.panel : p.bg2); g.fillPath (box);
+    g.setColour (p.dark ? juce::Colours::white.withAlpha (0.08f) : juce::Colours::black.withAlpha (0.06f));
+    g.strokePath (box, juce::PathStrokeType (1));
+    g.setColour (p.text); g.setFont (theme.ui (13, 600));
+    g.drawText (U ("Gestes et raccourcis"), juce::Rectangle<float> (c.getX() + 16, c.getY() + 12, 240, 22), juce::Justification::centredLeft, false);
+    auto x = helpClose();
+    g.setColour (p.ctl (p.dark)); g.fillEllipse (x);
+    g.setColour (p.dim);
+    const auto xc = x.getCentre();
+    g.drawLine (xc.x - 3, xc.y - 3, xc.x + 3, xc.y + 3, 1.4f);
+    g.drawLine (xc.x + 3, xc.y - 3, xc.x - 3, xc.y + 3, 1.4f);
+
+    const char* rows[][2] = {
+        { "Clic dans la courbe", "Nouvelle bande (bords : coupes)" },
+        { "Glisser une poignée", "Fréquence et gain · Maj : fin" },
+        { "Molette", "Largeur (Q)" },
+        { "Alt + molette", "Plage de l'EQ dynamique" },
+        { "Alt + clic maintenu", "Écouter la bande seule" },
+        { "Double-clic", "Activer / désactiver" },
+        { "Clic droit", "Forme, pente, Mid/Side, dessin…" },
+        { "Glisser dans le vide", "Sélection multiple" },
+        { "⌘Z · ⌘⇧Z", "Annuler · rétablir" } };
+    float y = c.getY() + 44;
+    const auto chipFont = theme.ui (11.5f, 600), txtFont = theme.ui (11.5f);
+    for (auto& row : rows)
+    {
+        const String k = U (row[0]);
+        juce::GlyphArrangement ga; ga.addLineOfText (chipFont, k, 0, 0);
+        const float w = ga.getBoundingBox (0, -1, true).getWidth() + 14;
+        auto chip = juce::Rectangle<float> (c.getX() + 16, y, w, 20);
+        g.setColour (p.ctl (p.dark)); g.fillRoundedRectangle (chip, 6);
+        g.setColour (p.text); g.setFont (chipFont); g.drawText (k, chip, juce::Justification::centred, false);
+        g.setColour (p.dim); g.setFont (txtFont);
+        g.drawText (U (row[1]), juce::Rectangle<float> (c.getX() + 16 + 142, y, c.getWidth() - 174, 20), juce::Justification::centredLeft, false);
+        y += 26;
+    }
 }
 
 void EqDisplay::paintReadout (juce::Graphics& g, int b)
@@ -651,7 +717,8 @@ void EqDisplay::mouseMove (const juce::MouseEvent& e)
     const int h = sketchMode ? -1 : hitBand (e.position);
     if (h != hover) { hover = h; repaint(); }
     if (sketchMode) setMouseCursor (juce::MouseCursor::CrosshairCursor);
-    else if (rangeButton().contains (e.position)) setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    else if (rangeButton().contains (e.position) || (helpShown() && helpClose().expanded (4).contains (e.position))) setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    else if (helpShown() && helpCard().contains (e.position)) setMouseCursor (juce::MouseCursor::NormalCursor);
     else setMouseCursor (h >= 0 ? juce::MouseCursor::DraggingHandCursor
                                 : plot().contains (e.position) ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
 }
@@ -676,6 +743,11 @@ void EqDisplay::mouseDown (const juce::MouseEvent& e)
         return;
     }
     if (! plot().contains (e.position)) return;
+    if (helpShown())
+    {
+        if (helpClose().expanded (4).contains (e.position)) { proc.ui.setProperty ("helpHidden", true, nullptr); repaint(); return; }
+        if (helpCard().contains (e.position)) return;
+    }
 
     if (sketchMode)
     {
@@ -753,7 +825,7 @@ void EqDisplay::mouseDrag (const juce::MouseEvent& e)
         const auto shape = (Shape) juce::roundToInt (proc.bandValue (st.band, P::fShape));
         if (! lockF)
         {
-            const double f = juce::jlimit (10.0, 30000.0, st.f * std::exp (dx * octPerPx));
+            const double f = juce::jlimit (fMin, fMax, st.f * std::exp (dx * octPerPx));
             proc.bandParam (st.band, P::fFreq)->setValueNotifyingHost (proc.bandParam (st.band, P::fFreq)->convertTo0to1 ((float) f));
         }
         if (hasGain (shape))
@@ -792,7 +864,7 @@ void EqDisplay::mouseUp (const juce::MouseEvent& e)
         const double sc = std::max (0.01, proc.gainScale());
         const float g = shape == Shape::bell ? (float) juce::jlimit (-30.0, 30.0, dbOf (e.position.y) / sc) : 0.0f;
         proc.pushUndo();
-        const int b = proc.createBand (shape, (float) juce::jlimit (10.0, 30000.0, shape == Shape::lowCut ? std::max (f, 20.0) : shape == Shape::highCut ? std::min (f, 20000.0) : f),
+        const int b = proc.createBand (shape, (float) juce::jlimit (fMin, fMax, f),
                                        std::abs (g) < 0.15f ? 0.0f : g, shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
         if (b < 0) { if (onMessage) onMessage (U ("Les 24 bandes sont utilisées")); return; }
         createdBand = b; createdAt = juce::Time::getMillisecondCounter();
@@ -919,6 +991,15 @@ void EqDisplay::showEmptyMenu (juce::Point<float> at)
     m.addItem (U ("Coupe-haut"), [add] { add (Shape::highCut, 0.71f, 24); });
     m.addItem (U ("Notch"), [add] { add (Shape::notch, 8.0f, 12); });
     m.addSeparator();
+    m.addItem (U ("Dessiner la courbe…"), [safe] { if (safe != nullptr) safe->setSketchMode (true); });
+    m.addItem (U ("Afficher l'aide"), (bool) proc.ui.getProperty ("helpHidden", false), false, [safe]
+    {
+        if (safe == nullptr) return;
+        safe->proc.ui.setProperty ("helpHidden", false, nullptr);
+        if (safe->onMessage) safe->onMessage (U ("L'aide s'affiche quand aucune bande n'existe"));
+        safe->repaint();
+    });
+    m.addSeparator();
     m.addItem (U ("Tout sélectionner"), [safe] { if (safe != nullptr) safe->selectAll(); });
     m.addItem (U ("Supprimer toutes les bandes"), [safe]
     {
@@ -967,6 +1048,7 @@ void EqDisplay::fitSketch()
         if (b >= 0) selection.add (b);
     }
     std::fill (sketch.begin(), sketch.end(), std::numeric_limits<float>::quiet_NaN());
+    setSketchMode (false);   // un tracé à la fois (clic droit › Dessiner la courbe pour recommencer)
     if (onSelectionChanged) onSelectionChanged();
     if (onMessage) onMessage (String ((int) bandsOut.size()) + U (" bandes ajustées sur le tracé"));
     refresh();

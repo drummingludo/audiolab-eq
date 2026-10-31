@@ -363,6 +363,130 @@ private:
     bool dimmed = false, focused = false;
 };
 
+// ── Valeur compacte réglable : glisser verticalement, molette, double-clic = défaut ──
+// stacked : libellé au-dessus de la valeur (Attaque / Retour) ; sinon côte à côte (Échelle 100 %).
+class ValueBox : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    ValueBox (Theme& t, juce::RangedAudioParameter& prm, juce::String label, std::function<juce::String (float)> format, bool stackedLayout)
+        : theme (t), param (prm), labelText (std::move (label)), fmt (std::move (format)), stacked (stackedLayout),
+          attachment (prm, [this] (float) { repaint(); }, nullptr)
+    {
+        setWantsKeyboardFocus (true);
+        setTitle (labelText);
+        setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+        attachment.sendInitialUpdate();
+    }
+    bool raised = false;
+    std::function<void()> onGestureStart;
+
+    float idealWidth() const
+    {
+        juce::GlyphArrangement a; a.addLineOfText (theme.ui (11), labelText, 0, 0);
+        juce::GlyphArrangement b; b.addLineOfText (theme.ui (12, 600), fmt (param.convertFrom0to1 (param.getValue())), 0, 0);
+        return a.getBoundingBox (0, -1, true).getWidth() + 6 + std::max (b.getBoundingBox (0, -1, true).getWidth(), 40.0f) + 20;
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& p = theme.pal();
+        auto b = getLocalBounds().toFloat();
+        g.setColour (isMouseOver (true) && isEnabled() ? p.ctlHover (raised) : p.ctl (raised)); g.fillRoundedRectangle (b, 8);
+        if (focused) { g.setColour (p.accent.withAlpha (0.35f)); g.drawRoundedRectangle (b.reduced (1), 8, 2); }
+        const auto v = fmt (param.convertFrom0to1 (param.getValue()));
+        if (stacked)
+        {
+            g.setColour (p.muted); g.setFont (theme.ui (8.5f, 600, 0.06f));
+            g.drawText (upper (labelText), b.withHeight (11).withCentre ({ b.getCentreX(), b.getCentreY() - 6.5f }), juce::Justification::centred, false);
+            g.setColour (p.text); g.setFont (theme.ui (11.5f, 600));
+            g.drawText (v, b.withHeight (14).withCentre ({ b.getCentreX(), b.getCentreY() + 6.0f }), juce::Justification::centred, false);
+        }
+        else
+        {
+            juce::GlyphArrangement a; a.addLineOfText (theme.ui (11), labelText, 0, 0);
+            const float lw = a.getBoundingBox (0, -1, true).getWidth();
+            auto r = b.reduced (10, 0);
+            g.setColour (p.muted); g.setFont (theme.ui (11));
+            g.drawText (labelText, r.removeFromLeft (lw + 1), juce::Justification::centredLeft, false);
+            r.removeFromLeft (6);
+            g.setColour (p.text); g.setFont (theme.ui (12, 600));
+            g.drawText (v, r, juce::Justification::centredLeft, false);
+        }
+    }
+    void mouseEnter (const juce::MouseEvent&) override { repaint(); }
+    void mouseExit (const juce::MouseEvent&) override { repaint(); }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (! isEnabled()) return;
+        if (onGestureStart) onGestureStart();
+        y0 = e.position.y; v0 = param.getValue();
+        attachment.beginGesture(); dragging = true;
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (! dragging) return;
+        const float k = e.mods.isShiftDown() ? 1200.0f : 220.0f;
+        setNorm (v0 + (y0 - e.position.y) / k, true);
+    }
+    void mouseUp (const juce::MouseEvent&) override { if (dragging) { attachment.endGesture(); dragging = false; } }
+    void mouseDoubleClick (const juce::MouseEvent&) override
+    {
+        if (! isEnabled()) return;
+        if (onGestureStart) onGestureStart();
+        attachment.setValueAsCompleteGesture (param.convertFrom0to1 (param.getDefaultValue()));
+    }
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& w) override
+    {
+        if (std::abs (w.deltaY) < 1e-6f || ! isEnabled()) return;
+        if (onGestureStart && juce::Time::getMillisecondCounter() - lastWheel > 600) onGestureStart();
+        lastWheel = juce::Time::getMillisecondCounter();
+        setNorm (param.getValue() + (w.deltaY > 0 ? 0.01f : -0.01f), false);
+    }
+    bool keyPressed (const juce::KeyPress& k) override
+    {
+        if (k.isKeyCode (juce::KeyPress::upKey) || k.isKeyCode (juce::KeyPress::rightKey)) { setNorm (param.getValue() + 0.02f, false); return true; }
+        if (k.isKeyCode (juce::KeyPress::downKey) || k.isKeyCode (juce::KeyPress::leftKey)) { setNorm (param.getValue() - 0.02f, false); return true; }
+        return false;
+    }
+    void focusGained (FocusChangeType c) override { focused = c == focusChangedByTabKey; repaint(); }
+    void focusLost (FocusChangeType) override { focused = false; repaint(); }
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        struct Value : juce::AccessibilityRangedNumericValueInterface
+        {
+            explicit Value (ValueBox& v) : box (v) {}
+            bool isReadOnly() const override { return false; }
+            double getCurrentValue() const override { return box.param.convertFrom0to1 (box.param.getValue()); }
+            void setValue (double v) override { box.attachment.setValueAsCompleteGesture ((float) v); }
+            AccessibleValueRange getRange() const override
+            {
+                const auto& r = box.param.getNormalisableRange();
+                return { { r.start, r.end }, r.interval > 0 ? r.interval : 0.01 };
+            }
+            ValueBox& box;
+        };
+        return std::make_unique<juce::AccessibilityHandler> (*this, juce::AccessibilityRole::slider, juce::AccessibilityActions(),
+                                                              juce::AccessibilityHandler::Interfaces { std::make_unique<Value> (*this) });
+    }
+
+private:
+    void setNorm (float n, bool partOfGesture)
+    {
+        const float v = param.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, n));
+        if (partOfGesture) attachment.setValueAsPartOfGesture (v); else attachment.setValueAsCompleteGesture (v);
+    }
+    Theme& theme;
+    juce::RangedAudioParameter& param;
+    juce::String labelText;
+    std::function<juce::String (float)> fmt;
+    bool stacked;
+    juce::ParameterAttachment attachment;
+    float y0 = 0, v0 = 0;
+    bool dragging = false, focused = false;
+    juce::uint32 lastWheel = 0;
+};
+
 // ── Boutons (ibtn, Reset, On/Bypass, A/B/C) ──────────────────────────────
 class PillButton : public juce::Button
 {
@@ -373,13 +497,15 @@ public:
     bool on = false;          // ibtn « actif », bp « On », snap « courant »
     bool has = false;         // snap : contient un réglage
     bool armed = false;       // snap : prêt à enregistrer
+    bool iconOnly = false;    // bouton carré avec une icône centrée
+    bool raised = false;      // posé sur le panneau flottant
     std::function<void (juce::Graphics&, juce::Rectangle<float>, juce::Colour)> icon;
 
     void paintButton (juce::Graphics& g, bool over, bool down) override
     {
         const auto& p = theme.pal();
         auto b = getLocalBounds().toFloat().reduced (0.5f);
-        juce::Colour bg = p.bg3, fg = p.text, br = juce::Colours::transparentBlack;
+        juce::Colour bg = p.ctl (raised), fg = p.text, br = juce::Colours::transparentBlack;
         float rad = 8;
         juce::String txt = getButtonText();
         if (style == Style::rst) fg = p.dim;
@@ -396,7 +522,7 @@ public:
             if (has) { bg = p.bg3; fg = p.text; }
             if (on) { bg = p.accent; fg = juce::Colours::white; }
         }
-        if ((over || down) && style != Style::bp && ! (style == Style::ibtn && on) && ! (style == Style::snap && on)) bg = p.bg4;
+        if ((over || down) && style != Style::bp && ! (style == Style::ibtn && on) && ! (style == Style::snap && on)) bg = p.ctlHover (raised);
         g.setColour (bg); g.fillRoundedRectangle (b, rad);
         if (style == Style::snap && ! on)
         {
@@ -416,6 +542,7 @@ public:
             g.setColour (p.red); g.fillEllipse (b.getCentreX() - 4, b.getCentreY() - 4, 8, 8);
             return;
         }
+        if (iconOnly && icon) { icon (g, b.withSizeKeepingCentre (16, 16), fg); return; }
         auto tb = b;
         if (icon) { icon (g, tb.removeFromLeft (b.getHeight()).reduced (5).translated (4, 0), fg); }
         g.setColour (fg);
@@ -457,7 +584,8 @@ public:
     {
         const auto& p = theme.pal();
         auto b = juce::Rectangle<float> (0, 0, (float) w, (float) h);
-        g.setColour (box.isMouseOver (true) ? p.bg4 : p.bg3); g.fillRoundedRectangle (b, 8);
+        const bool raised = (bool) box.getProperties().getWithDefault ("raised", false);
+        g.setColour (box.isMouseOver (true) ? p.ctlHover (raised) : p.ctl (raised)); g.fillRoundedRectangle (b, 8);
         if (box.hasKeyboardFocus (true)) { g.setColour (p.accent.withAlpha (0.3f)); g.drawRoundedRectangle (b.reduced (1), 8, 2); }
         juce::Path chev; const float cx = (float) w - 15, cy = h * 0.5f;
         chev.startNewSubPath (cx - 4, cy - 2); chev.lineTo (cx, cy + 2); chev.lineTo (cx + 4, cy - 2);
@@ -466,7 +594,7 @@ public:
     juce::Font getComboBoxFont (juce::ComboBox&) override { return theme.ui (12); }
     void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
     {
-        label.setBounds (4, 0, box.getWidth() - 28, box.getHeight());
+        label.setBounds (4, 0, box.getWidth() - 24, box.getHeight());
         label.setFont (getComboBoxFont (box));
     }
     juce::Font getPopupMenuFont() override { return theme.ui (13); }
@@ -501,6 +629,7 @@ class Toast : public juce::Component, private juce::Timer
 {
 public:
     explicit Toast (Theme& t) : theme (t) { setInterceptsMouseClicks (false, false); setAlpha (0); }
+    bool atTop = false;
     void show (const juce::String& s, bool ok = false)
     {
         text = s; good = ok; shownAt = juce::Time::getMillisecondCounter();
@@ -512,7 +641,7 @@ public:
         const auto& p = theme.pal();
         juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (13, 600), text, 0, 0);
         const float w = ga.getBoundingBox (0, -1, true).getWidth() + 36, h = 34;
-        auto r = juce::Rectangle<float> ((getWidth() - w) / 2, (float) getHeight() - h - 14, w, h);
+        auto r = juce::Rectangle<float> ((getWidth() - w) / 2, atTop ? 14.0f : (float) getHeight() - h - 14, w, h);
         juce::Path box; box.addRoundedRectangle (r, 10);
         softShadow (g, box, juce::Colours::black.withAlpha (0.25f), 18, { 0, 6 });
         g.setColour (p.dark ? p.bg3 : p.text); g.fillPath (box);

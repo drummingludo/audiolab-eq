@@ -108,6 +108,8 @@ DynSettings AudioLabEqProcessor::getDyn (int b) const
     d.on = bandValue (b, P::fDyn) > 0.5f;
     d.thrDb = bandValue (b, P::fThr);
     d.rangeDb = bandValue (b, P::fRange);
+    d.attackMs = bandValue (b, P::fAtt);
+    d.releaseMs = bandValue (b, P::fRel);
     return d;
 }
 
@@ -151,7 +153,6 @@ void AudioLabEqProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 void AudioLabEqProcessor::updateEngineTargets (bool)
 {
     const double sc = gainScale();
-    engine.setDynTimes (getParam (P::attack), getParam (P::release));
     for (int b = 0; b < maxBands; ++b) engine.setBand (b, getBandSpec (b, false), getDyn (b), sc);
 }
 
@@ -309,6 +310,8 @@ int AudioLabEqProcessor::createBand (Shape shape, float freq, float gain, float 
     setBandValue (b, P::fDyn, 0);
     setBandValue (b, P::fThr, -30);
     setBandValue (b, P::fRange, -6);
+    setBandValue (b, P::fAtt, 10);
+    setBandValue (b, P::fRel, 150);
     setBandValue (b, P::fOn, 1);
     setBandValue (b, P::fUsed, 1);
     return b;
@@ -453,7 +456,21 @@ void AudioLabEqProcessor::setStateInformation (const void* data, int sizeInBytes
             ui.copyPropertiesAndChildrenFrom (u, nullptr);
             state.removeChild (u, nullptr);
         }
+        // Projet v1.0 : Attaque / Retour étaient communs à toutes les bandes
+        auto legacy = [&state] (const char* id) -> juce::var
+        {
+            for (auto c : state) if (c.getProperty ("id").toString() == id) return c.getProperty ("value");
+            return {};
+        };
+        const auto oldAtt = legacy (P::legacyAttack), oldRel = legacy (P::legacyRelease);
+        const bool hasNew = ! legacy (P::bandId (0, P::fAtt).toRawUTF8()).isVoid();
         apvts.replaceState (state);
+        if (! hasNew && ! oldAtt.isVoid() && ! oldRel.isVoid())
+            for (int b = 0; b < maxBands; ++b)
+            {
+                setBandValue (b, P::fAtt, (float) oldAtt);
+                setBandValue (b, P::fRel, (float) oldRel);
+            }
     }
 }
 
