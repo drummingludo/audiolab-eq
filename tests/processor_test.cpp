@@ -18,7 +18,26 @@ int main()
         p.setPlayConfigDetails (2, 2, 48000, 512);
         p.prepareToPlay (48000, 512);
         std::printf ("1. Démarrage : %d bande(s) utilisée(s), latence %d\n", usedCount (p), p.getLatencySamples());
-        CHECK (usedCount (p) == 0, "le réglage initial doit être neutre");
+        CHECK (usedCount (p) == 5, "le réglage initial doit contenir 5 bandes");
+        {
+            const int expectShape[] = { 1, 0, 0, 0, 3 };   // low shelf, 3 cloches, high shelf
+            const float expectFreq[] = { 60, 300, 1000, 3000, 10000 };
+            for (int b = 0; b < 5; ++b)
+                CHECK (juce::roundToInt (p.bandValue (b, P::fShape)) == expectShape[b] && std::abs (p.bandValue (b, P::fFreq) - expectFreq[b]) < 0.5f
+                       && std::abs (p.bandValue (b, P::fGain)) < 1e-6f, "bande %d par défaut", b + 1);
+            // à plat : la sortie est identique à l'entrée
+            juce::AudioBuffer<float> buf (2, 4096), ref (2, 4096); juce::MidiBuffer midi; juce::Random rnd (11);
+            for (int pass = 0; pass < 3; ++pass)
+            {
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 4096; ++i) buf.setSample (ch, i, rnd.nextFloat() - 0.5f);
+                ref.makeCopyOf (buf);
+                p.processBlock (buf, midi);
+            }
+            float maxDiff = 0;
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 4096; ++i) maxDiff = std::max (maxDiff, std::abs (buf.getSample (ch, i) - ref.getSample (ch, i)));
+            std::printf ("   5 bandes à plat : écart max sortie / entrée %.2e\n", maxDiff);
+            CHECK (maxDiff < 1e-4f, "le réglage par défaut doit laisser passer le son (%.2e)", maxDiff);
+        }
 
         // presets
         const auto& list = P::presets();
@@ -36,7 +55,7 @@ int main()
         p.pushUndo();
         p.setBandValue (1, P::fGain, 9.0f);
         CHECK (p.undo() && std::abs (p.bandValue (1, P::fGain) - 3.0f) < 0.01f, "annuler le gain");
-        CHECK (p.undo() && usedCount (p) == 0, "annuler le preset");
+        CHECK (p.undo() && usedCount (p) == 5, "annuler le preset");
         CHECK (p.redo() && usedCount (p) == 4, "rétablir le preset");
         std::printf ("3. Annuler / rétablir : OK si aucun échec\n");
 
@@ -118,6 +137,7 @@ int main()
         AudioLabEqProcessor p;
         p.setPlayConfigDetails (1, 1, 44100, 256);
         p.prepareToPlay (44100, 256);
+        p.clearAllBands();
         juce::Random rnd (3);
         for (int b = 0; b < audiolab::eq::maxBands; ++b)
             p.createBand ((audiolab::eq::Shape) (b % 8), 30.0f * std::pow (1.3f, (float) b), (float) (b % 5) - 2.0f, 1.0f, 12,

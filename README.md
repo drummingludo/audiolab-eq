@@ -13,7 +13,7 @@ Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme
 - **Écoute d'une bande** (Alt + clic maintenu ou bouton *Écouter*) pour entendre seulement la zone traitée.
 - Interface épurée : la courbe occupe toute la fenêtre, les réglages de la bande sélectionnée apparaissent dans un **panneau flottant** sous la courbe.
 - Annuler / rétablir (Cmd+Z), **échelle de gain** (0–200 %), **gain auto** pour comparer à niveau égal, thème clair / sombre qui suit l'ordinateur, fenêtre redimensionnable.
-- Le réglage par défaut est **neutre** : aucune bande, le son passe sans modification.
+- Le réglage par défaut contient **cinq bandes à plat** (low shelf 60 Hz, cloches 300 Hz, 1 kHz, 3 kHz, high shelf 10 kHz, toutes à 0 dB) : le son passe sans modification, il suffit de tirer une poignée.
 
 ## Prise en main
 

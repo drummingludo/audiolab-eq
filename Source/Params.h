@@ -95,6 +95,17 @@ inline juce::NormalisableRange<float> releaseRange() { juce::NormalisableRange<f
 inline juce::String fmtMs (float v) { return v < 10 ? juce::String (v, 1) + " ms" : juce::String (juce::roundToInt (v)) + " ms"; }
 inline juce::NormalisableRange<float> qRange()    { return logRange (0.025f, 40.0f); }
 
+// ── Réglage par défaut : cinq bandes à plat (0 dB, le son n'est pas modifié) ──
+struct DefaultBand { eq::Shape shape; float freq, q; };
+constexpr DefaultBand defaultBands[] = {
+    { eq::Shape::lowShelf,  60.0f,    0.71f },
+    { eq::Shape::bell,      300.0f,   1.0f },
+    { eq::Shape::bell,      1000.0f,  1.0f },
+    { eq::Shape::bell,      3000.0f,  1.0f },
+    { eq::Shape::highShelf, 10000.0f, 0.71f },
+};
+constexpr int numDefaultBands = 5;
+
 // ── Création ────────────────────────────────────────────────────────────
 inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 {
@@ -105,16 +116,18 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     for (int b = 0; b < maxBands; ++b)
     {
         const String pre = U ("Bande ") + String (b + 1) + " ";
+        const bool isDef = b < numDefaultBands;
+        const DefaultBand def = isDef ? defaultBands[b] : DefaultBand { eq::Shape::bell, 1000.0f, 1.0f };
         auto grp = std::make_unique<AudioProcessorParameterGroup> ("band" + String (b + 1), pre.trim(), " | ");
-        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fUsed)), pre + U ("Utilisée"), false));
+        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fUsed)), pre + U ("Utilisée"), isDef));
         grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fOn)), pre + U ("Active"), true));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fFreq)), pre + U ("Fréquence"), freqRange(), 1000.0f,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fFreq)), pre + U ("Fréquence"), freqRange(), def.freq,
             AudioParameterFloatAttributes().withLabel ("Hz").withStringFromValueFunction ([] (float v, int) { return fmtHz (v); })));
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fGain)), pre + "Gain", NormalisableRange<float> (-30.0f, 30.0f, 0.01f), 0.0f,
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return fmtDb (v, 2); })));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fQ)), pre + "Q", qRange(), 1.0f,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fQ)), pre + "Q", qRange(), def.q,
             AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return fmtQ (v); })));
-        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fShape)), pre + U ("Forme"), shapeNames(), 0));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fShape)), pre + U ("Forme"), shapeNames(), (int) def.shape));
         grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fSlope)), pre + U ("Pente"), slopeNames(), 1));
         grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fPlace)), pre + U ("Placement"), placeNames(), 0));
         grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fDyn)), pre + U ("Dynamique"), false));
@@ -156,7 +169,9 @@ inline const std::vector<Preset>& presets()
 {
     using S = eq::Shape; using P = eq::Place;
     static const std::vector<Preset> list = {
-        { "Défaut (neutre)", "Aucune bande : le son passe sans modification.", {} },
+        { "Défaut (neutre)", "Cinq bandes à plat (60 Hz, 300 Hz, 1 kHz, 3 kHz, 10 kHz) : le son passe sans modification.",
+          { { S::lowShelf, 60, 0, 0.71f, 12 }, { S::bell, 300, 0, 1.0f, 12 }, { S::bell, 1000, 0, 1.0f, 12 },
+            { S::bell, 3000, 0, 1.0f, 12 }, { S::highShelf, 10000, 0, 0.71f, 12 } } },
         { "Coupe-bas 80 Hz", "Retire les grondements et les bruits de manipulation sous 80 Hz.",
           { { S::lowCut, 80, 0, 0.71f, 24 } } },
         { "Voix — clarté", "Coupe-bas, moins de « carton » vers 250 Hz, présence et air.",
