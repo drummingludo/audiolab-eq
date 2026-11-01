@@ -45,9 +45,11 @@ public:
 
     static constexpr double fMin = 20.0, fMax = 20000.0;
     static constexpr float rightGutter = 48.0f, bottomGutter = 24.0f;
-    // Échelle dB comme Pro-Q : +plage en haut, −plage au-dessus de la zone du panneau de bande
-    // (le 0 dB est donc plus haut que le milieu ; sous −plage, la grille continue derrière le panneau).
-    static constexpr float curveTop = 12.0f, panelZone = 200.0f;
+    // Échelle dB comme Pro-Q : 0 dB au-dessus du milieu (y = 216 sur 520) pour laisser la place
+    // au panneau de bande en bas ; vers −7 dB la courbe passe derrière le panneau, la grille continue.
+    static constexpr float curveTop = 12.0f, curveBottom = 420.0f;
+    void paintNode (juce::Graphics&, int band) const;
+    int hitBandAt (juce::Point<float> p) const { return hitBand (p); }
 
     juce::Rectangle<float> plot() const;
     juce::Point<float> nodePos (int band) const;

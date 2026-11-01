@@ -29,6 +29,7 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     content.addAndMakeVisible (display);
     content.addAndMakeVisible (shadow);
     content.addChildComponent (panel);
+    content.addChildComponent (overlay);
 
     // Barre du bas : phase, analyseur, échelle, sortie, gain auto
     phaseSeg.attach (prm (P::phase));
@@ -130,6 +131,7 @@ void AudioLabEqEditor::placePanel()
     {
         if (panel.isVisible()) panel.setVisible (false);
         shadow.repaint();
+        overlay.update();
         return;
     }
     // Comme Pro-Q : toujours en bas de la courbe, il suit la bande de gauche à droite.
@@ -141,6 +143,36 @@ void AudioLabEqEditor::placePanel()
     const int x = juce::jlimit (juce::roundToInt (r.getX()) + 12, juce::roundToInt (r.getRight()) - 12 - w, juce::roundToInt (cx - w * 0.5f));
     const juce::Rectangle<int> nb (x, juce::roundToInt (r.getBottom()) - 12 - h, w, h);
     if (panel.getBounds() != nb) { panel.setBounds (nb); shadow.repaint(); }
+    overlay.update();
+}
+
+void AudioLabEqEditor::NodeOverlay::update()
+{
+    juce::Array<int> now;
+    if (ed.panel.isVisible())
+    {
+        const auto zone = ed.panel.getBounds().toFloat().expanded (14);
+        for (int b : ed.display.getSelection())
+            if (zone.contains (ed.display.nodePos (b) + ed.display.getPosition().toFloat())) now.add (b);
+    }
+    shown = now;
+    const bool vis = ! now.isEmpty();
+    if (vis) setBounds (ed.panel.getBounds().expanded (16));
+    if (isVisible() != vis) setVisible (vis);
+    if (vis) repaint();
+}
+
+void AudioLabEqEditor::NodeOverlay::paint (juce::Graphics& g)
+{
+    g.addTransform (juce::AffineTransform::translation ((float) (ed.display.getX() - getX()), (float) (ed.display.getY() - getY())));
+    for (int b : shown) ed.display.paintNode (g, b);
+}
+
+bool AudioLabEqEditor::NodeOverlay::hitTest (int x, int y)
+{
+    const juce::Point<float> pt ((float) (x + getX() - ed.display.getX()), (float) (y + getY() - ed.display.getY()));
+    for (int b : shown) if (ed.display.nodePos (b).getDistanceFrom (pt) < 13.0f) return true;
+    return false;
 }
 
 void AudioLabEqEditor::Shadow::paint (juce::Graphics& g)

@@ -41,6 +41,28 @@ private:
         AudioLabEqEditor& ed;
     };
 
+    // Poignées sélectionnées redessinées par-dessus le panneau quand elles passent dessous
+    // (elles restent visibles et saisissables ; les gestes sont transmis à la courbe).
+    class NodeOverlay : public juce::Component
+    {
+    public:
+        explicit NodeOverlay (AudioLabEqEditor& e) : ed (e) { setMouseCursor (juce::MouseCursor::DraggingHandCursor); }
+        void update();
+        void paint (juce::Graphics& g) override;
+        bool hitTest (int x, int y) override;
+        void mouseMove (const juce::MouseEvent& e) override        { ed.display.mouseMove (rel (e)); }
+        void mouseExit (const juce::MouseEvent& e) override        { ed.display.mouseExit (rel (e)); }
+        void mouseDown (const juce::MouseEvent& e) override        { ed.display.mouseDown (rel (e)); }
+        void mouseDrag (const juce::MouseEvent& e) override        { ed.display.mouseDrag (rel (e)); }
+        void mouseUp (const juce::MouseEvent& e) override          { ed.display.mouseUp (rel (e)); }
+        void mouseDoubleClick (const juce::MouseEvent& e) override { ed.display.mouseDoubleClick (rel (e)); }
+        void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override { ed.display.mouseWheelMove (rel (e), w); }
+    private:
+        juce::MouseEvent rel (const juce::MouseEvent& e) const { return e.getEventRelativeTo (&ed.display); }
+        juce::Array<int> shown;
+        AudioLabEqEditor& ed;
+    };
+
     void timerCallback() override;
     void darkModeSettingChanged() override { applyTheme(); }
     void applyTheme();
@@ -55,6 +77,7 @@ private:
     audiolab::EqDisplay display;
     Shadow shadow { *this };
     audiolab::BandPanel panel;
+    NodeOverlay overlay { *this };
     audiolab::Toast toast { theme };
 
     // barre du bas

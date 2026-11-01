@@ -91,8 +91,9 @@ int main (int argc, char** argv)
             return (float) std::max (-12.0, v);
         }); } });
     steps.push_back ({ 1500, [&] { shot ("04_clair_dessin_ajuste"); ed->getDisplay().selectAll(); } });
-    steps.push_back ({ 800,  [&] { shot ("05_clair_multi_selection"); preset ("Kick"); ed->getDisplay().clearSelection(); ed->getDisplay().select (2); } });
-    steps.push_back ({ 1500, [&] { shot ("06_clair_panneau_en_haut"); P_phase.setValueNotifyingHost (1.0f); preset ("Mid/Side"); theme ("dark");
+    steps.push_back ({ 800,  [&] { shot ("05_clair_multi_selection"); preset ("Kick"); ed->getDisplay().clearSelection(); ed->getDisplay().select (2);
+                                   proc->setBandValue (2, audiolab::params::fGain, -10.0f); } });
+    steps.push_back ({ 1500, [&] { shot ("06_clair_poignee_sur_panneau"); P_phase.setValueNotifyingHost (1.0f); preset ("Mid/Side"); theme ("dark");
                                    rebuild(); ed->getDisplay().select (1); ed->getDisplay().testHover (1); } });
     steps.push_back ({ 1800, [&] { shot ("07_sombre_mid_side_lineaire"); P_phase.setValueNotifyingHost (0.0f); preset ("Défaut");
                                    proc->ui.setProperty ("helpHidden", true, nullptr); rebuild();

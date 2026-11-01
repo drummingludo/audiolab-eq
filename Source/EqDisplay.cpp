@@ -65,13 +65,13 @@ double EqDisplay::fOf (float x) const
 float EqDisplay::yOf (double db) const
 {
     auto r = plot();
-    const float top = r.getY() + curveTop, bot = r.getBottom() - panelZone;
+    const float top = r.getY() + curveTop, bot = r.getY() + curveBottom;
     return top + (float) ((range() - db) / (2.0 * range())) * (bot - top);
 }
 double EqDisplay::dbOf (float y) const
 {
     auto r = plot();
-    const float top = r.getY() + curveTop, bot = r.getBottom() - panelZone;
+    const float top = r.getY() + curveTop, bot = r.getY() + curveBottom;
     return range() - (double) ((y - top) / (bot - top)) * 2.0 * range();
 }
 float EqDisplay::yAn (double db) const
@@ -352,7 +352,6 @@ void EqDisplay::paint (juce::Graphics& g)
         const auto s = proc.getBandSpec (b, true);
         const auto c = bandColour (b, p);
         const auto pos = nodePos (b);
-        const bool sel = selection.contains (b), hv = b == hover;
         // plage dynamique
         if (proc.bandValue (b, P::fDyn) > 0.5f && hasGain (s.shape))
         {
@@ -363,35 +362,7 @@ void EqDisplay::paint (juce::Graphics& g)
             g.drawLine (pos.x - 5, yr, pos.x + 5, yr, 2.0f);
             g.setColour (c); g.drawEllipse (pos.x - 4.5f, yd - 4.5f, 9, 9, 1.8f);
         }
-        const float rad = sel ? 9.5f : hv ? 9.0f : 8.0f;
-        if (sel)
-        {
-            g.setColour (c.withAlpha (0.25f));
-            g.fillEllipse (pos.x - rad - 5, pos.y - rad - 5, (rad + 5) * 2, (rad + 5) * 2);
-        }
-        if (s.active)
-        {
-            g.setColour (c); g.fillEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2);
-            g.setColour (juce::Colours::white);
-        }
-        else
-        {
-            g.setColour (p.cv); g.fillEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2);
-            g.setColour (c.withAlpha (0.7f)); g.drawEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2, 1.6f);
-        }
-        if (sel) { g.setColour (p.dark ? juce::Colours::white : p.text); g.drawEllipse (pos.x - rad - 1, pos.y - rad - 1, rad * 2 + 2, rad * 2 + 2, 1.5f); }
-        g.setColour (s.active ? juce::Colours::white : c);
-        g.setFont (theme.ui (9.5f, 700));
-        g.drawText (String (b + 1), juce::Rectangle<float> (pos.x - 10, pos.y - 6, 20, 12), juce::Justification::centred, false);
-        if (s.place != Place::stereo)
-        {
-            g.setColour (c); g.setFont (theme.ui (9, 700));
-            g.drawText (P::placeShort()[(int) s.place], juce::Rectangle<float> (pos.x + rad - 1, pos.y - rad - 11, 14, 11), juce::Justification::centredLeft, false);
-        }
-        if (proc.getSolo() == b)
-        {
-            g.setColour (c); g.drawEllipse (pos.x - rad - 4, pos.y - rad - 4, rad * 2 + 8, rad * 2 + 8, 1.2f);
-        }
+        paintNode (g, b);
     }
 
     // lasso
@@ -450,6 +421,45 @@ void EqDisplay::paint (juce::Graphics& g)
 
     paintMeters (g);
     paintPiano (g);
+}
+
+// Une poignée (aussi redessinée par-dessus le panneau flottant quand elle passe dessous)
+void EqDisplay::paintNode (juce::Graphics& g, int b) const
+{
+    const auto& p = theme.pal();
+    const auto s = proc.getBandSpec (b, true);
+    const auto c = bandColour (b, p);
+    const auto pos = nodePos (b);
+    const bool sel = selection.contains (b), hv = b == hover;
+    const float rad = sel ? 9.5f : hv ? 9.0f : 8.0f;
+    if (sel)
+    {
+        g.setColour (c.withAlpha (0.25f));
+        g.fillEllipse (pos.x - rad - 5, pos.y - rad - 5, (rad + 5) * 2, (rad + 5) * 2);
+    }
+    if (s.active)
+    {
+        g.setColour (c); g.fillEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2);
+        g.setColour (juce::Colours::white);
+    }
+    else
+    {
+        g.setColour (p.cv); g.fillEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2);
+        g.setColour (c.withAlpha (0.7f)); g.drawEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2, 1.6f);
+    }
+    if (sel) { g.setColour (p.dark ? juce::Colours::white : p.text); g.drawEllipse (pos.x - rad - 1, pos.y - rad - 1, rad * 2 + 2, rad * 2 + 2, 1.5f); }
+    g.setColour (s.active ? juce::Colours::white : c);
+    g.setFont (theme.ui (9.5f, 700));
+    g.drawText (String (b + 1), juce::Rectangle<float> (pos.x - 10, pos.y - 6, 20, 12), juce::Justification::centred, false);
+    if (s.place != Place::stereo)
+    {
+        g.setColour (c); g.setFont (theme.ui (9, 700));
+        g.drawText (P::placeShort()[(int) s.place], juce::Rectangle<float> (pos.x + rad - 1, pos.y - rad - 11, 14, 11), juce::Justification::centredLeft, false);
+    }
+    if (proc.getSolo() == b)
+    {
+        g.setColour (c); g.drawEllipse (pos.x - rad - 4, pos.y - rad - 4, rad * 2 + 8, rad * 2 + 8, 1.2f);
+    }
 }
 
 void EqDisplay::paintAnalyzer (juce::Graphics& g, const std::vector<float>& col, juce::Colour c, bool fill)
