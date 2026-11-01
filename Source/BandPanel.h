@@ -58,7 +58,7 @@ inline void trash (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour c)
 class BandPanel : public juce::Component
 {
 public:
-    static constexpr int panelW = 560, singleH = 172, multiH = 78;
+    static constexpr int panelW = 580, singleH = 208, multiH = 88;
 
     BandPanel (Theme& t, AudioLabEqProcessor& p, EqDisplay& d)
         : theme (t), proc (p), display (d),
@@ -71,7 +71,6 @@ public:
         soloBtn.icon = icons::headphones; soloBtn.iconOnly = true;
         delBtn.icon = icons::trash;     delBtn.iconOnly = true;
         closeBtn.icon = icons::cross;   closeBtn.iconOnly = true;
-        for (auto* b : { &onBtn, &soloBtn, &delBtn, &closeBtn, &dynBtn }) b->raised = true;
         closeBtn.setTooltip (fr ("Fermer le panneau (Échap)"));
         closeBtn.onClick = [this] { display.clearSelection(); };
         onBtn.setTooltip (fr ("Activer / désactiver la bande (double-clic sur la poignée)"));
@@ -131,7 +130,7 @@ public:
         const auto& sel = display.getSelection();
         count = sel.size();
         band = count >= 1 ? sel[0] : -1;
-        kFreq.reset(); kGain.reset(); kQ.reset(); kThr.reset(); kRange.reset(); vAtt.reset(); vRel.reset();
+        kFreq.reset(); kGain.reset(); kQ.reset(); kThr.reset(); kRange.reset(); kAtt.reset(); kRel.reset();
 
         const bool single = count == 1, any = count >= 1;
         for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &closeBtn, (juce::Component*) &placeBox }) c->setVisible (any);
@@ -141,32 +140,27 @@ public:
         if (single)
         {
             const int b = band;
-            auto bc = [b] (const Pal& q) { return bandColour (b, q); };
-            auto ora = [] (const Pal& q) { return q.orange; };
-            kFreq = std::make_unique<ArcKnob> (theme, *proc.bandParam (b, P::fFreq), fr ("Fréquence"), "Hz", bc, ArcKnob::Size::xs,
+            using K = ArcKnob;
+            const auto M = K::Size::main, S = K::Size::small;
+            // teal : fréquence, gain, Q, seuil (forme de la courbe, niveau) ; orange : plage, attaque, retour (action, temps)
+            kFreq = std::make_unique<K> (theme, *proc.bandParam (b, P::fFreq), fr ("Fréquence"), "Hz", Fam::teal, M,
                 [] (float v) { return P::fmtHzShort (v); }, 20.0f, fr ("Fréquence centrale ou de coupure"));
-            kGain = std::make_unique<ArcKnob> (theme, *proc.bandParam (b, P::fGain), "Gain", "dB", bc, ArcKnob::Size::xs,
+            kGain = std::make_unique<K> (theme, *proc.bandParam (b, P::fGain), "Gain", "dB", Fam::teal, M,
                 [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Gain de la bande (cloches, shelfs, tilt)"));
-            kQ = std::make_unique<ArcKnob> (theme, *proc.bandParam (b, P::fQ), "Q", "Q", bc, ArcKnob::Size::xs,
+            kQ = std::make_unique<K> (theme, *proc.bandParam (b, P::fQ), "Q", "Q", Fam::teal, M,
                 [] (float v) { return P::fmtQ (v); }, 0.025f, fr ("Largeur de bande : Q élevé = étroit (molette sur la poignée)"));
-            kThr = std::make_unique<ArcKnob> (theme, *proc.bandParam (b, P::fThr), fr ("Seuil"), "dB", ora, ArcKnob::Size::xs,
+            kThr = std::make_unique<K> (theme, *proc.bandParam (b, P::fThr), fr ("Seuil"), "dB", Fam::teal, M,
                 [] (float v) { return juce::String (v, 1); }, 0.0f, fr ("Niveau à partir duquel la bande dynamique agit"));
-            kRange = std::make_unique<ArcKnob> (theme, *proc.bandParam (b, P::fRange), "Plage", "dB", ora, ArcKnob::Size::xs,
+            kRange = std::make_unique<K> (theme, *proc.bandParam (b, P::fRange), "Plage", "dB", Fam::orange, M,
                 [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Gain ajouté (+) ou retiré (−) au maximum quand le signal dépasse le seuil (Alt + molette sur la poignée)"));
-            vAtt = std::make_unique<ValueBox> (theme, *proc.bandParam (b, P::fAtt), fr ("Attaque"), [] (float v) { return P::fmtMs (v); }, true);
-            vRel = std::make_unique<ValueBox> (theme, *proc.bandParam (b, P::fRel), fr ("Retour"), [] (float v) { return P::fmtMs (v); }, true);
-            vAtt->setTooltip (fr ("Vitesse de réaction de la dynamique de cette bande (glisser verticalement, double-clic : 10 ms)"));
-            vRel->setTooltip (fr ("Temps de retour de la dynamique de cette bande (glisser verticalement, double-clic : 150 ms)"));
-            for (auto* k : { kFreq.get(), kGain.get(), kQ.get(), kThr.get(), kRange.get() })
+            kAtt = std::make_unique<K> (theme, *proc.bandParam (b, P::fAtt), fr ("Attaque"), "ms", Fam::orange, S,
+                [] (float v) { return P::fmtMs (v); }, 0.5f, fr ("Vitesse de réaction de la dynamique de cette bande (double-clic : 10 ms)"));
+            kRel = std::make_unique<K> (theme, *proc.bandParam (b, P::fRel), fr ("Retour"), "ms", Fam::orange, S,
+                [] (float v) { return P::fmtMs (v); }, 10.0f, fr ("Temps de retour de la dynamique de cette bande (double-clic : 150 ms)"));
+            for (auto* k : { kFreq.get(), kGain.get(), kQ.get(), kThr.get(), kRange.get(), kAtt.get(), kRel.get() })
             {
                 k->onGestureStart = [this] { proc.pushUndo(); };
                 addAndMakeVisible (k);
-            }
-            for (auto* v : { vAtt.get(), vRel.get() })
-            {
-                v->raised = true;
-                v->onGestureStart = [this] { proc.pushUndo(); };
-                addAndMakeVisible (v);
             }
             title = fr ("Bande ") + juce::String (b + 1);
         }
@@ -203,7 +197,7 @@ public:
         dim (kGain.get(), eq::hasGain (shape));
         dim (kQ.get(), eq::usesQ (shape, slope));
         const bool dynOn = dyn && eq::canBeDynamic (shape);
-        for (juce::Component* c : { (juce::Component*) kThr.get(), (juce::Component*) kRange.get(), (juce::Component*) vAtt.get(), (juce::Component*) vRel.get() })
+        for (juce::Component* c : { (juce::Component*) kThr.get(), (juce::Component*) kRange.get(), (juce::Component*) kAtt.get(), (juce::Component*) kRel.get() })
             dim (c, dynOn);
     }
 
@@ -211,63 +205,65 @@ public:
     {
         const auto& p = theme.pal();
         auto b = getLocalBounds().toFloat();
-        juce::Path box; box.addRoundedRectangle (b.reduced (0.5f), 14);
-        g.setColour (p.panel); g.fillPath (box);
-        g.setColour (p.dark ? juce::Colours::white.withAlpha (0.08f) : juce::Colours::black.withAlpha (0.06f));
-        g.strokePath (box, juce::PathStrokeType (1));
+        juce::Path box; box.addRoundedRectangle (b.reduced (0.5f), 12);
+        g.setColour (p.surface); g.fillPath (box);
+        g.setColour (p.rail); g.strokePath (box, juce::PathStrokeType (1));
 
         if (count == 0) return;
-        float x = 14;
+        float x = 16;
         if (count == 1)
         {
-            g.setColour (bandColour (band, p)); g.fillEllipse (x, 12 + 8, 12, 12);
-            x += 20;
+            // pastille numérotée de la bande choisie
+            g.setColour (p.select); g.fillEllipse (x, 20, 20, 20);
+            g.setColour (p.text); g.setFont (theme.ui (10, 600));
+            g.drawText (juce::String (band + 1), juce::Rectangle<float> (x, 20, 20, 20), juce::Justification::centred, false);
+            x += 28;
         }
         g.setColour (p.text); g.setFont (theme.ui (14, 600));
-        g.drawText (title, juce::Rectangle<float> (x, 12, count == 1 ? 66.0f : 200.0f, 28), juce::Justification::centredLeft, false);
-        const auto sepCol = p.dark ? juce::Colours::white.withAlpha (0.1f) : juce::Colours::black.withAlpha (0.08f);
-        g.setColour (sepCol);
-        g.fillRect (sepCloseX, 17.0f, 1.0f, 18.0f);   // avant la croix de fermeture
-        if (count == 1) g.fillRect (sepX, 50.0f, 1.0f, 70.0f);
+        g.drawText (title, juce::Rectangle<float> (x, 16, count == 1 ? 70.0f : 200.0f, 28), juce::Justification::centredLeft, false);
+        g.setColour (p.rail);
+        g.fillRect (sepCloseX, 21.0f, 1.0f, 18.0f);   // avant la croix de fermeture
+        if (count == 1) g.fillRect (sepX, 58.0f, 1.0f, 84.0f);
         else
         {
-            g.setColour (p.muted); g.setFont (theme.ui (11.5f));
+            g.setColour (p.text2); g.setFont (theme.ui (12));
             g.drawText (fr ("Glissez une poignée pour déplacer toute la sélection · Maj : réglage fin"),
-                        juce::Rectangle<float> (14, 46, (float) getWidth() - 28, 18), juce::Justification::centredLeft, false);
+                        juce::Rectangle<float> (16, 56, (float) getWidth() - 32, 18), juce::Justification::centredLeft, false);
         }
     }
 
 private:
     void layout()
     {
-        // ligne 1 : … · active · écouter · supprimer | fermer
-        const int y1 = 12, h1 = 28, right = getWidth() - 14;
+        // marge intérieure 16 ; ligne 1 : … · active · écouter · supprimer | fermer
+        const int y1 = 16, h1 = 28, right = getWidth() - 16;
         closeBtn.setBounds (right - 28, y1, 28, h1);
-        sepCloseX = (float) right - 28 - 7;
-        delBtn.setBounds (right - 28 - 14 - 28, y1, 28, h1);
+        sepCloseX = (float) right - 28 - 9;
+        delBtn.setBounds (right - 28 - 18 - 28, y1, 28, h1);
         if (count == 1)
         {
             soloBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
             onBtn.setBounds (soloBtn.getX() - 4 - 28, y1, 28, h1);
-            shapeBox.setBounds (106, y1, 104, h1);
-            slopeBox.setBounds (216, y1, 96, h1);
-            placeBox.setBounds (318, y1, onBtn.getX() - 8 - 318, h1);
+            shapeBox.setBounds (118, y1, 100, h1);
+            slopeBox.setBounds (224, y1, 96, h1);
+            placeBox.setBounds (326, y1, juce::jmin (88, onBtn.getX() - 12 - 326), h1);
 
-            const int y2 = 50, kw = 70, kh = 76;
-            int x = 14;
-            for (auto* k : { kFreq.get(), kGain.get(), kQ.get() }) { k->setBounds (x, y2, kw, kh); x += kw + 4; }
-            sepX = (float) x + 10; x += 21 + 4;
-            dynBtn.setBounds (x, y2 + 22, juce::roundToInt (dynBtn.idealWidth()), 28);
-            x = dynBtn.getRight() + 6;
+            // ligne 2 : potentiomètres 72 px (colonnes de 80), dynamique ; ligne 3 : attaque, retour
+            const int y2 = 58, kw = 80, kh = 94;
+            int x = 16;
+            for (auto* k : { kFreq.get(), kGain.get(), kQ.get() }) { k->setBounds (x, y2, kw, kh); x += kw + 6; }
+            sepX = (float) x + 4; x += 14;
+            dynBtn.setBounds (x, y2 + 22, 88, 28);
+            x = dynBtn.getRight() + 8;
             kThr->setBounds (x, y2, kw, kh);
-            kRange->setBounds (x + kw + 4, y2, kw, kh);
-            vAtt->setBounds (x, y2 + kh + 2, kw, 32);
-            vRel->setBounds (x + kw + 4, y2 + kh + 2, kw, 32);
+            kRange->setBounds (x + kw + 6, y2, kw, kh);
+            kAtt->setBounds (x + 4, y2 + kh + 12, kAtt->idealWidth(), 28);
+            kRel->setBounds (x + kw + 10, y2 + kh + 12, kRel->idealWidth(), 28);
         }
         else
         {
             onBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
-            placeBox.setBounds (220, y1, 104, h1);
+            placeBox.setBounds (224, y1, 104, h1);
         }
     }
 
@@ -298,7 +294,6 @@ private:
     float sepX = 246, sepCloseX = 0;
     PillButton onBtn, soloBtn, delBtn, closeBtn, dynBtn;
     juce::ComboBox shapeBox, slopeBox, placeBox;
-    std::unique_ptr<ArcKnob> kFreq, kGain, kQ, kThr, kRange;
-    std::unique_ptr<ValueBox> vAtt, vRel;
+    std::unique_ptr<ArcKnob> kFreq, kGain, kQ, kThr, kRange, kAtt, kRel;
 };
 } // namespace audiolab

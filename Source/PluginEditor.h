@@ -18,7 +18,7 @@ public:
     void resized() override;
     bool keyPressed (const juce::KeyPress&) override;
 
-    static constexpr int baseW = 1120, baseH = 624;
+    static constexpr int baseW = 1120, baseH = 640;
 
     audiolab::EqDisplay& getDisplay() { return display; }   // tests
 
@@ -83,7 +83,7 @@ private:
     // barre du bas
     audiolab::SegButtons phaseSeg { theme, { juce::String::fromUTF8 ("Zéro latence"), juce::String::fromUTF8 ("Linéaire") } };
     juce::ComboBox analyzerBox;
-    std::unique_ptr<audiolab::ValueBox> vScale, vOut;
+    std::unique_ptr<audiolab::ArcKnob> vScale, vOut;
     audiolab::PillButton autoBtn;
 
     std::unique_ptr<juce::ParameterAttachment> bypassAtt;

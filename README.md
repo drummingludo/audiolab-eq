@@ -12,7 +12,7 @@ Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme
 - **Dessiner la courbe** (clic droit dans la courbe) : tracez la courbe voulue, les bandes sont placées et réglées automatiquement au relâchement.
 - **Écoute d'une bande** (Alt + clic maintenu ou bouton *Écouter*) pour entendre seulement la zone traitée.
 - Interface épurée : la courbe occupe toute la fenêtre, les réglages de la bande sélectionnée apparaissent dans un **panneau flottant** sous la courbe.
-- Annuler / rétablir (Cmd+Z), **échelle de gain** (0–200 %), **gain auto** pour comparer à niveau égal, thème clair / sombre qui suit l'ordinateur, fenêtre redimensionnable.
+- Annuler / rétablir (Cmd+Z), **échelle de gain** (0–200 %), **gain auto** pour comparer à niveau égal, interface sombre selon la charte Audio Lab V2 (teal pour les niveaux et la forme de la courbe, orange pour le temps et l'action du traitement, police Poppins), fenêtre redimensionnable.
 - Le réglage par défaut contient **cinq bandes à plat** (low shelf 60 Hz, cloches 300 Hz, 1 kHz, 3 kHz, high shelf 10 kHz, toutes à 0 dB) : le son passe sans modification, il suffit de tirer une poignée.
 
 ## Prise en main
@@ -72,6 +72,6 @@ cmake --build build --target ALEQDspTest ALEQProcessorTest ALEQRenderUI
 
 ## Licence
 
-Code sous **GNU AGPLv3** (voir `LICENSE`), comme la version libre du framework [JUCE](https://juce.com) qu'il utilise. Police Inter sous licence SIL OFL 1.1 (`Resources/Inter-OFL-LICENSE.txt`).
+Code sous **GNU AGPLv3** (voir `LICENSE`), comme la version libre du framework [JUCE](https://juce.com) qu'il utilise. Police Poppins sous licence SIL OFL 1.1 (`Resources/Poppins-OFL-LICENSE.txt`).
 
 © Transversal Studio — Ludovic Diaz

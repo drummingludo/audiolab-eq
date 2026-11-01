@@ -44,7 +44,7 @@ public:
     std::function<void()> onCurvesChanged;   // poignées déplacées : le panneau flottant suit
 
     static constexpr double fMin = 20.0, fMax = 20000.0;
-    static constexpr float rightGutter = 48.0f, bottomGutter = 24.0f;
+    static constexpr float rightGutter = 72.0f, bottomGutter = 24.0f;
     // Échelle dB comme Pro-Q : 0 dB au-dessus du milieu (y = 216 sur 520) pour laisser la place
     // au panneau de bande en bas ; vers −7 dB la courbe passe derrière le panneau, la grille continue.
     static constexpr float curveTop = 12.0f, curveBottom = 420.0f;

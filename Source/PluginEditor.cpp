@@ -61,10 +61,12 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
         display.refresh();
     };
 
-    vScale = std::make_unique<ValueBox> (theme, prm (P::gainScale), U ("Échelle"), [] (float v) { return String (juce::roundToInt (v)) + " %"; }, false);
-    vScale->setTooltip (U ("Échelle de gain : multiplie le gain de toutes les bandes (100 % = tel quel, 0 % = courbe plate, 200 % = doublé). Glisser verticalement, double-clic : 100 %"));
-    vOut = std::make_unique<ValueBox> (theme, prm (P::outGain), U ("Sortie"), [] (float v) { return P::fmtDb (v) + " dB"; }, false);
-    vOut->setTooltip (U ("Gain de sortie. Glisser verticalement, double-clic : 0 dB"));
+    // petits potentiomètres : échelle (forme de la courbe, teal), sortie (gain, teal secondaire, départ à 12 h)
+    vScale = std::make_unique<ArcKnob> (theme, prm (P::gainScale), U ("Échelle"), "%", Fam::teal, ArcKnob::Size::small,
+        [] (float v) { return String (juce::roundToInt (v)) + " %"; }, 0.0f,
+        U ("Échelle de gain : multiplie le gain de toutes les bandes (100 % = tel quel, 0 % = courbe plate, 200 % = doublé). Double-clic : 100 %"));
+    vOut = std::make_unique<ArcKnob> (theme, prm (P::outGain), U ("Sortie"), "dB", Fam::teal2, ArcKnob::Size::small,
+        [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Gain de sortie. Double-clic : 0 dB"));
     for (auto* v : { vScale.get(), vOut.get() }) v->onGestureStart = [this] { proc.pushUndo(); };
 
     autoBtn.setTooltip (U ("Gain auto : compense le volume moyen ajouté ou retiré par l'égalisation, pour comparer à niveau égal"));
@@ -107,9 +109,7 @@ AudioLabEqEditor::~AudioLabEqEditor()
 
 void AudioLabEqEditor::applyTheme()
 {
-    const String t = proc.ui.getProperty ("themeOverride", "auto").toString();
-    const bool dark = t == "dark" || (t != "light" && juce::Desktop::getInstance().isDarkModeActive());
-    theme.setDark (dark);
+    // charte V2 : un seul thème, sombre
     lnf.refresh();
     sendLookAndFeelChange();
     content.repaint();
@@ -178,9 +178,9 @@ bool AudioLabEqEditor::NodeOverlay::hitTest (int x, int y)
 void AudioLabEqEditor::Shadow::paint (juce::Graphics& g)
 {
     if (! ed.panel.isVisible()) return;
-    juce::Path box; box.addRoundedRectangle (ed.panel.getBounds().toFloat(), 14);
+    juce::Path box; box.addRoundedRectangle (ed.panel.getBounds().toFloat(), 12);
     const bool dark = ed.theme.pal().dark;
-    juce::DropShadow (juce::Colours::black.withAlpha (dark ? 0.55f : 0.16f), 28, { 0, 8 }).drawForPath (g, box);
+    juce::DropShadow (juce::Colours::black.withAlpha (dark ? 0.6f : 0.16f), 36, { 0, 14 }).drawForPath (g, box);
 }
 
 void AudioLabEqEditor::timerCallback()
@@ -216,19 +216,20 @@ void AudioLabEqEditor::Content::resized()
 {
     auto& e = ed;
     // courbe 1040 × 520 en (16, 16) ; à droite l'échelle dB et les crêtes ; dessous le clavier
-    e.display.setBounds (16, 16, 1040 + (int) EqDisplay::rightGutter, 520 + (int) EqDisplay::bottomGutter);
+    // écran 1000 × 520 en (24, 24) (marges de 24) ; à droite l'échelle dB et les barres de sortie ; dessous le clavier
+    e.display.setBounds (24, 24, 1000 + (int) EqDisplay::rightGutter, 520 + (int) EqDisplay::bottomGutter);
     e.shadow.setBounds (getLocalBounds());
-    e.toast.setBounds (16, 16, 1040, 520);
+    e.toast.setBounds (24, 24, 1000, 520);
 
-    // barre du bas (hauteur 40 à partir de y = 570)
-    const int y = 575, h = 30;
-    const int pw = juce::roundToInt (e.phaseSeg.idealWidth());
-    e.phaseSeg.setBounds (16, y, pw, h);
-    e.analyzerBox.setBounds (e.phaseSeg.getRight() + 8, y, 196, h);
-    int rx = baseW - 16;
+    // barre du bas : y = 584, hauteur 32, écarts de 16
+    const int y = 584, h = 32;
+    e.phaseSeg.setBounds (24, y, 216, h);
+    e.analyzerBox.setBounds (e.phaseSeg.getRight() + 16, y, 200, h);
+    int rx = baseW - 24;
     const int aw = juce::roundToInt (e.autoBtn.idealWidth());
-    e.autoBtn.setBounds (rx - aw, y, aw, h); rx -= aw + 8;
-    e.vOut->setBounds (rx - 106, y, 106, h); rx -= 106 + 8;
-    e.vScale->setBounds (rx - 108, y, 108, h);
+    e.autoBtn.setBounds (rx - aw, y, aw, h); rx -= aw + 16;
+    const int ow = e.vOut->idealWidth(), sw = e.vScale->idealWidth();
+    e.vOut->setBounds (rx - ow, y + 2, ow, 28); rx -= ow + 16;
+    e.vScale->setBounds (rx - sw, y + 2, sw, 28);
     e.placePanel();
 }

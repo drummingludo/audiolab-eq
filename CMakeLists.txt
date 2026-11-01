@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "")
 
-project(AudioLabEQ VERSION 1.1.3 LANGUAGES C CXX)
+project(AudioLabEQ VERSION 1.2.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -50,9 +50,10 @@ juce_add_plugin(AudioLabEQ
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 juce_add_binary_data(ALEQData SOURCES
-    Resources/Inter-Regular.ttf
-    Resources/Inter-SemiBold.ttf
-    Resources/Inter-Bold.ttf)
+    Resources/Poppins-Regular.ttf
+    Resources/Poppins-Medium.ttf
+    Resources/Poppins-SemiBold.ttf
+    Resources/Poppins-Bold.ttf)
 
 target_sources(AudioLabEQ PRIVATE
     Source/PluginProcessor.cpp
