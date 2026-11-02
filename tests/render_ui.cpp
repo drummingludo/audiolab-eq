@@ -62,8 +62,8 @@ int main (int argc, char** argv)
 
     auto& P_phase = *proc->apvts.getParameter (audiolab::params::phase);
     steps.push_back ({ 0,    [&] { theme ("light"); rebuild(); } });   // réglage par défaut d'une nouvelle instance
-    steps.push_back ({ 1500, [&] { shot ("00_clair_defaut"); preset ("Voix — clarté"); ed->getDisplay().select (2); } });
-    steps.push_back ({ 1800, [&] { shot ("01_clair_bande3"); theme ("dark"); preset ("Voix — de-esser"); rebuild(); ed->getDisplay().select (1); } });
+    steps.push_back ({ 1500, [&] { shot ("00_clair_defaut"); preset ("Vocal: clarity"); ed->getDisplay().select (2); } });
+    steps.push_back ({ 1800, [&] { shot ("01_clair_bande3"); theme ("dark"); preset ("Vocal: de-esser"); rebuild(); ed->getDisplay().select (1); } });
     steps.push_back ({ 1800, [&] { shot ("02_sombre_dynamique"); theme ("light"); proc->clearAllBands(); rebuild(); } });
     auto click = [&] (juce::Point<float> pos)
     {

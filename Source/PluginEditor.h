@@ -81,7 +81,7 @@ private:
     audiolab::Toast toast { theme };
 
     // barre du bas
-    audiolab::SegButtons phaseSeg { theme, { juce::String::fromUTF8 ("Zéro latence"), juce::String::fromUTF8 ("Linéaire") } };
+    audiolab::SegButtons phaseSeg { theme, { "Zero latency", "Linear" } };
     juce::ComboBox analyzerBox;
     std::unique_ptr<audiolab::ArcKnob> vScale, vOut;
     audiolab::PillButton autoBtn;

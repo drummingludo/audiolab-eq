@@ -10,7 +10,7 @@ static String U (const char* s) { return String::fromUTF8 (s); }
 EqDisplay::EqDisplay (Theme& t, AudioLabEqProcessor& p) : theme (t), proc (p)
 {
     setWantsKeyboardFocus (true);
-    setTitle (U ("Courbe d'égalisation"));
+    setTitle (U ("EQ curve"));
     fftBuf.assign ((size_t) fftSize * 2, 0.0f);
     window.resize ((size_t) fftSize);
     for (int i = 0; i < fftSize; ++i)
@@ -343,7 +343,7 @@ void EqDisplay::paint (juce::Graphics& g)
     if (curveMode != 0)
     {
         // légende des deux courbes
-        const String a = curveMode == 2 ? "Mid" : U ("Gauche"), b = curveMode == 2 ? "Side" : U ("Droite");
+        const String a = curveMode == 2 ? "Mid" : U ("Left"), b = curveMode == 2 ? "Side" : U ("Right");
         auto lg = juce::Rectangle<float> (r.getX() + 12, r.getY() + 10, 150, 16);
         g.setColour (p.teal); g.fillRect (lg.getX(), lg.getCentreY() - 1.25f, 18.0f, 2.5f);
         g.setColour (p.text); g.setFont (theme.ui (11, 500)); g.drawText (a, lg.withTrimmedLeft (24), juce::Justification::centredLeft, false);
@@ -395,7 +395,7 @@ void EqDisplay::paint (juce::Graphics& g)
         if (drag != Drag::sketch)
         {
             g.setColour (p.orange); g.setFont (theme.ui (12, 500));
-            g.drawText (U ("Dessinez la courbe voulue : les bandes sont ajustées au relâchement"),
+            g.drawText (U ("Draw the curve you want: the bands are fitted when you release"),
                         r.withHeight (28).translated (0, 8), juce::Justification::centred, false);
         }
     }
@@ -569,7 +569,7 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
     // consigne sous la ligne 0 dB (à gauche de l'aide quand elle est ouverte)
     auto hint = help ? juce::Rectangle<float> (r.getX() + 60, yOf (0) + 30, 560, 40)
                      : juce::Rectangle<float> (r.getX(), yOf (0) + 30, r.getWidth(), 40);
-    const String l1 = U ("Cliquez dans la courbe pour ajouter une bande"), l2 = U ("ou clic droit › Dessiner la courbe");
+    const String l1 = U ("Click on the curve to add a band"), l2 = U ("or right-click › Draw curve");
     {
         // voile discret derrière la consigne pour la lire par-dessus l'analyseur
         juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (14, 600), l1, 0, 0);
@@ -589,7 +589,7 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
     g.setColour (p.surface); g.fillPath (box);
     g.setColour (p.rail); g.strokePath (box, juce::PathStrokeType (1));
     g.setColour (p.text); g.setFont (theme.ui (13, 600));
-    g.drawText (U ("Gestes et raccourcis"), juce::Rectangle<float> (c.getX() + 16, c.getY() + 12, 240, 22), juce::Justification::centredLeft, false);
+    g.drawText (U ("Gestures and shortcuts"), juce::Rectangle<float> (c.getX() + 16, c.getY() + 12, 240, 22), juce::Justification::centredLeft, false);
     auto x = helpClose();
     g.setColour (p.cap); g.fillEllipse (x);
     g.setColour (p.text2);
@@ -598,15 +598,15 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
     g.drawLine (xc.x + 3, xc.y - 3, xc.x - 3, xc.y + 3, 1.4f);
 
     const char* rows[][2] = {
-        { "Clic dans la courbe", "Nouvelle bande (bords : coupes)" },
-        { "Glisser une poignée", "Fréquence et gain · Maj : fin" },
-        { "Molette", "Largeur (Q)" },
-        { "Alt + molette", "Plage de l'EQ dynamique" },
-        { "Alt + clic maintenu", "Écouter la bande seule" },
-        { "Double-clic", "Activer / désactiver" },
-        { "Clic droit", "Forme, pente, Mid/Side, dessin…" },
-        { "Glisser dans le vide", "Sélection multiple" },
-        { "⌘Z · ⌘⇧Z", "Annuler · rétablir" } };
+        { "Click on the curve", "New band (edges: cuts)" },
+        { "Drag a handle", "Frequency and gain · Shift: fine" },
+        { "Mouse wheel", "Width (Q)" },
+        { "Alt + mouse wheel", "Dynamic EQ range" },
+        { "Alt + click and hold", "Listen to the band alone" },
+        { "Double-click", "Turn on / off" },
+        { "Right-click", "Shape, slope, Mid/Side, drawing…" },
+        { "Drag on empty space", "Multiple selection" },
+        { "⌘Z · ⌘⇧Z", "Undo · redo" } };
     float y = c.getY() + 44;
     const auto chipFont = theme.ui (11, 500), txtFont = theme.ui (11);
     for (auto& row : rows)
@@ -630,9 +630,9 @@ void EqDisplay::paintReadout (juce::Graphics& g, int b)
     const auto pos = nodePos (b);
     int midi; double cents;
     nearestNote (s.freq, midi, cents);
-    String l1 = U ("Bande ") + String (b + 1) + U (" · ") + P::shapeNames()[(int) s.shape];
+    String l1 = U ("Band ") + String (b + 1) + U (" · ") + P::shapeNames()[(int) s.shape];
     if (s.place != Place::stereo) l1 << U (" · ") << P::placeNames()[(int) s.place];
-    if (! s.active) l1 << U (" · désactivée");
+    if (! s.active) l1 << U (" · off");
     String l2 = P::fmtHz ((float) s.freq);
     if (hasGain (s.shape)) l2 << U ("  ") << P::fmtDb ((float) s.gainDb) << " dB";
     if (usesQ (s.shape, s.slope)) l2 << "  Q " << P::fmtQ ((float) s.q);
@@ -708,7 +708,7 @@ void EqDisplay::deleteSelected()
     if (selection.isEmpty()) return;
     proc.pushUndo();
     for (int b : selection) proc.deleteBand (b);
-    if (onMessage) onMessage (selection.size() > 1 ? String (selection.size()) + U (" bandes supprimées") : U ("Bande supprimée"));
+    if (onMessage) onMessage (selection.size() > 1 ? String (selection.size()) + U (" bands deleted") : U ("Band deleted"));
     selection.clearQuick();
     if (onSelectionChanged) onSelectionChanged();
     refresh();
@@ -888,7 +888,7 @@ void EqDisplay::mouseUp (const juce::MouseEvent& e)
         proc.pushUndo();
         const int b = proc.createBand (shape, (float) juce::jlimit (fMin, fMax, f),
                                        std::abs (g) < 0.15f ? 0.0f : g, shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
-        if (b < 0) { if (onMessage) onMessage (U ("Les 24 bandes sont utilisées")); return; }
+        if (b < 0) { if (onMessage) onMessage (U ("All 24 bands are in use")); return; }
         createdBand = b; createdAt = juce::Time::getMillisecondCounter();
         select (b);
         refresh();
@@ -905,7 +905,7 @@ void EqDisplay::mouseDoubleClick (const juce::MouseEvent& e)
     proc.pushUndo();
     const bool on = proc.bandValue (b, P::fOn) > 0.5f;
     proc.setBandValue (b, P::fOn, on ? 0.0f : 1.0f);
-    if (onMessage) onMessage (U ("Bande ") + String (b + 1) + (on ? U (" désactivée") : U (" activée")));
+    if (onMessage) onMessage (U ("Band ") + String (b + 1) + (on ? U (" off") : U (" on")));
     refresh();
 }
 
@@ -972,22 +972,22 @@ void EqDisplay::showBandMenu (int b, juce::Point<float>)
     for (int i = 0; i < numSlopes; ++i) slopes.addItem (sn[i], true, i == slopeIdx, [apply, i] { apply (P::fSlope, (float) i); });
     const auto pn = P::placeNames();
     for (int i = 0; i < numPlaces; ++i) places.addItem (pn[i], true, i == place, [apply, i] { apply (P::fPlace, (float) i); });
-    m.addSectionHeader (U ("Bande ") + String (b + 1) + (targets.size() > 1 ? U (" (+") + String (targets.size() - 1) + ")" : String()));
-    m.addSubMenu (U ("Forme"), shapes);
-    m.addSubMenu (U ("Pente"), slopes, usesSlope (shape));
-    m.addSubMenu (U ("Placement stéréo"), places);
+    m.addSectionHeader (U ("Band ") + String (b + 1) + (targets.size() > 1 ? U (" (+") + String (targets.size() - 1) + ")" : String()));
+    m.addSubMenu (U ("Shape"), shapes);
+    m.addSubMenu (U ("Slope"), slopes, usesSlope (shape));
+    m.addSubMenu (U ("Stereo placement"), places);
     m.addSeparator();
     const bool on = proc.bandValue (b, P::fOn) > 0.5f;
-    m.addItem (on ? U ("Désactiver") : U ("Activer"), [apply, on] { apply (P::fOn, on ? 0.0f : 1.0f); });
+    m.addItem (on ? U ("Turn off") : U ("Turn on"), [apply, on] { apply (P::fOn, on ? 0.0f : 1.0f); });
     const bool dyn = proc.bandValue (b, P::fDyn) > 0.5f;
-    m.addItem (U ("EQ dynamique"), canBeDynamic (shape), dyn, [apply, dyn] { apply (P::fDyn, dyn ? 0.0f : 1.0f); });
-    m.addItem (U ("Écouter cette bande"), true, proc.getSolo() == b, [safe, b]
+    m.addItem (U ("Dynamic EQ"), canBeDynamic (shape), dyn, [apply, dyn] { apply (P::fDyn, dyn ? 0.0f : 1.0f); });
+    m.addItem (U ("Listen to this band"), true, proc.getSolo() == b, [safe, b]
     {
         if (safe != nullptr) { safe->proc.setSolo (safe->proc.getSolo() == b ? -1 : b); safe->refresh(); if (safe->onSelectionChanged) safe->onSelectionChanged(); }
     });
-    m.addItem (U ("Réinitialiser le gain"), hasGain (shape), false, [apply] { apply (P::fGain, 0.0f); });
+    m.addItem (U ("Reset gain"), hasGain (shape), false, [apply] { apply (P::fGain, 0.0f); });
     m.addSeparator();
-    m.addItem (targets.size() > 1 ? U ("Supprimer les bandes") : U ("Supprimer"), [safe] { if (safe != nullptr) safe->deleteSelected(); });
+    m.addItem (targets.size() > 1 ? U ("Delete bands") : U ("Delete"), [safe] { if (safe != nullptr) safe->deleteSelected(); });
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition());
 }
 
@@ -1005,25 +1005,25 @@ void EqDisplay::showEmptyMenu (juce::Point<float> at)
         if (b >= 0) safe->select (b);
         safe->refresh();
     };
-    m.addSectionHeader (U ("Ajouter une bande à ") + P::fmtHz ((float) f));
-    m.addItem (U ("Cloche"), [add] { add (Shape::bell, 1.0f, 12); });
+    m.addSectionHeader (U ("Add a band at ") + P::fmtHz ((float) f));
+    m.addItem (U ("Bell"), [add] { add (Shape::bell, 1.0f, 12); });
     m.addItem (U ("Low shelf"), [add] { add (Shape::lowShelf, 0.71f, 12); });
     m.addItem (U ("High shelf"), [add] { add (Shape::highShelf, 0.71f, 12); });
-    m.addItem (U ("Coupe-bas"), [add] { add (Shape::lowCut, 0.71f, 24); });
-    m.addItem (U ("Coupe-haut"), [add] { add (Shape::highCut, 0.71f, 24); });
+    m.addItem (U ("Low cut"), [add] { add (Shape::lowCut, 0.71f, 24); });
+    m.addItem (U ("High cut"), [add] { add (Shape::highCut, 0.71f, 24); });
     m.addItem (U ("Notch"), [add] { add (Shape::notch, 8.0f, 12); });
     m.addSeparator();
-    m.addItem (U ("Dessiner la courbe…"), [safe] { if (safe != nullptr) safe->setSketchMode (true); });
-    m.addItem (U ("Afficher l'aide"), (bool) proc.ui.getProperty ("helpHidden", false), false, [safe]
+    m.addItem (U ("Draw curve…"), [safe] { if (safe != nullptr) safe->setSketchMode (true); });
+    m.addItem (U ("Show help"), (bool) proc.ui.getProperty ("helpHidden", false), false, [safe]
     {
         if (safe == nullptr) return;
         safe->proc.ui.setProperty ("helpHidden", false, nullptr);
-        if (safe->onMessage) safe->onMessage (U ("L'aide s'affiche quand aucune bande n'existe"));
+        if (safe->onMessage) safe->onMessage (U ("Help is shown when there are no bands"));
         safe->repaint();
     });
     m.addSeparator();
-    m.addItem (U ("Tout sélectionner"), [safe] { if (safe != nullptr) safe->selectAll(); });
-    m.addItem (U ("Supprimer toutes les bandes"), [safe]
+    m.addItem (U ("Select all"), [safe] { if (safe != nullptr) safe->selectAll(); });
+    m.addItem (U ("Delete all bands"), [safe]
     {
         if (safe == nullptr) return;
         safe->proc.pushUndo(); safe->proc.clearAllBands(); safe->clearSelection(); safe->refresh();
@@ -1072,6 +1072,6 @@ void EqDisplay::fitSketch()
     std::fill (sketch.begin(), sketch.end(), std::numeric_limits<float>::quiet_NaN());
     setSketchMode (false);   // un tracé à la fois (clic droit › Dessiner la courbe pour recommencer)
     if (onSelectionChanged) onSelectionChanged();
-    if (onMessage) onMessage (String ((int) bandsOut.size()) + U (" bandes ajustées sur le tracé"));
+    if (onMessage) onMessage (String ((int) bandsOut.size()) + U (" bands fitted to the drawing"));
     refresh();
 }

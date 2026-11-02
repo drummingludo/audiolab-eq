@@ -63,7 +63,7 @@ public:
     BandPanel (Theme& t, AudioLabEqProcessor& p, EqDisplay& d)
         : theme (t), proc (p), display (d),
           onBtn (t, PillButton::Style::ibtn, {}), soloBtn (t, PillButton::Style::ibtn, {}),
-          delBtn (t, PillButton::Style::rst, {}), closeBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String::fromUTF8 ("Dynamique"))
+          delBtn (t, PillButton::Style::rst, {}), closeBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String ("Dynamic"))
     {
         namespace P = params;
         setInterceptsMouseClicks (true, true);
@@ -71,20 +71,20 @@ public:
         soloBtn.icon = icons::headphones; soloBtn.iconOnly = true;
         delBtn.icon = icons::trash;     delBtn.iconOnly = true;
         closeBtn.icon = icons::cross;   closeBtn.iconOnly = true;
-        closeBtn.setTooltip (fr ("Fermer le panneau (Échap)"));
+        closeBtn.setTooltip (fr ("Close the panel (Esc)"));
         closeBtn.onClick = [this] { display.clearSelection(); };
-        onBtn.setTooltip (fr ("Activer / désactiver la bande (double-clic sur la poignée)"));
-        soloBtn.setTooltip (fr ("Écouter seulement la zone du spectre traitée par la bande (ou Alt + clic maintenu sur la poignée)"));
-        delBtn.setTooltip (fr ("Supprimer la bande (touche Effacer)"));
-        dynBtn.setTooltip (fr ("EQ dynamique : le gain de la bande varie selon le niveau du signal dans sa zone de fréquences"));
+        onBtn.setTooltip (fr ("Turn the band on / off (double-click the handle)"));
+        soloBtn.setTooltip (fr ("Listen only to the part of the spectrum this band processes (or Alt + click and hold the handle)"));
+        delBtn.setTooltip (fr ("Delete the band (Delete key)"));
+        dynBtn.setTooltip (fr ("Dynamic EQ: the band gain follows the level of the signal in its frequency range"));
 
         for (int i = 0; i < eq::numShapes; ++i) shapeBox.addItem (P::shapeNames()[i], i + 1);
         for (int i = 0; i < eq::numSlopes; ++i) slopeBox.addItem (P::slopeNames()[i], i + 1);
         for (int i = 0; i < eq::numPlaces; ++i) placeBox.addItem (P::placeNames()[i], i + 1);
-        shapeBox.setTitle (fr ("Forme")); slopeBox.setTitle (fr ("Pente")); placeBox.setTitle (fr ("Placement stéréo"));
-        shapeBox.setTooltip (fr ("Forme du filtre"));
-        slopeBox.setTooltip (fr ("Pente des coupes et des shelfs"));
-        placeBox.setTooltip (fr ("Stéréo, gauche, droite, Mid (centre) ou Side (côtés)"));
+        shapeBox.setTitle (fr ("Shape")); slopeBox.setTitle (fr ("Slope")); placeBox.setTitle (fr ("Stereo placement"));
+        shapeBox.setTooltip (fr ("Filter shape"));
+        slopeBox.setTooltip (fr ("Slope of the cuts and shelves"));
+        placeBox.setTooltip (fr ("Stereo, left, right, Mid (centre) or Side (sides)"));
         for (auto* c : { &shapeBox, &slopeBox, &placeBox }) c->getProperties().set ("raised", true);
 
         onBtn.onClick = [this]
@@ -143,28 +143,28 @@ public:
             using K = ArcKnob;
             const auto M = K::Size::main, S = K::Size::small;
             // teal : fréquence, gain, Q, seuil (forme de la courbe, niveau) ; orange : plage, attaque, retour (action, temps)
-            kFreq = std::make_unique<K> (theme, *proc.bandParam (b, P::fFreq), fr ("Fréquence"), "Hz", Fam::teal, M,
-                [] (float v) { return P::fmtHzShort (v); }, 20.0f, fr ("Fréquence centrale ou de coupure"));
+            kFreq = std::make_unique<K> (theme, *proc.bandParam (b, P::fFreq), fr ("Frequency"), "Hz", Fam::teal, M,
+                [] (float v) { return P::fmtHzShort (v); }, 20.0f, fr ("Centre or cut-off frequency"));
             kGain = std::make_unique<K> (theme, *proc.bandParam (b, P::fGain), "Gain", "dB", Fam::teal, M,
-                [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Gain de la bande (cloches, shelfs, tilt)"));
+                [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Band gain (bells, shelves, tilt)"));
             kQ = std::make_unique<K> (theme, *proc.bandParam (b, P::fQ), "Q", "Q", Fam::teal, M,
-                [] (float v) { return P::fmtQ (v); }, 0.025f, fr ("Largeur de bande : Q élevé = étroit (molette sur la poignée)"));
-            kThr = std::make_unique<K> (theme, *proc.bandParam (b, P::fThr), fr ("Seuil"), "dB", Fam::teal, M,
-                [] (float v) { return juce::String (v, 1); }, 0.0f, fr ("Niveau à partir duquel la bande dynamique agit"));
-            kRange = std::make_unique<K> (theme, *proc.bandParam (b, P::fRange), "Plage", "dB", Fam::orange, M,
-                [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Gain ajouté (+) ou retiré (−) au maximum quand le signal dépasse le seuil (Alt + molette sur la poignée)"));
-            kAtt = std::make_unique<K> (theme, *proc.bandParam (b, P::fAtt), fr ("Attaque"), "ms", Fam::orange, S,
-                [] (float v) { return P::fmtMs (v); }, 0.5f, fr ("Vitesse de réaction de la dynamique de cette bande (double-clic : 10 ms)"));
-            kRel = std::make_unique<K> (theme, *proc.bandParam (b, P::fRel), fr ("Retour"), "ms", Fam::orange, S,
-                [] (float v) { return P::fmtMs (v); }, 10.0f, fr ("Temps de retour de la dynamique de cette bande (double-clic : 150 ms)"));
+                [] (float v) { return P::fmtQ (v); }, 0.025f, fr ("Bandwidth: high Q = narrow (mouse wheel on the handle)"));
+            kThr = std::make_unique<K> (theme, *proc.bandParam (b, P::fThr), fr ("Threshold"), "dB", Fam::teal, M,
+                [] (float v) { return juce::String (v, 1); }, 0.0f, fr ("Level above which the dynamic band acts"));
+            kRange = std::make_unique<K> (theme, *proc.bandParam (b, P::fRange), "Range", "dB", Fam::orange, M,
+                [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Maximum gain added (+) or removed (−) when the signal goes above the threshold (Alt + mouse wheel on the handle)"));
+            kAtt = std::make_unique<K> (theme, *proc.bandParam (b, P::fAtt), fr ("Attack"), "ms", Fam::orange, S,
+                [] (float v) { return P::fmtMs (v); }, 0.5f, fr ("How fast this band's dynamics react (double-click: 10 ms)"));
+            kRel = std::make_unique<K> (theme, *proc.bandParam (b, P::fRel), fr ("Release"), "ms", Fam::orange, S,
+                [] (float v) { return P::fmtMs (v); }, 10.0f, fr ("Release time of this band's dynamics (double-click: 150 ms)"));
             for (auto* k : { kFreq.get(), kGain.get(), kQ.get(), kThr.get(), kRange.get(), kAtt.get(), kRel.get() })
             {
                 k->onGestureStart = [this] { proc.pushUndo(); };
                 addAndMakeVisible (k);
             }
-            title = fr ("Bande ") + juce::String (b + 1);
+            title = fr ("Band ") + juce::String (b + 1);
         }
-        else if (any) title = juce::String (count) + fr (" bandes sélectionnées");
+        else if (any) title = juce::String (count) + fr (" bands selected");
         else title = {};
 
         setVisible (any);
@@ -227,7 +227,7 @@ public:
         else
         {
             g.setColour (p.text2); g.setFont (theme.ui (12));
-            g.drawText (fr ("Glissez une poignée pour déplacer toute la sélection · Maj : réglage fin"),
+            g.drawText (fr ("Drag a handle to move the whole selection · Shift: fine adjustment"),
                         juce::Rectangle<float> (16, 56, (float) getWidth() - 32, 18), juce::Justification::centredLeft, false);
         }
     }

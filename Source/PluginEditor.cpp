@@ -12,7 +12,7 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     : AudioProcessorEditor (&p), proc (p),
       display (theme, p),
       panel (theme, p, display),
-      autoBtn (theme, PillButton::Style::ibtn, U ("Gain auto"))
+      autoBtn (theme, PillButton::Style::ibtn, U ("Auto gain"))
 {
     setLookAndFeel (&lnf);
     tooltips.setLookAndFeel (&lnf);
@@ -24,7 +24,7 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     // Courbe + panneau flottant
     display.onSelectionChanged = [this] { rebuildPanel(); };
     display.onMessage = [this] (const String& s) { toast.show (s); };
-    display.onUndoRedo = [this] { rebuildPanel(); toast.show (U ("Annulé / rétabli")); };
+    display.onUndoRedo = [this] { rebuildPanel(); toast.show (U ("Undone / redone")); };
     display.onCurvesChanged = [this] { placePanel(); };
     content.addAndMakeVisible (display);
     content.addAndMakeVisible (shadow);
@@ -38,18 +38,18 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
         phaseSeg.onSelect = [this, f] (int i)
         {
             f (i);
-            toast.show (i == 1 ? U ("Phase linéaire : aucune rotation de phase, latence ") + String (juce::roundToInt (1000.0 * LinearPhase::firLengthFor (proc.getSampleRateSafe()) / 2 / proc.getSampleRateSafe())) + " ms"
-                               : U ("Zéro latence : filtres analogiques, aucune latence"));
+            toast.show (i == 1 ? U ("Linear phase: no phase rotation, latency ") + String (juce::roundToInt (1000.0 * LinearPhase::firLengthFor (proc.getSampleRateSafe()) / 2 / proc.getSampleRateSafe())) + " ms"
+                               : U ("Zero latency: analogue-style filters, no latency"));
         };
     }
-    phaseSeg.setTitle (U ("Mode de phase"));
-    phaseSeg.setTooltip (U ("Zéro latence : comme un égaliseur analogique · Linéaire : aucune rotation de phase (ajoute de la latence)"));
+    phaseSeg.setTitle (U ("Phase mode"));
+    phaseSeg.setTooltip (U ("Zero latency: like an analogue equaliser · Linear: no phase rotation (adds latency)"));
 
-    analyzerBox.addItem (U ("Analyseur : avant + après"), 1);
-    analyzerBox.addItem (U ("Analyseur : après"), 2);
-    analyzerBox.addItem (U ("Analyseur : avant"), 3);
-    analyzerBox.addItem (U ("Analyseur : désactivé"), 4);
-    analyzerBox.setTitle (U ("Analyseur"));
+    analyzerBox.addItem (U ("Analyser: pre + post"), 1);
+    analyzerBox.addItem (U ("Analyser: post"), 2);
+    analyzerBox.addItem (U ("Analyser: pre"), 3);
+    analyzerBox.addItem (U ("Analyser: off"), 4);
+    analyzerBox.setTitle (U ("Analyser"));
     {
         const auto m = proc.ui.getProperty ("analyzer", "prepost").toString();
         analyzerBox.setSelectedId (m == "post" ? 2 : m == "pre" ? 3 : m == "off" ? 4 : 1, juce::dontSendNotification);
@@ -62,14 +62,14 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     };
 
     // petits potentiomètres : échelle (forme de la courbe, teal), sortie (gain, teal secondaire, départ à 12 h)
-    vScale = std::make_unique<ArcKnob> (theme, prm (P::gainScale), U ("Échelle"), "%", Fam::teal, ArcKnob::Size::small,
+    vScale = std::make_unique<ArcKnob> (theme, prm (P::gainScale), U ("Scale"), "%", Fam::teal, ArcKnob::Size::small,
         [] (float v) { return String (juce::roundToInt (v)) + " %"; }, 0.0f,
-        U ("Échelle de gain : multiplie le gain de toutes les bandes (100 % = tel quel, 0 % = courbe plate, 200 % = doublé). Double-clic : 100 %"));
-    vOut = std::make_unique<ArcKnob> (theme, prm (P::outGain), U ("Sortie"), "dB", Fam::teal2, ArcKnob::Size::small,
-        [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Gain de sortie. Double-clic : 0 dB"));
+        U ("Gain scale: multiplies the gain of every band (100 % = as is, 0 % = flat curve, 200 % = doubled). Double-click: 100 %"));
+    vOut = std::make_unique<ArcKnob> (theme, prm (P::outGain), U ("Output"), "dB", Fam::teal2, ArcKnob::Size::small,
+        [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Output gain. Double-click: 0 dB"));
     for (auto* v : { vScale.get(), vOut.get() }) v->onGestureStart = [this] { proc.pushUndo(); };
 
-    autoBtn.setTooltip (U ("Gain auto : compense le volume moyen ajouté ou retiré par l'égalisation, pour comparer à niveau égal"));
+    autoBtn.setTooltip (U ("Auto gain: compensates the average loudness added or removed by the EQ, to compare at equal level"));
     autoBtn.onClick = [this]
     {
         proc.pushUndo();
@@ -189,7 +189,7 @@ void AudioLabEqEditor::timerCallback()
     if (autoBtn.on != ag) { autoBtn.on = ag; autoBtn.repaint(); }
     if (ag)
     {
-        const String tip = U ("Gain auto : ") + P::fmtDb (proc.getAutoGainDb()) + " dB";
+        const String tip = U ("Auto gain: ") + P::fmtDb (proc.getAutoGainDb()) + " dB";
         if (autoBtn.getTooltip() != tip) autoBtn.setTooltip (tip);
     }
     // le panneau suit les changements faits ailleurs (automation, menu, molette…)

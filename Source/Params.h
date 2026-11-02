@@ -40,8 +40,8 @@ inline juce::String U (const char* s) { return juce::String::fromUTF8 (s); }
 
 inline juce::StringArray shapeNames()
 {
-    return { U ("Cloche"), U ("Low shelf"), U ("Coupe-bas"), U ("High shelf"), U ("Coupe-haut"),
-             U ("Notch"), U ("Passe-bande"), U ("Tilt") };
+    return { U ("Bell"), U ("Low shelf"), U ("Low cut"), U ("High shelf"), U ("High cut"),
+             U ("Notch"), U ("Band pass"), U ("Tilt") };
 }
 inline juce::StringArray slopeNames()
 {
@@ -49,9 +49,9 @@ inline juce::StringArray slopeNames()
     for (int v : eq::slopeValues) s.add (juce::String (v) + " dB/oct");
     return s;
 }
-inline juce::StringArray placeNames() { return { U ("Stéréo"), U ("Gauche"), U ("Droite"), U ("Mid"), U ("Side") }; }
-inline juce::StringArray placeShort() { return { U ("Stéréo"), "L", "R", "M", "S" }; }
-inline juce::StringArray phaseNames() { return { U ("Zéro latence"), U ("Phase linéaire") }; }
+inline juce::StringArray placeNames() { return { U ("Stereo"), U ("Left"), U ("Right"), U ("Mid"), U ("Side") }; }
+inline juce::StringArray placeShort() { return { U ("Stereo"), "L", "R", "M", "S" }; }
+inline juce::StringArray phaseNames() { return { U ("Zero latency"), U ("Linear phase") }; }
 
 inline int slopeIndex (int dbPerOct)
 {
@@ -115,39 +115,39 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 
     for (int b = 0; b < maxBands; ++b)
     {
-        const String pre = U ("Bande ") + String (b + 1) + " ";
+        const String pre = U ("Band ") + String (b + 1) + " ";
         const bool isDef = b < numDefaultBands;
         const DefaultBand def = isDef ? defaultBands[b] : DefaultBand { eq::Shape::bell, 1000.0f, 1.0f };
         auto grp = std::make_unique<AudioProcessorParameterGroup> ("band" + String (b + 1), pre.trim(), " | ");
-        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fUsed)), pre + U ("Utilisée"), isDef));
+        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fUsed)), pre + U ("Used"), isDef));
         grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fOn)), pre + U ("Active"), true));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fFreq)), pre + U ("Fréquence"), freqRange(), def.freq,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fFreq)), pre + U ("Frequency"), freqRange(), def.freq,
             AudioParameterFloatAttributes().withLabel ("Hz").withStringFromValueFunction ([] (float v, int) { return fmtHz (v); })));
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fGain)), pre + "Gain", NormalisableRange<float> (-30.0f, 30.0f, 0.01f), 0.0f,
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return fmtDb (v, 2); })));
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fQ)), pre + "Q", qRange(), def.q,
             AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return fmtQ (v); })));
-        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fShape)), pre + U ("Forme"), shapeNames(), (int) def.shape));
-        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fSlope)), pre + U ("Pente"), slopeNames(), 1));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fShape)), pre + U ("Shape"), shapeNames(), (int) def.shape));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fSlope)), pre + U ("Slope"), slopeNames(), 1));
         grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fPlace)), pre + U ("Placement"), placeNames(), 0));
-        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fDyn)), pre + U ("Dynamique"), false));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fThr)), pre + U ("Seuil"), NormalisableRange<float> (-80.0f, 0.0f, 0.1f), -30.0f,
+        grp->addChild (std::make_unique<AudioParameterBool> (pid (bandId (b, fDyn)), pre + U ("Dynamic"), false));
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fThr)), pre + U ("Threshold"), NormalisableRange<float> (-80.0f, 0.0f, 0.1f), -30.0f,
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return juce::String (v, 1); })));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRange)), pre + U ("Plage dynamique"), NormalisableRange<float> (-30.0f, 30.0f, 0.01f), -6.0f,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRange)), pre + U ("Dynamic range"), NormalisableRange<float> (-30.0f, 30.0f, 0.01f), -6.0f,
             AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return fmtDb (v, 1); })));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fAtt), 2), pre + U ("Attaque"), attackRange(), 10.0f,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fAtt), 2), pre + U ("Attack"), attackRange(), 10.0f,
             AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
-        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRel), 2), pre + U ("Retour"), releaseRange(), 150.0f,
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRel), 2), pre + U ("Release"), releaseRange(), 150.0f,
             AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
         layout.add (std::move (grp));
     }
 
-    layout.add (std::make_unique<AudioParameterFloat> (pid (outGain), U ("Sortie"), NormalisableRange<float> (-36.0f, 36.0f, 0.01f), 0.0f,
+    layout.add (std::make_unique<AudioParameterFloat> (pid (outGain), U ("Output"), NormalisableRange<float> (-36.0f, 36.0f, 0.01f), 0.0f,
         AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return fmtDb (v, 1); })));
-    layout.add (std::make_unique<AudioParameterFloat> (pid (gainScale), U ("Échelle de gain"), NormalisableRange<float> (0.0f, 200.0f, 0.1f), 100.0f,
+    layout.add (std::make_unique<AudioParameterFloat> (pid (gainScale), U ("Gain scale"), NormalisableRange<float> (0.0f, 200.0f, 0.1f), 100.0f,
         AudioParameterFloatAttributes().withLabel ("%").withStringFromValueFunction ([] (float v, int) { return String (juce::roundToInt (v)); })));
-    layout.add (std::make_unique<AudioParameterChoice> (pid (phase), U ("Mode de phase"), phaseNames(), 0));
-    layout.add (std::make_unique<AudioParameterBool> (pid (autoGain), U ("Gain auto"), false));
+    layout.add (std::make_unique<AudioParameterChoice> (pid (phase), U ("Phase mode"), phaseNames(), 0));
+    layout.add (std::make_unique<AudioParameterBool> (pid (autoGain), U ("Auto gain"), false));
     layout.add (std::make_unique<AudioParameterBool> (pid (bypass), "Bypass", false));
     return layout;
 }
@@ -169,35 +169,35 @@ inline const std::vector<Preset>& presets()
 {
     using S = eq::Shape; using P = eq::Place;
     static const std::vector<Preset> list = {
-        { "Défaut (neutre)", "Cinq bandes à plat (60 Hz, 300 Hz, 1 kHz, 3 kHz, 10 kHz) : le son passe sans modification.",
+        { "Default (neutral)", "Five flat bands (60 Hz, 300 Hz, 1 kHz, 3 kHz, 10 kHz): the sound passes through unchanged.",
           { { S::lowShelf, 60, 0, 0.71f, 12 }, { S::bell, 300, 0, 1.0f, 12 }, { S::bell, 1000, 0, 1.0f, 12 },
             { S::bell, 3000, 0, 1.0f, 12 }, { S::highShelf, 10000, 0, 0.71f, 12 } } },
-        { "Coupe-bas 80 Hz", "Retire les grondements et les bruits de manipulation sous 80 Hz.",
+        { "Low cut 80 Hz", "Removes rumble and handling noise below 80 Hz.",
           { { S::lowCut, 80, 0, 0.71f, 24 } } },
-        { "Voix — clarté", "Coupe-bas, moins de « carton » vers 250 Hz, présence et air.",
+        { "Vocal: clarity", "Low cut, less \"boxiness\" around 250 Hz, presence and air.",
           { { S::lowCut, 90, 0, 0.71f, 18 }, { S::bell, 250, -2.5f, 1.2f, 12 }, { S::bell, 3500, 2.0f, 0.9f, 12 },
             { S::highShelf, 10000, 2.5f, 0.71f, 12 } } },
-        { "Voix — de-esser (dynamique)", "La cloche à 6,5 kHz ne baisse que lorsque les sifflantes dépassent le seuil.",
+        { "Vocal: de-esser (dynamic)", "The 6.5 kHz bell only dips when the sibilants go above the threshold.",
           { { S::lowCut, 80, 0, 0.71f, 18 }, { S::bell, 6500, 0, 3.0f, 12, P::stereo, true, -32, -8 } } },
-        { "Kick — punch", "Coupe le sub inutile, renforce l'impact, creuse le « carton », ajoute le clic.",
+        { "Kick: punch", "Cuts the useless sub, adds impact, scoops the \"boxiness\", adds the click.",
           { { S::lowCut, 30, 0, 0.71f, 24 }, { S::bell, 60, 3, 1.4f, 12 }, { S::bell, 350, -4, 1.5f, 12 }, { S::bell, 4000, 3, 1.2f, 12 } } },
-        { "Basse — définition", "Fondamentale plus lisible, bas-médium allégé, attaque des cordes.",
+        { "Bass: definition", "Clearer fundamental, lighter low mids, string attack.",
           { { S::lowCut, 35, 0, 0.71f, 24 }, { S::bell, 100, 2, 1.0f, 12 }, { S::bell, 250, -2.5f, 1.4f, 12 },
             { S::bell, 1200, 2.5f, 1.5f, 12 }, { S::highCut, 8000, 0, 0.71f, 12 } } },
-        { "Guitare acoustique", "Moins de résonance de caisse, plus de brillance.",
+        { "Acoustic guitar", "Less body resonance, more brilliance.",
           { { S::lowCut, 100, 0, 0.71f, 18 }, { S::bell, 200, -3, 1.2f, 12 }, { S::bell, 5000, 2, 1.0f, 12 },
             { S::highShelf, 12000, 2, 0.71f, 12 } } },
-        { "Bus batterie", "Poids dans le grave, moins de boue, cymbales plus ouvertes.",
+        { "Drum bus", "Weight in the lows, less mud, more open cymbals.",
           { { S::bell, 80, 2, 0.9f, 12 }, { S::bell, 400, -2, 1.1f, 12 }, { S::highShelf, 8000, 2.5f, 0.71f, 12 } } },
-        { "Master — air et poids", "Retouches douces de mastering : un peu de grave et d'air.",
+        { "Master: air and weight", "Gentle mastering touches: a little low end and air.",
           { { S::lowCut, 20, 0, 0.71f, 12 }, { S::lowShelf, 80, 1, 0.71f, 12 }, { S::highShelf, 12000, 1.5f, 0.71f, 12 } } },
-        { "Mid/Side — aigus plus larges", "Aigus renforcés seulement sur les côtés ; grave des côtés coupé (basses mono).",
+        { "Mid/Side: wider highs", "Highs boosted on the sides only; low end of the sides cut (mono bass).",
           { { S::lowCut, 120, 0, 0.71f, 12, P::side }, { S::highShelf, 8000, 3, 0.71f, 12, P::side } } },
-        { "Anti-résonances (dynamique)", "Deux cloches qui ne creusent que lorsque les résonances ressortent.",
+        { "Anti-resonance (dynamic)", "Two bells that only dip when the resonances stick out.",
           { { S::bell, 250, 0, 2.0f, 12, P::stereo, true, -24, -6 }, { S::bell, 2500, 0, 3.0f, 12, P::stereo, true, -30, -5 } } },
-        { "Téléphone / radio", "Bande passante réduite façon téléphone.",
+        { "Phone / radio", "Narrow bandwidth, like a telephone.",
           { { S::lowCut, 400, 0, 0.71f, 24 }, { S::highCut, 3400, 0, 0.71f, 24 }, { S::bell, 1500, 4, 1.0f, 12 } } },
-        { "Tilt — plus brillant", "Bascule tout le spectre autour de 1 kHz : plus d'aigu, moins de grave.",
+        { "Tilt: brighter", "Tilts the whole spectrum around 1 kHz: more highs, less lows.",
           { { S::tiltShelf, 1000, 4, 0.71f, 6 } } },
     };
     return list;

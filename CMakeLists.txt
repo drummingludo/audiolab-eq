@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "")
 
-project(AudioLabEQ VERSION 1.2.0 LANGUAGES C CXX)
+project(AudioLabEQ VERSION 1.3.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -31,8 +31,8 @@ endif()
 
 juce_add_plugin(AudioLabEQ
     PRODUCT_NAME "Audio Lab EQ"
-    PLUGIN_NAME "Audio Lab EQ"
-    DESCRIPTION "Égaliseur paramétrique 24 bandes d'Audio Lab (Chimiste du son)"
+    PLUGIN_NAME "Lab EQ"
+    DESCRIPTION "24-band parametric equaliser from Audio Lab (Chimiste du son)"
     COMPANY_NAME "Transversal Studio"
     COMPANY_WEBSITE "https://transversalstudio.fr"
     COMPANY_EMAIL "ludo@transversalstudio.fr"

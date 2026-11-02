@@ -9,7 +9,7 @@ INSTALLATION
      tout en bas, bouton « Ouvrir quand même ».
 2. Relancez votre logiciel de musique.
 
-Le plugin apparaît sous le nom « Audio Lab EQ » (fabricant : Transversal Studio) :
+Le plugin apparaît sous le nom « Lab EQ » (fabricant : Transversal Studio) :
 - Logic Pro, GarageBand : format AU (Audio Units > Transversal Studio)
 - Ableton Live, FL Studio, Cubase, Reaper, Studio One, Bitwig : format VST3
 
