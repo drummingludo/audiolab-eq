@@ -37,12 +37,12 @@ inline void drawArcControl (juce::Graphics& g, const Theme& th, juce::Point<floa
         juce::Path arc; arc.addCentredArc (c.x, c.y, r, r, 0, a, b, true);
         const auto ps = onCircle (c, r, ang (startN)), pv = onCircle (c, r, ang (valueN));
         juce::ColourGradient grad (cols.first, ps, cols.second, pv, false);
-        // halo (≈ flou de 2 px à 55 %, renforcé pendant le réglage)
-        const float k = active ? 1.6f : 1.0f;
-        g.setGradientFill (grad); g.setOpacity (0.16f * k);
-        g.strokePath (arc, juce::PathStrokeType (sw + 4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
-        g.setOpacity (0.24f * k);
-        g.strokePath (arc, juce::PathStrokeType (sw + 2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
+        // halo fin et discret (2 voiles : +1,6 et +3,2 px), à peine renforcé pendant le réglage
+        const float k = active ? 1.5f : 1.0f;
+        g.setGradientFill (grad); g.setOpacity (0.05f * k);
+        g.strokePath (arc, juce::PathStrokeType (sw + 3.2f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
+        g.setOpacity (0.12f * k);
+        g.strokePath (arc, juce::PathStrokeType (sw + 1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
         g.setOpacity (1.0f);
         g.setGradientFill (grad);
         g.strokePath (arc, juce::PathStrokeType (sw, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
