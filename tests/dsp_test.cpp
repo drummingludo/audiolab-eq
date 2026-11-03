@@ -2,7 +2,8 @@
 //  1. réponse impulsionnelle de chaque forme de filtre = réponse analytique (courbe affichée)
 //  2. placement Mid / Side / Gauche / Droite
 //  3. EQ dynamique : gain réduit au-dessus du seuil, inchangé en dessous
-//  4. phase linéaire : latence N/2, réponse = prototype analogique, symétrie de la RI
+//  4. phase linéaire : latence N/2 + bloc, réponse = prototype analogique, symétrie, changement de FIR sans trou ;
+//     phase naturelle : latence D + bloc
 //  5. écoute solo, robustesse (automatisation aléatoire : pas de NaN, pas d'explosion)
 #include <juce_dsp/juce_dsp.h>
 #include "EqEngine.h"
@@ -162,28 +163,28 @@ int main()
         CHECK (off[0] < -8.0 && off[1] > -3.0, "attaque par bande (%.2f / %.2f)", off[0], off[1]);
     }
 
-    std::printf ("4. Phase linéaire\n");
+    std::printf ("4. Phase linéaire / naturelle (convolution par partitions)\n");
     for (double fs : { 48000.0, 96000.0 })
     {
         LinearPhase lp;
-        lp.prepare (fs, 512);
+        lp.prepare (fs);
         LinearPhase::Snapshot snap;
         snap.stereo = true;
         BandSpec b1; b1.active = true; b1.shape = Shape::bell; b1.freq = 2000; b1.gainDb = 8; b1.q = 1.5;
         BandSpec b2; b2.active = true; b2.shape = Shape::lowCut; b2.freq = 200; b2.slope = 24; b2.q = 0.71;
         BandSpec b3; b3.active = true; b3.shape = Shape::highShelf; b3.freq = 8000; b3.gainDb = -6; b3.q = 0.71; b3.place = Place::side;
         snap.bands[0] = b1; snap.bands[1] = b2; snap.bands[2] = b3;
-        lp.design (snap);
-        // laisse la file de chargement des RI faire son travail
-        std::vector<float> l (512, 0.0f), r (512, 0.0f);
-        for (int k = 0; k < 80; ++k) { std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f); lp.process (l.data(), r.data(), 512); std::this_thread::sleep_for (std::chrono::milliseconds (5)); }
-        const int N = lp.latency() * 2, len = 4 * N;
+        const int N = audiolab::eq::fir::lengthFor (audiolab::eq::fir::Res::medium, fs);
+        lp.design (snap, audiolab::eq::fir::Mode::linear, N, false);
+        lp.switchTo (audiolab::eq::fir::Mode::linear, N);
+        CHECK (lp.ready(), "FIR conçu non installé");
+        const int lat = lp.latencyFor (audiolab::eq::fir::Mode::linear, N), len = 4 * N;
         std::vector<float> xl ((size_t) len, 0.0f), xr ((size_t) len, 0.0f);
         xl[0] = 1; xr[0] = 1;   // impulsion « Mid »
         for (int off = 0; off < len; off += 512) lp.process (xl.data() + off, xr.data() + off, std::min (512, len - off));
         int pk = 0; for (int i = 0; i < len; ++i) if (std::abs (xl[(size_t) i]) > std::abs (xl[(size_t) pk])) pk = i;
-        std::printf ("   %.0f kHz : FIR %d points, pic de la RI à %d (latence annoncée %d)\n", fs / 1000, N, pk, lp.latency());
-        CHECK (pk == lp.latency(), "latence %d ≠ pic %d", lp.latency(), pk);
+        std::printf ("   %.0f kHz : FIR %d points, pic de la RI à %d (latence annoncée %d = N/2 + bloc %d)\n", fs / 1000, N, pk, lat, lp.partition());
+        CHECK (pk == lat, "latence %d ≠ pic %d", lat, pk);
         double asym = 0; for (int m = 1; m < N / 2 - 1; ++m) asym = std::max (asym, (double) std::abs (xl[(size_t) (pk + m)] - xl[(size_t) (pk - m)]));
         CHECK (asym < 1e-5, "RI non symétrique (%.2e)", asym);
         // réponse : cloche + coupe-bas (signal mono : la bande Side n'agit pas)
@@ -201,18 +202,53 @@ int main()
             if (e > worst) { worst = e; wf = f; }
         }
         std::printf ("   réponse mesurée vs analogique (150 Hz–%.0f kHz) : écart max %.3f dB à %.0f Hz\n", 0.45 * fs / 1000, worst, wf);
-        CHECK (worst < 0.5, "phase linéaire : écart %.2f dB à %.0f Hz", worst, wf);
+        CHECK (worst < 0.2, "phase linéaire : écart %.2f dB à %.0f Hz", worst, wf);
         // Side : impulsion L=1, R=-1 → shelf -6 dB dans l'aigu
-        std::fill (xl.begin(), xl.end(), 0.0f); std::fill (xr.begin(), xr.end(), 0.0f);
         lp.reset();
+        std::fill (xl.begin(), xl.end(), 0.0f); std::fill (xr.begin(), xr.end(), 0.0f);
         xl[0] = 1; xr[0] = -1;
         for (int off = 0; off < len; off += 512) lp.process (xl.data() + off, xr.data() + off, std::min (512, len - off));
-        std::vector<float> irs (xl.begin() + lp.latency() - N / 2, xl.begin() + lp.latency() + N / 2);
+        std::vector<float> irs (xl.begin() + lat - N / 2, xl.begin() + lat + N / 2);
         auto ms = fftMagDb (irs, (int) std::log2 (N));
         const double hf = ms[(size_t) std::lround (18000.0 * N / fs)];
         const double expectHf = magnitudeDb (d1, 18000, fs, true) + magnitudeDb (d2, 18000, fs, true) - 6 + 0.0;
         std::printf ("   Side à 18 kHz : %.2f dB (attendu ≈ %.2f)\n", hf, expectHf);
-        CHECK (std::abs (hf - expectHf) < 0.7, "Side en phase linéaire");
+        CHECK (std::abs (hf - expectHf) < 0.3, "Side en phase linéaire");
+
+        // Changement de FIR pendant la lecture : fondu sans trou (sinus 1 kHz, la cloche passe de +8 à +2 dB)
+        lp.reset();
+        const int n2 = 6 * N;
+        std::vector<float> sl ((size_t) n2), sr ((size_t) n2);
+        for (int i = 0; i < n2; ++i) sl[(size_t) i] = sr[(size_t) i] = (float) (0.1 * std::sin (2 * pi * 997 * i / fs));
+        const int swapAt = 3 * N;
+        for (int off = 0; off < n2; off += 256)
+        {
+            if (off == swapAt)
+            {
+                snap.bands[0].gainDb = 2;
+                lp.design (snap, audiolab::eq::fir::Mode::linear, N, false);
+            }
+            lp.process (sl.data() + off, sr.data() + off, std::min (256, n2 - off));
+        }
+        // enveloppe RMS par fenêtres de 5 ms après le changement : jamais sous le niveau final (−6 dB environ)
+        const int win = (int) (0.005 * fs);
+        double minRms = 1e9, finalRms = rmsDb (sl.data() + n2 - 4 * win, 4 * win);
+        for (int i = swapAt; i + win < n2; i += win) minRms = std::min (minRms, rmsDb (sl.data() + i, win));
+        std::printf ("   FIR changé en lecture : RMS min %.2f dB, final %.2f dB (pas de trou si min ≥ final − 0.5)\n", minRms, finalRms);
+        CHECK (minRms >= finalRms - 0.5, "trou dans la sortie quand le FIR change (%.2f dB)", minRms - finalRms);
+
+        // Natural phase : latence D + bloc, réponse impulsionnelle qui démarre en D
+        LinearPhase ln; ln.prepare (fs);
+        const int Nn = audiolab::eq::fir::lengthFor (audiolab::eq::fir::Res::medium, fs);
+        ln.design (snap, audiolab::eq::fir::Mode::natural, Nn, false);
+        ln.switchTo (audiolab::eq::fir::Mode::natural, Nn);
+        std::vector<float> nl ((size_t) 2 * Nn, 0.0f), nr ((size_t) 2 * Nn, 0.0f);
+        nl[0] = nr[0] = 1;
+        for (int off = 0; off < 2 * Nn; off += 512) ln.process (nl.data() + off, nr.data() + off, 512);
+        const int latN = ln.latencyFor (audiolab::eq::fir::Mode::natural, Nn);
+        double pre = 0; for (int i = 0; i < latN - ln.naturalDelaySamples(); ++i) pre = std::max (pre, (double) std::abs (nl[(size_t) i]));
+        std::printf ("   Natural phase : latence %d éch. (%.1f ms), sortie avant le bloc : %.1e\n", latN, 1000.0 * latN / fs, pre);
+        CHECK (pre < 1e-6 && latN <= 0.012 * fs, "Natural phase : latence");
     }
 
     std::printf ("5. Écoute solo et robustesse\n");

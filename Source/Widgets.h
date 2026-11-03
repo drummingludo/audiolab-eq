@@ -312,6 +312,33 @@ private:
     Style style;
 };
 
+// ── Flèche d'ouverture (« Advanced settings ») : fermé = texte secondaire, ouvert = texte ──
+// (même composant que le Compresseur)
+class Disclosure : public juce::Button
+{
+public:
+    Disclosure (Theme& t, juce::String label) : juce::Button (label), theme (t) {}
+    bool open = false;
+
+    void paintButton (juce::Graphics& g, bool over, bool) override
+    {
+        const auto& p = theme.pal();
+        const juce::Colour c = open || over ? p.text : p.text2;
+        const float x = 8, y = getHeight() * 0.5f - 6;   // boîte 12 × 12 du chevron
+        juce::Path ch;
+        if (open) { ch.startNewSubPath (x + 2.5f, y + 4.5f); ch.lineTo (x + 6, y + 8); ch.lineTo (x + 9.5f, y + 4.5f); }
+        else      { ch.startNewSubPath (x + 4.5f, y + 2.5f); ch.lineTo (x + 8, y + 6); ch.lineTo (x + 4.5f, y + 9.5f); }
+        g.setColour (c);
+        g.strokePath (ch, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setFont (theme.ui (12));
+        g.drawText (getButtonText(), juce::Rectangle<float> (26, 0, (float) getWidth() - 26, (float) getHeight()), juce::Justification::centredLeft, false);
+    }
+    float idealWidth() const { return 26 + juce::GlyphArrangement::getStringWidth (theme.ui (12), getButtonText()) + 8; }
+
+private:
+    Theme& theme;
+};
+
 // ── Menus déroulants, bulles d'aide ──────────────────────────────────────
 class ALLookAndFeel : public juce::LookAndFeel_V4
 {

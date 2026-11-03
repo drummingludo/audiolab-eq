@@ -23,15 +23,19 @@ constexpr const char* fThr   = "thr";
 constexpr const char* fRange = "range";
 constexpr const char* fAtt   = "att";
 constexpr const char* fRel   = "rel";
-constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange, fAtt, fRel };
-constexpr int numBandFields = 13;
+constexpr const char* fSc    = "sc";      // 2.0 : source du détecteur dynamique (Internal / External)
+constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange, fAtt, fRel, fSc };
+constexpr int numBandFields = 14;
+constexpr int legacyBandFields = 13;      // états A/B et annuler des versions 1.x
 
 constexpr const char* outGain   = "out_gain";
 constexpr const char* gainScale = "gain_scale";
 constexpr const char* phase     = "phase";
 constexpr const char* autoGain  = "auto_gain";
 constexpr const char* bypass    = "bypass";
-constexpr const char* globalIds[] = { outGain, gainScale, phase, autoGain };
+constexpr const char* linRes    = "lin_res";   // 2.0 : résolution de la phase linéaire
+constexpr const char* globalIds[] = { outGain, gainScale, phase, autoGain, linRes };
+constexpr int legacyGlobals = 4;
 // Réglages globaux de la v1.0 (remplacés par Attaque / Retour par bande), relus à l'ouverture d'anciens projets
 constexpr const char* legacyAttack  = "dyn_attack";
 constexpr const char* legacyRelease = "dyn_release";
@@ -51,7 +55,12 @@ inline juce::StringArray slopeNames()
 }
 inline juce::StringArray placeNames() { return { U ("Stereo"), U ("Left"), U ("Right"), U ("Mid"), U ("Side") }; }
 inline juce::StringArray placeShort() { return { U ("Stereo"), "L", "R", "M", "S" }; }
-inline juce::StringArray phaseNames() { return { U ("Zero latency"), U ("Linear phase") }; }
+// (l'ordre des choix ne change pas : 0 et 1 gardent leur sens, Natural phase est ajouté en 2)
+inline juce::StringArray phaseNames() { return { U ("Zero latency"), U ("Linear phase"), U ("Natural phase") }; }
+inline juce::StringArray resNames()   { return { U ("Auto"), U ("Low"), U ("Medium"), U ("High"), U ("Max") }; }
+inline juce::StringArray scNames()    { return { U ("Internal"), U ("External") }; }
+constexpr int phaseZero = 0, phaseLinear = 1, phaseNatural = 2;
+constexpr int resMediumIndex = 2;
 
 inline int slopeIndex (int dbPerOct)
 {
@@ -139,6 +148,7 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
             AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRel), 2), pre + U ("Release"), releaseRange(), 150.0f,
             AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fSc), 3), pre + U ("Side-chain"), scNames(), 0));
         layout.add (std::move (grp));
     }
 
@@ -149,6 +159,7 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     layout.add (std::make_unique<AudioParameterChoice> (pid (phase), U ("Phase mode"), phaseNames(), 0));
     layout.add (std::make_unique<AudioParameterBool> (pid (autoGain), U ("Auto gain"), false));
     layout.add (std::make_unique<AudioParameterBool> (pid (bypass), "Bypass", false));
+    layout.add (std::make_unique<AudioParameterChoice> (pid (linRes, 3), U ("Linear phase resolution"), resNames(), 0));
     return layout;
 }
 

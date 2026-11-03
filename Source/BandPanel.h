@@ -109,13 +109,26 @@ public:
             proc.setBandValue (band, params::fDyn, proc.bandValue (band, params::fDyn) > 0.5f ? 0.0f : 1.0f);
             display.refresh(); sync();
         };
+        // source du détecteur dynamique (2.0) : signal de la bande ou side-chain externe
+        scBox.addItem (fr ("Internal"), 1);
+        scBox.addItem (fr ("External"), 2);
+        scBox.setTitle (fr ("Side-chain"));
+        scBox.getProperties().set ("raised", true);
+        scBox.onChange = [this]
+        {
+            const int v = scBox.getSelectedId() - 1;
+            if (v < 0 || band < 0 || juce::roundToInt (proc.bandValue (band, params::fSc)) == v) return;
+            proc.pushUndo();
+            proc.setBandValue (band, params::fSc, (float) v);
+            sync();
+        };
         shapeBox.onChange = [this] { applyChoice (shapeBox, params::fShape); };
         slopeBox.onChange = [this] { applyChoice (slopeBox, params::fSlope); };
         placeBox.onChange = [this] { applyChoice (placeBox, params::fPlace); };
 
         for (juce::Component* c : { (juce::Component*) &onBtn, (juce::Component*) &soloBtn, (juce::Component*) &delBtn,
                                     (juce::Component*) &closeBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox,
-                                    (juce::Component*) &placeBox })
+                                    (juce::Component*) &placeBox, (juce::Component*) &scBox })
             addChildComponent (c);
         setVisible (false);
     }
@@ -134,7 +147,7 @@ public:
 
         const bool single = count == 1, any = count >= 1;
         for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &closeBtn, (juce::Component*) &placeBox }) c->setVisible (any);
-        for (auto* c : { (juce::Component*) &soloBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox })
+        for (auto* c : { (juce::Component*) &soloBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox, (juce::Component*) &scBox })
             c->setVisible (single);
 
         if (single)
@@ -199,6 +212,13 @@ public:
         const bool dynOn = dyn && eq::canBeDynamic (shape);
         for (juce::Component* c : { (juce::Component*) kThr.get(), (juce::Component*) kRange.get(), (juce::Component*) kAtt.get(), (juce::Component*) kRel.get() })
             dim (c, dynOn);
+        const bool ext = proc.bandValue (b, P::fSc) > 0.5f;
+        scBox.setSelectedId (ext ? 2 : 1, juce::dontSendNotification);
+        dim (&scBox, dynOn, 0.4f);
+        const auto tip = ! ext ? fr ("Side-chain: the dynamic band follows its own signal (Internal) or the plugin's side-chain input (External)")
+                       : proc.sideChainConnected() ? fr ("External: the dynamic band follows the side-chain input")
+                                                   : fr ("External selected, but no side-chain input is connected: the band follows its own signal");
+        if (scBox.getTooltip() != tip) scBox.setTooltip (tip);
     }
 
     void paint (juce::Graphics& g) override
@@ -259,6 +279,7 @@ private:
             kRange->setBounds (x + kw + 6, y2, kw, kh);
             kAtt->setBounds (x + 4, y2 + kh + 12, kAtt->idealWidth(), 28);
             kRel->setBounds (x + kw + 10, y2 + kh + 12, kRel->idealWidth(), 28);
+            scBox.setBounds (dynBtn.getX(), y2 + kh + 12, dynBtn.getWidth(), 28);   // sous « Dynamic »
         }
         else
         {
@@ -293,7 +314,7 @@ private:
     juce::String title;
     float sepX = 246, sepCloseX = 0;
     PillButton onBtn, soloBtn, delBtn, closeBtn, dynBtn;
-    juce::ComboBox shapeBox, slopeBox, placeBox;
+    juce::ComboBox shapeBox, slopeBox, placeBox, scBox;
     std::unique_ptr<ArcKnob> kFreq, kGain, kQ, kThr, kRange, kAtt, kRel;
 };
 } // namespace audiolab

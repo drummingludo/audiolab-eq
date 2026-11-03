@@ -5,9 +5,9 @@ L'égaliseur d'**Audio Lab** (« Chimiste du son », Transversal Studio) en plug
 Un égaliseur paramétrique complet, pensé pour le mixage et le mastering comme pour l'apprentissage :
 
 - **24 bandes**, chacune : cloche, low shelf, high shelf, coupe-bas, coupe-haut, notch, passe-bande ou tilt ; pentes de 6 à 96 dB/octave pour les coupes.
-- **EQ dynamique par bande** : seuil, plage (positive ou négative), attaque et retour propres à chaque bande. Exemples : de-esser, anti-résonances qui ne creusent que lorsque c'est nécessaire.
+- **EQ dynamique par bande** : seuil, plage (positive ou négative), attaque et retour propres à chaque bande, détecteur sur le signal de la bande ou sur le **side-chain externe** (Internal / External). Exemples : de-esser, anti-résonances qui ne creusent que lorsque c'est nécessaire, basse qui s'efface sous le kick.
 - **Placement par bande** : stéréo, gauche, droite, **Mid** ou **Side** ; deux courbes s'affichent quand le traitement diffère entre Mid et Side (ou gauche et droite).
-- **Deux modes de phase** : *Zéro latence* (filtres analogiques modélisés, sans latence) et *Phase linéaire* (FIR symétriques, aucune rotation de phase, latence compensée par le logiciel).
+- **Trois modes de phase** : *Zero latency* (filtres « matched » : la courbe analogique jusqu'à 20 kHz, sans latence), *Natural* (module et phase de l'égaliseur analogique, latence 8 ms) et *Linear* (FIR symétriques, aucune rotation de phase ; résolution Auto / Low / Medium / High / Max dans *Advanced settings*, latence compensée par le logiciel). L'écran montre toujours la réponse réelle.
 - **Analyseur de spectre** avant / après (pente d'affichage de 4,5 dB/octave), **clavier de piano** sous la courbe et nom de la note de chaque bande.
 - **Dessiner la courbe** (clic droit dans la courbe) : tracez la courbe voulue, les bandes sont placées et réglées automatiquement au relâchement.
 - **Écoute d'une bande** (Alt + clic maintenu ou bouton *Écouter*) pour entendre seulement la zone traitée.
@@ -62,11 +62,20 @@ cmake --build build --target ALEQDspTest ALEQProcessorTest ALEQRenderUI
 ./build/ALEQRenderUI_artefacts/Release/ALEQRenderUI /tmp       # captures PNG de l'interface
 ```
 
+Banc qualité du moteur, sans JUCE (seuils chiffrés, aussi lancé par la fabrication Mac) :
+
+```
+clang++ -O2 -std=c++17 -I Source tests/quality_test.cpp -o qt && ./qt
+```
+
+Fiche du plugin et mesures avant / après de la 2.0.0 : `docs/Lab_EQ_fiche.md`.
+
 ## Architecture
 
-- `Source/EqMath.h` : conception des filtres (SVF trapézoïdaux, Butterworth pour les coupes) et réponse analytique — la même description sert au son, à la courbe affichée et aux FIR de la phase linéaire.
-- `Source/EqEngine.h` : moteur temps réel zéro latence (lissage des réglages, fondus sans clic, Mid/Side, détecteurs dynamiques, écoute).
-- `Source/LinearPhase.h` : FIR symétriques calculés sur un fil séparé, matrice 2×2 pour le Mid/Side.
+- `Source/EqMath.h` : conception des filtres (SVF trapézoïdaux ; conception « matched » en zéro latence, prototype analogique pour les FIR) et réponse analytique : la même description sert au son, à la courbe affichée et aux FIR.
+- `Source/EqEngine.h` : moteur temps réel zéro latence (coefficients interpolés à chaque échantillon, fondus sans clic, Mid/Side, détecteurs dynamiques, side-chain externe, écoute).
+- `Source/FirDesign.h` : conception des FIR Linear / Natural phase (sans JUCE), matrice 2×2 pour le Mid/Side.
+- `Source/LinearPhase.h` : convolution par partitions qui garde l'historique d'un FIR à l'autre (fondu sans trou), calcul sur un fil séparé, courbe réelle pour l'écran.
 - `Source/SketchFit.h` : ajustement des bandes sur une courbe dessinée.
 - `Source/EqDisplay.*`, `Source/PluginEditor.*` : interface (charte Audio Lab).
 

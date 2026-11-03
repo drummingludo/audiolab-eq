@@ -18,7 +18,8 @@ public:
     void resized() override;
     bool keyPressed (const juce::KeyPress&) override;
 
-    static constexpr int baseW = 1120, baseH = 640;
+    // 1120 × 640 (validé) ; panneau « Advanced settings » ouvert : 1120 × 714
+    static constexpr int baseW = 1120, baseH = 640, baseHOpen = 714;
 
     audiolab::EqDisplay& getDisplay() { return display; }   // tests
 
@@ -68,6 +69,10 @@ private:
     void applyTheme();
     void rebuildPanel();
     void placePanel();
+    void setAdvanced (bool open, bool resizeWindow);
+    int currentH() const { return advOpen ? baseHOpen : baseH; }
+    juce::String latencyText() const;
+    juce::String sideChainText() const;
 
     AudioLabEqProcessor& proc;
     audiolab::Theme theme;
@@ -80,13 +85,19 @@ private:
     NodeOverlay overlay { *this };
     audiolab::Toast toast { theme };
 
-    // barre du bas
-    audiolab::SegButtons phaseSeg { theme, { "Zero latency", "Linear" } };
+    // barre du bas : segments dans l'ordre Zero latency / Natural / Linear (paramètre : 0 / 2 / 1)
+    audiolab::SegButtons phaseSeg { theme, { "Zero latency", "Natural", "Linear" } };
     juce::ComboBox analyzerBox;
     std::unique_ptr<audiolab::ArcKnob> vScale, vOut;
     audiolab::PillButton autoBtn;
+    audiolab::Disclosure advBtn { theme, "Advanced settings" };
 
-    std::unique_ptr<juce::ParameterAttachment> bypassAtt;
+    // panneau « Advanced settings »
+    audiolab::SegButtons resSeg { theme, { "Auto", "Low", "Medium", "High", "Max" } };
+    bool advOpen = false;
+    juce::String latText, scText;
+
+    std::unique_ptr<juce::ParameterAttachment> bypassAtt, phaseAtt;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioLabEqEditor)
 };

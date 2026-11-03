@@ -31,19 +31,35 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     content.addChildComponent (panel);
     content.addChildComponent (overlay);
 
-    // Barre du bas : phase, analyseur, échelle, sortie, gain auto
-    phaseSeg.attach (prm (P::phase));
+    // Barre du bas : phase, analyseur, réglages avancés, échelle, sortie, gain auto
+    // (segments : Zero latency / Natural / Linear ; valeurs du paramètre : 0 / 2 / 1)
+    phaseAtt = std::make_unique<juce::ParameterAttachment> (prm (P::phase), [this] (float v)
     {
-        auto f = phaseSeg.onSelect;
-        phaseSeg.onSelect = [this, f] (int i)
-        {
-            f (i);
-            toast.show (i == 1 ? U ("Linear phase: no phase rotation, latency ") + String (juce::roundToInt (1000.0 * LinearPhase::firLengthFor (proc.getSampleRateSafe()) / 2 / proc.getSampleRateSafe())) + " ms"
-                               : U ("Zero latency: analogue-style filters, no latency"));
-        };
-    }
+        const int m = juce::roundToInt (v);
+        phaseSeg.setSelected (m == P::phaseLinear ? 2 : m == P::phaseNatural ? 1 : 0);
+    }, nullptr);
+    phaseSeg.onSelect = [this] (int i)
+    {
+        const int m = i == 2 ? P::phaseLinear : i == 1 ? P::phaseNatural : P::phaseZero;
+        phaseAtt->setValueAsCompleteGesture ((float) m);
+        const double ms = 1000.0 * proc.latencyForMode (m) / proc.getSampleRateSafe();
+        toast.show (m == P::phaseLinear ? U ("Linear phase: no phase rotation, latency ") + String (ms, 1) + " ms"
+                  : m == P::phaseNatural ? U ("Natural phase: analogue magnitude and phase, latency ") + String (ms, 1) + " ms"
+                                         : U ("Zero latency: analogue-matched filters, no latency"));
+    };
+    phaseAtt->sendInitialUpdate();
     phaseSeg.setTitle (U ("Phase mode"));
-    phaseSeg.setTooltip (U ("Zero latency: like an analogue equaliser · Linear: no phase rotation (adds latency)"));
+    phaseSeg.setTooltip (U ("Zero latency: analogue-matched filters, no latency. Natural: the magnitude and phase of an analogue equaliser, 8 ms latency. "
+                            "Linear: no phase rotation at all, longer latency (resolution in Advanced settings)"));
+
+    // Réglages avancés : résolution de la phase linéaire, état du side-chain
+    resSeg.onSurface = true;
+    resSeg.attach (prm (P::linRes));
+    resSeg.setTitle (U ("Linear phase resolution"));
+    resSeg.setTooltip (U ("Length of the linear phase filter. Auto: chosen from the lowest and narrowest band (the latency only changes when playback is stopped). "
+                          "Low: shortest latency, less precise in the low end. Max: most precise, longest latency."));
+    advBtn.setTooltip (U ("Show / hide the linear phase resolution and the side-chain status"));
+    advBtn.onClick = [this] { setAdvanced (! advOpen, true); };
 
     analyzerBox.addItem (U ("Analyser: pre + post"), 1);
     analyzerBox.addItem (U ("Analyser: post"), 2);
@@ -77,8 +93,9 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     };
 
     for (juce::Component* c : { (juce::Component*) &phaseSeg, (juce::Component*) &analyzerBox, (juce::Component*) vScale.get(),
-                                (juce::Component*) vOut.get(), (juce::Component*) &autoBtn })
+                                (juce::Component*) vOut.get(), (juce::Component*) &autoBtn, (juce::Component*) &advBtn })
         content.addAndMakeVisible (c);
+    content.addChildComponent (resSeg);
 
     // Bypass du logiciel hôte : la courbe s'estompe
     bypassAtt = std::make_unique<juce::ParameterAttachment> (prm (P::bypass), [this] (float v) { display.setAlpha (v > 0.5f ? 0.45f : 1.0f); }, nullptr);
@@ -90,17 +107,20 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     juce::Desktop::getInstance().addDarkModeSettingListener (this);
     applyTheme();
 
-    const double sc = juce::jlimit (0.6, 2.0, (double) proc.ui.getProperty ("scale", 1.0));
+    const double sc = juce::jlimit (0.6, 2.0, (double) proc.ui.getProperty ("scale", 1.0));   // lu avant que les limites ne redimensionnent
+    setAdvanced ((bool) proc.ui.getProperty ("adv", false), false);   // panneau avancé caché par défaut
     setResizable (true, true);
-    getConstrainer()->setFixedAspectRatio ((double) baseW / baseH);
-    setResizeLimits (baseW * 6 / 10, baseH * 6 / 10, baseW * 2, baseH * 2);
-    setSize (juce::roundToInt (baseW * sc), juce::roundToInt (baseH * sc));
+    getConstrainer()->setFixedAspectRatio ((double) baseW / currentH());
+    setResizeLimits (baseW * 6 / 10, currentH() * 6 / 10, baseW * 2, currentH() * 2);
+    setSize (juce::roundToInt (baseW * sc), juce::roundToInt (currentH() * sc));
     rebuildPanel();
+    proc.editorOpen = true;
     startTimerHz (10);
 }
 
 AudioLabEqEditor::~AudioLabEqEditor()
 {
+    proc.editorOpen = false;
     stopTimer();
     juce::Desktop::getInstance().removeDarkModeSettingListener (this);
     tooltips.setLookAndFeel (nullptr);
@@ -117,6 +137,38 @@ void AudioLabEqEditor::applyTheme()
 }
 
 bool AudioLabEqEditor::keyPressed (const juce::KeyPress& k) { return display.keyPressed (k); }
+
+// Ouvre / ferme le panneau « Advanced settings » : la fenêtre grandit ou rétrécit de 74 px (à l'échelle)
+void AudioLabEqEditor::setAdvanced (bool open, bool resizeWindow)
+{
+    advOpen = open;
+    proc.ui.setProperty ("adv", open, nullptr);
+    advBtn.open = open; advBtn.repaint();
+    resSeg.setVisible (open);
+    if (resizeWindow)
+    {
+        const double s = (double) getWidth() / baseW;   // échelle actuelle, lue avant de changer les limites
+        getConstrainer()->setFixedAspectRatio ((double) baseW / currentH());
+        setResizeLimits (baseW * 6 / 10, currentH() * 6 / 10, baseW * 2, currentH() * 2);
+        setSize (juce::roundToInt (baseW * s), juce::roundToInt (currentH() * s));
+    }
+    resized();
+    content.repaint();
+}
+
+juce::String AudioLabEqEditor::latencyText() const
+{
+    const int mode = proc.activePhaseMode();
+    const int lat = proc.reportedLatency();
+    const double ms = 1000.0 * lat / proc.getSampleRateSafe();
+    if (mode == P::phaseZero) return U ("Latency: 0 ms (Zero latency mode)");
+    return U ("Latency: ") + String (ms, 1) + " ms (" + String (lat) + U (" smp) · filter ") + String (proc.activeFirLength()) + U (" points");
+}
+
+juce::String AudioLabEqEditor::sideChainText() const
+{
+    return proc.sideChainConnected() ? U ("Side-chain input: connected") : U ("Side-chain input: not connected");
+}
 
 // ── Panneau flottant ────────────────────────────────────────────────────
 void AudioLabEqEditor::rebuildPanel()
@@ -185,6 +237,10 @@ void AudioLabEqEditor::Shadow::paint (juce::Graphics& g)
 
 void AudioLabEqEditor::timerCallback()
 {
+    {
+        const auto lt = latencyText(), st = sideChainText();
+        if (lt != latText || st != scText) { latText = lt; scText = st; if (advOpen) content.repaint(); }
+    }
     const bool ag = proc.getParam (P::autoGain) > 0.5f;
     if (autoBtn.on != ag) { autoBtn.on = ag; autoBtn.repaint(); }
     if (ag)
@@ -203,13 +259,29 @@ void AudioLabEqEditor::resized()
 {
     const float s = (float) getWidth() / baseW;
     content.setTransform (juce::AffineTransform::scale (s));
-    content.setBounds (0, 0, baseW, baseH);
+    content.setBounds (0, 0, baseW, currentH());
     proc.ui.setProperty ("scale", (double) s, nullptr);
 }
 
 void AudioLabEqEditor::Content::paint (juce::Graphics& g)
 {
-    g.fillAll (ed.theme.pal().win);
+    const auto& p = ed.theme.pal();
+    g.fillAll (p.win);
+    if (! ed.advOpen) return;
+    // panneau des réglages avancés (« Surface », coins 12, marge intérieure 16)
+    g.setColour (p.surface); g.fillRoundedRectangle (24, 632, 1072, 58, 12);
+    g.setColour (p.text2); g.setFont (ed.theme.ui (12));
+    g.drawText (U ("Linear phase resolution"), juce::Rectangle<float> (40, 648, 150, 26), juce::Justification::centredLeft, false);
+    // à droite : état du side-chain ; au milieu : latence (place restante)
+    const auto f11 = ed.theme.ui (11);
+    const float right = 1096 - 16, sw = juce::GlyphArrangement::getStringWidth (f11, ed.scText) + 2;
+    const float x0 = (float) ed.resSeg.getRight() + 24, sepX = right - sw - 12;
+    g.setFont (f11);
+    g.setColour (p.soft);
+    g.drawFittedText (ed.latText, juce::Rectangle<float> (x0, 648, sepX - 12 - x0, 26).toNearestInt(), juce::Justification::centredLeft, 1, 0.9f);
+    g.setColour (p.rail); g.fillRect (sepX, 652.0f, 1.0f, 18.0f);   // séparateur
+    g.setColour (ed.proc.sideChainConnected() ? p.teal2 : p.soft);
+    g.drawText (ed.scText, juce::Rectangle<float> (right - sw, 648, sw, 26), juce::Justification::centredRight, false);
 }
 
 void AudioLabEqEditor::Content::resized()
@@ -223,8 +295,11 @@ void AudioLabEqEditor::Content::resized()
 
     // barre du bas : y = 584, hauteur 32, écarts de 16
     const int y = 584, h = 32;
-    e.phaseSeg.setBounds (24, y, 216, h);
+    e.phaseSeg.setBounds (24, y, juce::roundToInt (e.phaseSeg.idealWidth()), h);
     e.analyzerBox.setBounds (e.phaseSeg.getRight() + 16, y, 200, h);
+    e.advBtn.setBounds (e.analyzerBox.getRight() + 16, y + 2, juce::roundToInt (e.advBtn.idealWidth()), 28);
+    // panneau avancé : une ligne de 26 px à y = 648
+    e.resSeg.setBounds (40 + 150, 648, juce::roundToInt (e.resSeg.idealWidth()), 26);
     int rx = baseW - 24;
     const int aw = juce::roundToInt (e.autoBtn.idealWidth());
     e.autoBtn.setBounds (rx - aw, y, aw, h); rx -= aw + 16;

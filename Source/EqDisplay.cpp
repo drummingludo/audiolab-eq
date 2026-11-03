@@ -116,7 +116,8 @@ void EqDisplay::timerCallback()
         key.insert (key.end(), { (float) s.freq, (float) s.gainDb, (float) s.q, (float) s.shape, (float) s.slope, (float) s.place,
                                  std::round (proc.getDynOffset (b) * 20.0f) / 20.0f });
     }
-    key.push_back (proc.isLinearPhase() ? 1.0f : 0.0f);
+    key.push_back ((float) proc.phaseMode());
+    key.push_back ((float) proc.firDisplayVersion());   // nouvelle courbe réelle du FIR
     key.push_back ((float) range());
     if (key != lastKey) { lastKey = std::move (key); dirty = true; }
     if (dirty) { updateCurves(); dirty = false; repaint(); if (onCurvesChanged) onCurvesChanged(); }
@@ -173,6 +174,30 @@ void EqDisplay::updateCurves()
             if (! on) continue;
             if (toA) totalCurve[(size_t) i] += v;
             if (toB) curveB[(size_t) i] += v;
+        }
+    }
+
+    // Modes Linear / Natural phase : la courbe totale est la réponse RÉELLE du FIR (longueur et
+    // fenêtre comprises), calculée par le fil de conception ; les bandes gardent leur forme idéale.
+    if (analog)
+    {
+        LinearPhase::DisplayData dd;
+        proc.getFirDisplay (dd);
+        const int wantMode = proc.phaseMode() == P::phaseNatural ? 1 : 0;
+        if (dd.valid && dd.mode == wantMode)
+        {
+            const auto& ca = curveMode == 2 ? dd.ms0 : dd.lr0;
+            const auto& cb = curveMode == 2 ? dd.ms1 : dd.lr1;
+            constexpr int G = LinearPhase::displayPoints;
+            const double f0 = dd.freq[0], f1 = dd.freq[G - 1];
+            for (int i = 0; i < numCols; ++i)
+            {
+                const double pos = std::log (colFreq[(size_t) i] / f0) / std::log (f1 / f0) * (G - 1);
+                const int k = juce::jlimit (0, G - 2, (int) pos);
+                const float t = (float) juce::jlimit (0.0, 1.0, pos - k);
+                totalCurve[(size_t) i] = ca[(size_t) k] + (ca[(size_t) k + 1] - ca[(size_t) k]) * t;
+                curveB[(size_t) i] = cb[(size_t) k] + (cb[(size_t) k + 1] - cb[(size_t) k]) * t;
+            }
         }
     }
 }

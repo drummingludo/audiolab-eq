@@ -38,7 +38,7 @@ public:
 
     // ── État partagé avec l'interface ────────────────────────────────────
     juce::AudioProcessorValueTreeState apvts;
-    juce::ValueTree ui;   // thème, taille, analyseur, échelle dB, A/B, preset
+    juce::ValueTree ui;   // taille, analyseur, échelle dB, A/B, preset, panneau avancé
 
     float getParam (const juce::String& id) const { return apvts.getRawParameterValue (id)->load(); }
     float bandValue (int band, const char* field) const { return bandPtr[(size_t) band][(size_t) fieldIndex (field)]->load(); }
@@ -48,10 +48,23 @@ public:
     audiolab::eq::BandSpec getBandSpec (int band, bool withScale = true) const;
     audiolab::eq::DynSettings getDyn (int band) const;
     double gainScale() const { return getParam (audiolab::params::gainScale) / 100.0; }
-    bool isLinearPhase() const { return getParam (audiolab::params::phase) > 0.5f; }
+    int phaseMode() const { return juce::jlimit (0, 2, juce::roundToInt (getParam (audiolab::params::phase))); }
+    bool isLinearPhase() const { return phaseMode() != audiolab::params::phaseZero; }   // un mode FIR (linéaire ou naturel)
+    int linResIndex() const { return juce::jlimit (0, 4, juce::roundToInt (getParam (audiolab::params::linRes))); }
     float getDynOffset (int band) const { return engine.getDynOffset (band); }
     double getSampleRateSafe() const { const double s = getSampleRate(); return s > 0 ? s : 48000.0; }
     float getAutoGainDb() const { return autoGainDb.load(); }
+
+    // Mode réellement actif (après le fondu de changement), longueur du FIR, latence annoncée
+    int activePhaseMode() const { return activeMode.load(); }
+    int activeFirLength() const { return activeN.load(); }
+    int reportedLatency() const { return latencyNow.load(); }
+    int latencyForMode (int mode) const;   // latence qu'aurait ce mode avec les réglages actuels
+    bool sideChainConnected() const { return scConnected.load(); }
+    // Courbe réelle du FIR (modes Linear / Natural phase), pour l'écran
+    void getFirDisplay (audiolab::eq::LinearPhase::DisplayData& d) const { linear.getDisplay (d); }
+    int firDisplayVersion() const { return linear.displayVersion(); }
+    std::atomic<bool> editorOpen { false };
 
     // Modifications venant de l'interface (fil des messages)
     void setValue (juce::RangedAudioParameter* p, float value);
@@ -102,11 +115,16 @@ public:
     std::vector<float> getStateVector() const;
     void setStateVector (const std::vector<float>&);
 
+    // Tests : force l'état « lecture en cours » (l'hôte de test n'a pas de tête de lecture)
+    std::atomic<int> testPlaying { -1 };
+
 private:
     static int fieldIndex (const char* field);
     void updateEngineTargets (bool stereo);
     audiolab::eq::LinearPhase::Snapshot makeSnapshot (bool stereo) const;
     void computeAutoGain();
+    int desiredFirLength (int mode, bool playing) const;
+    void applySwitch (int mode, int N);
 
     class Designer;
     std::unique_ptr<Designer> designer;
@@ -117,15 +135,22 @@ private:
 
     audiolab::eq::Engine engine;
     audiolab::eq::LinearPhase linear;
-    std::atomic<bool> linearActive { false }, stereoLayout { true };
+    std::atomic<bool> stereoLayout { true }, scConnected { false };
+    std::atomic<int> activeMode { 0 }, activeN { 0 }, latencyNow { 0 };
     int currentLatency = 0;
     int soloBand = -1;
 
-    // retard du signal sec (bypass, écoute solo en phase linéaire)
+    // Changement de mode / de latence : fondu de sortie, bascule, attente du FIR, fondu d'entrée
+    enum class Sw { idle, fadeOut, wait, fadeIn };
+    Sw sw = Sw::idle;
+    float swGain = 1.0f, swStep = 0.0f;
+    int swCount = 0, pendMode = 0, pendN = 0;
+
+    // retard du signal sec (bypass, écoute solo en phase linéaire) et du détecteur en mode FIR
     static constexpr int chunk = 1024;
-    std::vector<float> dryRingL, dryRingR;
+    std::vector<float> dryRingL, dryRingR, scRingL, scRingR;
     int dryW = 0;
-    std::vector<float> inL, inR, dlyL, dlyR, mono;
+    std::vector<float> dlyL, dlyR, detL, detR, scDL, scDR, mono;
     juce::SmoothedValue<float> outSm, bypassSm;
 
     std::array<audiolab::eq::BandSpec, audiolab::eq::maxBands> lastSpecs {};

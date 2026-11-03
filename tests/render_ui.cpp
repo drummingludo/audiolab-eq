@@ -94,12 +94,35 @@ int main (int argc, char** argv)
     steps.push_back ({ 1500, [&] { shot ("04_clair_dessin_ajuste"); ed->getDisplay().selectAll(); } });
     steps.push_back ({ 800,  [&] { shot ("05_clair_multi_selection"); preset ("Kick"); ed->getDisplay().clearSelection(); ed->getDisplay().select (2);
                                    proc->setBandValue (2, audiolab::params::fGain, -10.0f); } });
-    steps.push_back ({ 1500, [&] { shot ("06_clair_poignee_sur_panneau"); P_phase.setValueNotifyingHost (1.0f); preset ("Mid/Side"); theme ("dark");
+    steps.push_back ({ 1500, [&] { shot ("06_clair_poignee_sur_panneau"); P_phase.setValueNotifyingHost (P_phase.convertTo0to1 ((float) audiolab::params::phaseLinear)); preset ("Mid/Side"); theme ("dark");
                                    rebuild(); ed->getDisplay().select (1); ed->getDisplay().testHover (1); } });
     steps.push_back ({ 1800, [&] { shot ("07_sombre_mid_side_lineaire"); P_phase.setValueNotifyingHost (0.0f); proc->clearAllBands();
                                    proc->ui.setProperty ("helpHidden", true, nullptr); rebuild();
                                    ed->setSize (AudioLabEqEditor::baseW * 7 / 10, AudioLabEqEditor::baseH * 7 / 10); } });
-    steps.push_back ({ 1200, [&] { shot ("08_sombre_vide_petite_taille"); juce::MessageManager::getInstance()->stopDispatchLoop(); } });
+    auto& P_res = *proc->apvts.getParameter (audiolab::params::linRes);
+    // 2.0 : Natural phase, panneau avancé, side-chain par bande
+    steps.push_back ({ 1200, [&] { shot ("08_sombre_vide_petite_taille");
+        preset ("Vocal: de-esser"); proc->setBandValue (1, audiolab::params::fSc, 1.0f);
+        P_phase.setValueNotifyingHost (P_phase.convertTo0to1 ((float) audiolab::params::phaseNatural));
+        proc->ui.setProperty ("adv", true, nullptr); proc->ui.setProperty ("scale", 1.0, nullptr); rebuild(); ed->getDisplay().select (1); } });
+    steps.push_back ({ 2000, [&] { shot ("09_naturel_avance_sidechain");
+        // phase linéaire en résolution Low : la courbe affichée est celle du FIR réel (notch 60 Hz, cloche 50 Hz)
+        proc->clearAllBands();
+        proc->createBand (audiolab::eq::Shape::notch, 60.0f, 0.0f, 10.0f, 12);
+        proc->createBand (audiolab::eq::Shape::bell, 150.0f, -9.0f, 6.0f, 12);
+        proc->createBand (audiolab::eq::Shape::highShelf, 9000.0f, 4.0f, 0.71f, 12);
+        P_res.setValueNotifyingHost (P_res.convertTo0to1 (1.0f));
+        P_phase.setValueNotifyingHost (P_phase.convertTo0to1 ((float) audiolab::params::phaseLinear));
+        ed->getDisplay().clearSelection(); } });
+    steps.push_back ({ 2500, [&] { shot ("10_lineaire_low_courbe_reelle");
+        P_res.setValueNotifyingHost (P_res.convertTo0to1 (0.0f)); } });
+    steps.push_back ({ 2500, [&] { shot ("11_lineaire_auto_courbe_reelle");
+        ed->setSize (AudioLabEqEditor::baseW * 6 / 10, AudioLabEqEditor::baseHOpen * 6 / 10); } });
+    steps.push_back ({ 1200, [&] { shot ("12_avance_60pc"); ed->setSize (AudioLabEqEditor::baseW * 2, AudioLabEqEditor::baseHOpen * 2); } });
+    steps.push_back ({ 1200, [&] { shot ("13_avance_200pc"); preset ("Vocal: de-esser"); proc->ui.setProperty ("adv", false, nullptr);
+        P_phase.setValueNotifyingHost (0.0f); rebuild(); ed->setSize (AudioLabEqEditor::baseW * 2, AudioLabEqEditor::baseH * 2); ed->getDisplay().select (1); } });
+    steps.push_back ({ 1500, [&] { shot ("14_principal_200pc_dynamique"); ed->setSize (AudioLabEqEditor::baseW * 6 / 10, AudioLabEqEditor::baseH * 6 / 10); } });
+    steps.push_back ({ 1200, [&] { shot ("15_principal_60pc_dynamique"); juce::MessageManager::getInstance()->stopDispatchLoop(); } });
 
     std::function<void (size_t)> next = [&] (size_t i)
     {

@@ -1,6 +1,15 @@
 // Audio Lab EQ — moteur temps réel (mode zéro latence) :
 // chaîne de 24 bandes SVF, EQ dynamique par bande, placement Stéréo / G / D / Mid / Side,
 // écoute (solo) d'une bande, transitions sans clic.
+//
+// 2.0 :
+//  - filtres conçus en « matched » (EqMath.h) : la courbe suit l'analogique jusqu'à 20 kHz ;
+//  - coefficients interpolés à CHAQUE échantillon entre deux conceptions (sous-blocs de 32) :
+//    plus d'effet d'escalier quand un réglage bouge ;
+//  - EQ dynamique : le détecteur tourne d'abord sur le sous-bloc, le gain est conçu pour la fin
+//    du sous-bloc, puis chaque échantillon prend le gain que le détecteur lui donne (interpolation
+//    des coefficients suivant le gain de l'échantillon) : plus de raies à fs/32 ;
+//  - side-chain externe par bande (Internal / External) pour le détecteur.
 #pragma once
 #include "EqMath.h"
 #include <atomic>
@@ -31,6 +40,18 @@ inline void toRT (const Section& s, SectionRT& r)
         r.G = s.g / (1.0 + s.g);
         r.cLp = s.cLp; r.cHp = s.cHp;
     }
+}
+
+// Section intermédiaire (interpolation linéaire des paramètres physiques : g, k, mélanges)
+inline void lerpRT (const Section& a, const Section& b, double t, SectionRT& r)
+{
+    if (a.kind != b.kind) { toRT (t < 0.5 ? a : b, r); return; }
+    Section s = b;
+    s.g = a.g + (b.g - a.g) * t;
+    s.k = a.k + (b.k - a.k) * t;
+    s.m0 = a.m0 + (b.m0 - a.m0) * t; s.m1 = a.m1 + (b.m1 - a.m1) * t; s.m2 = a.m2 + (b.m2 - a.m2) * t;
+    s.cLp = a.cLp + (b.cLp - a.cLp) * t; s.cHp = a.cHp + (b.cHp - a.cHp) * t;
+    toRT (s, r);
 }
 
 inline double tick (const SectionRT& c, double* st, double x)
@@ -75,12 +96,18 @@ struct DynSettings
     bool on = false;
     double thrDb = -30.0, rangeDb = -6.0;
     double attackMs = 10.0, releaseMs = 150.0;
+    bool external = false;     // détecteur alimenté par le side-chain externe (s'il est branché)
 };
 
 class Engine
 {
 public:
     static constexpr int subBlock = 32;
+    static constexpr int dynStep = 8;   // pas de reconception des bandes dynamiques
+
+    // Mesures « avant » (1.x) : coefficients changés par paliers de 32 échantillons, gain dynamique
+    // du sous-bloc précédent. Uniquement pour le banc de test.
+    bool legacyStepping = false;
 
     void prepare (double sampleRate)
     {
@@ -107,18 +134,28 @@ public:
 
     void setSolo (int band) { soloTarget = band; }
 
+    // Retour au mode zéro latence : les états des filtres (figés pendant les modes FIR) repartent de zéro
+    void clearFilterStates()
+    {
+        for (auto& b : bands) { for (auto& c : b.st) for (auto& x : c) x[0] = x[1] = 0.0; }
+        soloSt[0][0] = soloSt[0][1] = soloSt[1][0] = soloSt[1][1] = 0;
+    }
+
     // Décalage de gain dynamique actuel (dB), lu par l'interface
     float getDynOffset (int i) const { return bands[(size_t) i].dynOut.load (std::memory_order_relaxed); }
 
     // Traitement en place. R peut être nul (mono). bypassIIR : n'applique pas la chaîne IIR
-    // (mode phase linéaire) mais fait tourner les détecteurs ; l'écoute solo se fait alors à part (solo()).
-    void process (float* L, float* R, int n, bool bypassIIR)
+    // (modes FIR) mais fait tourner les détecteurs ; l'écoute solo se fait alors à part (solo()).
+    // scL / scR : side-chain externe (nuls s'il n'est pas branché ; scR nul si mono).
+    void process (float* L, float* R, int n, bool bypassIIR, const float* scL = nullptr, const float* scR = nullptr)
     {
         for (int off = 0; off < n; off += subBlock)
         {
             const int len = std::min (subBlock, n - off);
             float* l = L + off;
             float* r = R != nullptr ? R + off : nullptr;
+            const float* sl = scL != nullptr ? scL + off : nullptr;
+            const float* sr = scL != nullptr ? (scR != nullptr ? scR + off : sl) : nullptr;
 
             // Copie d'entrée pour l'écoute solo (signal avant égalisation)
             for (int i = 0; i < len; ++i) { inL[i] = l[i]; inR[i] = r != nullptr ? r[i] : l[i]; }
@@ -126,9 +163,9 @@ public:
             for (int bi = 0; bi < maxBands; ++bi)
             {
                 auto& b = bands[(size_t) bi];
-                b.advance (fs, len);
+                b.advance (fs, len, legacyStepping);
                 if (b.wet <= 0.0 && b.wetTarget <= 0.0 && ! b.detecting) continue;
-                processBand (b, l, r, len, bypassIIR);
+                processBand (b, l, r, len, bypassIIR, sl, sr);
             }
             if (! bypassIIR) solo (inL, inR, l, r, len);
         }
@@ -191,18 +228,21 @@ private:
         Shape shape = Shape::bell; int slope = 12; Place place = Place::stereo;
         bool structure = false;
         double wet = 0, wetTarget = 0, wetStart = 0;
-        Design des;
+        // conceptions : début (prev) et fin (cur) du sous-bloc ; coefficients de cur précalculés
+        Design prev, cur;
         std::array<SectionRT, 9> rt {};
         int nsec = 0;
-        double outGain = 1.0;
+        bool interp = false;          // prev ≠ cur : coefficients interpolés à chaque échantillon
+        bool fresh = true;            // pas encore de conception (première, ou nouvelle structure)
         double st[2][9][2] {};
-        double lastF = -1, lastG = 1e9, lastQ = -1;
+        double lastF = -1, lastG = 1e9, lastQ = -1, lastBase = 1e9;
+        bool baseMoved = false;       // fréquence / gain / Q ont bougé dans ce sous-bloc
 
         // dynamique
         bool detecting = false, detValid = false;
         SectionRT det;
         double detSt[2][2] {};
-        double env = 0, dynOffset = 0;
+        double env = 0, dynOffset = 0, dynPrev = 0;
         double envA = 0.99, envR = 0.999, coefAtk = -1, coefRel = -1;
         std::atomic<float> dynOut { 0.0f };
 
@@ -210,7 +250,8 @@ private:
         {
             coefAtk = coefRel = -1;
             init = false; structure = false; wet = 0; wetTarget = 0; wetStart = 0; nsec = 0; detValid = false;
-            env = 0; dynOffset = 0; dynOut.store (0.0f);
+            env = 0; dynOffset = 0; dynPrev = 0; dynOut.store (0.0f);
+            fresh = true; interp = false;
             clearStates();
         }
         void clearStates()
@@ -219,8 +260,8 @@ private:
             for (auto& c : detSt) c[0] = c[1] = 0.0;
         }
 
-        // Prépare un sous-bloc : lissage des réglages, transitions de structure, coefficients.
-        void advance (double fs, int len)
+        // Prépare un sous-bloc : lissage des réglages, transitions de structure.
+        void advance (double fs, int len, bool legacy)
         {
             const bool wantOn = target.active;
             const bool structChanged = structure && (target.shape != shape || target.slope != slope || target.place != place);
@@ -230,7 +271,7 @@ private:
                 fLog = std::log (target.freq); gDb = target.gainDb * scale; qLog = std::log (target.q);
                 shape = target.shape; slope = target.slope; place = target.place;
                 structure = true; init = true; clearStates();
-                lastF = -1;
+                lastF = -1; fresh = true;
             }
 
             wetStart = wet;
@@ -244,9 +285,9 @@ private:
                     if (structChanged && wantOn)
                     {
                         shape = target.shape; slope = target.slope; place = target.place;
-                        clearStates(); lastF = -1;
+                        clearStates(); lastF = -1; fresh = true;
                     }
-                    else if (! wantOn) { init = false; env = 0; dynOffset = 0; dynOut.store (0.0f); }
+                    else if (! wantOn) { init = false; env = 0; dynOffset = 0; dynPrev = 0; dynOut.store (0.0f); }
                 }
             }
             else wetTarget = 1.0;
@@ -265,31 +306,89 @@ private:
             fLog += (tf - fLog) * a;
             qLog += (tq - qLog) * a;
             gDb += (tg - gDb) * a;
-            if (std::abs (tf - fLog) < 1e-6) fLog = tf;
-            if (std::abs (tq - qLog) < 1e-6) qLog = tq;
-            if (std::abs (tg - gDb) < 1e-6) gDb = tg;
+            // arrêt du lissage quand l'écart n'est plus audible (évite des reconceptions inutiles)
+            if (std::abs (tf - fLog) < 2e-5) fLog = tf;
+            if (std::abs (tq - qLog) < 2e-5) qLog = tq;
+            if (std::abs (tg - gDb) < 1e-4) gDb = tg;
 
             detecting = dynOk && wantOn;
-            if (! detecting) { dynOffset = 0; env = 0; detValid = false; dynOut.store (0.0f, std::memory_order_relaxed); }
+            if (! detecting) { dynOffset = 0; dynPrev = 0; env = 0; detValid = false; dynOut.store (0.0f, std::memory_order_relaxed); }
 
-            const double f = std::exp (fLog), q = std::exp (qLog), g = gDb + dynOffset;
-            if (std::abs (f - lastF) > 1e-9 * f || std::abs (g - lastG) > 1e-7 || std::abs (q - lastQ) > 1e-9 * q)
-            {
-                BandSpec s; s.active = true; s.shape = shape; s.slope = slope; s.place = place;
-                s.freq = f; s.q = q; s.gainDb = g;
-                design (s, fs, des, false);
-                nsec = des.n; outGain = des.outGain;
-                for (int i = 0; i < nsec; ++i) toRT (des.s[(size_t) i], rt[(size_t) i]);
-                lastF = f; lastG = g; lastQ = q;
-                detValid = false;
-            }
-            if (detecting && ! detValid) { toRT (listenSection (shape, f, q, fs), det); detValid = true; }
+            const double f = std::exp (fLog), q = std::exp (qLog);
+            baseMoved = std::abs (f - lastF) > 1e-9 * f || std::abs (gDb - lastBase) > 1e-7 || std::abs (q - lastQ) > 1e-9 * q;
+            if (detecting && (! detValid || baseMoved)) { toRT (listenSection (shape, f, q, fs), det); detValid = true; }
+
+            // 1.x : la conception se faisait ici, avec le gain dynamique du sous-bloc précédent
+            if (legacy || ! detecting) redesign (fs, dynOffset, legacy);
         }
 
-        inline double chain (int ch, double x)
+        // Nouvelle conception pour la fin du sous-bloc (gain de base lissé + décalage dynamique)
+        void redesign (double fs, double dynDb, bool legacy, bool useCache = false)
+        {
+            const double f = std::exp (fLog), q = std::exp (qLog), g = gDb + dynDb;
+            const bool changed = fresh || std::abs (f - lastF) > 1e-9 * f || std::abs (g - lastG) > 1e-7 || std::abs (q - lastQ) > 1e-9 * q;
+            if (! changed) { if (interp) { prev = cur; interp = false; } return; }
+            BandSpec s; s.active = true; s.shape = shape; s.slope = slope; s.place = place;
+            s.freq = f; s.q = q; s.gainDb = g;
+            prev = cur;
+            if (useCache) designCached (s, fs, dynDb);
+            else design (s, fs, cur, false);
+            if (fresh || legacy || prev.n != cur.n) { prev = cur; interp = false; }
+            else interp = true;
+            fresh = false;
+            nsec = cur.n;
+            for (int i = 0; i < nsec; ++i) toRT (cur.s[(size_t) i], rt[(size_t) i]);
+            lastF = f; lastG = g; lastQ = q; lastBase = gDb;
+        }
+
+        // Bande dynamique : conceptions mises en cache tous les 0,25 dB sur la plage du gain dynamique
+        // (fréquence, Q et gain de base fixés), le gain du moment est interpolé entre les deux voisines.
+        // Une conception « matched » coûte ≈ 1,3 µs ; sans cache, 6000 par seconde et par bande dynamique.
+        static constexpr int cacheSize = 128;
+        struct Cached { Section s; double outGain = 1; };
+        std::array<Cached, cacheSize> cache {};
+        std::array<bool, cacheSize> cacheOk {};
+        double cKeyF = -1, cKeyQ = -1, cKeyBase = 1e9, cKeyRange = 1e9, cMin = 0, cStep = 0.25;
+        int cKeyShape = -1, cKeySlope = -1;
+
+        void designCached (const BandSpec& s, double fs, double dynDb)
+        {
+            const double range = dyn.rangeDb * scale;
+            if (cKeyF != s.freq || cKeyQ != s.q || cKeyBase != gDb || cKeyRange != range || cKeyShape != (int) s.shape || cKeySlope != s.slope)
+            {
+                cKeyF = s.freq; cKeyQ = s.q; cKeyBase = gDb; cKeyRange = range; cKeyShape = (int) s.shape; cKeySlope = s.slope;
+                cMin = std::min (0.0, range);
+                cStep = std::max (0.25, std::abs (range) / (cacheSize - 2));
+                cacheOk.fill (false);
+            }
+            const double pos = std::clamp ((dynDb - cMin) / cStep, 0.0, (double) (cacheSize - 2));
+            const int i0 = (int) pos;
+            const double t = pos - i0;
+            Design tmp;
+            for (int i : { i0, i0 + 1 })
+                if (! cacheOk[(size_t) i])
+                {
+                    BandSpec e = s; e.gainDb = gDb + cMin + i * cStep;
+                    design (e, fs, tmp, false);
+                    if (tmp.n != 1) { design (s, fs, cur, false); return; }   // (toutes les formes à gain : 1 section)
+                    cache[(size_t) i] = { tmp.s[0], tmp.outGain };
+                    cacheOk[(size_t) i] = true;
+                }
+            const auto& a = cache[(size_t) i0];
+            const auto& b = cache[(size_t) i0 + 1];
+            cur.n = 1;
+            auto& o = cur.s[0];
+            o = b.s;
+            o.g = a.s.g + (b.s.g - a.s.g) * t; o.k = a.s.k + (b.s.k - a.s.k) * t;
+            o.m0 = a.s.m0 + (b.s.m0 - a.s.m0) * t; o.m1 = a.s.m1 + (b.s.m1 - a.s.m1) * t; o.m2 = a.s.m2 + (b.s.m2 - a.s.m2) * t;
+            cur.outGain = a.outGain + (b.outGain - a.outGain) * t;
+        }
+
+        // Chaîne de la bande pour un échantillon ; coef : coefficients (interpolés ou non)
+        inline double chain (int ch, double x, const SectionRT* coef, double outGain)
         {
             double y = x;
-            for (int i = 0; i < nsec; ++i) y = tick (rt[(size_t) i], st[ch][i], y);
+            for (int i = 0; i < nsec; ++i) y = tick (coef[i], st[ch][i], y);
             return y * outGain;
         }
     };
@@ -313,80 +412,120 @@ private:
         return range < 0 ? -std::min (o, -range) : std::min (o, range);
     }
 
-    void processBand (Band& b, float* l, float* r, int len, bool bypassIIR)
+    // Détecteur sur un échantillon (entrée de la bande ou side-chain externe)
+    void detect (Band& b, double xl, double xr, bool stereo)
     {
-        const double w0 = b.wetStart, w1 = b.wet;
-        const bool iir = ! bypassIIR && (w0 > 0.0 || w1 > 0.0);
-        const bool stereo = r != nullptr;
-        const double dw = (w1 - w0) / len;
-        double w = w0;
-        const bool det = b.detecting;
-
-        for (int i = 0; i < len; ++i)
+        switch (b.place)
         {
-            w += dw;
-            const double xl = l[i], xr = stereo ? r[i] : xl;
-            switch (b.place)
+            case Place::stereo:
             {
-                case Place::stereo:
+                const double dl = tick (b.det, b.detSt[0], xl);
+                const double dr = stereo ? tick (b.det, b.detSt[1], xr) : dl;
+                follow (b, std::max (std::abs (dl), std::abs (dr)));
+                break;
+            }
+            case Place::left:  follow (b, tick (b.det, b.detSt[0], xl)); break;
+            case Place::right: follow (b, tick (b.det, b.detSt[0], stereo ? xr : xl)); break;
+            case Place::mid:   follow (b, tick (b.det, b.detSt[0], stereo ? 0.5 * (xl + xr) : xl)); break;
+            case Place::side:  follow (b, tick (b.det, b.detSt[0], stereo ? 0.5 * (xl - xr) : 0.0)); break;
+        }
+    }
+
+    void processBand (Band& b, float* l, float* r, int len, bool bypassIIR, const float* scl, const float* scr)
+    {
+        const bool stereo = r != nullptr;
+        const bool det = b.detecting;
+        const bool ext = det && b.dyn.external && scl != nullptr;
+        const bool scStereo = scr != nullptr && scr != scl;
+        const double w0 = b.wetStart, w1 = b.wet;
+        const bool filt = ! bypassIIR && (w0 > 0.0 || w1 > 0.0);
+        const double dw = (w1 - w0) / len;
+        // bande dynamique : reconception tous les 8 échantillons (le gain d'un détecteur rapide n'est pas
+        // monotone sur 32 échantillons) ; sinon une fois par sous-bloc de 32
+        const int step = det && ! legacyStepping ? dynStep : len;
+        double dynDb[subBlock];
+
+        for (int s0 = 0; s0 < len; s0 += step)
+        {
+            const int m = std::min (step, len - s0);
+            if (det)
+            {
+                // 1) détecteur sur le pas (entrée de la bande, ou side-chain externe)
+                for (int i = s0; i < s0 + m; ++i)
                 {
-                    if (det)
-                    {
-                        const double dl = tick (b.det, b.detSt[0], xl);
-                        const double dr = stereo ? tick (b.det, b.detSt[1], xr) : dl;
-                        follow (b, std::max (std::abs (dl), std::abs (dr)));
-                    }
-                    if (iir)
-                    {
-                        l[i] = (float) (xl + w * (b.chain (0, xl) - xl));
-                        if (stereo) r[i] = (float) (xr + w * (b.chain (1, xr) - xr));
-                    }
-                    break;
+                    if (ext) detect (b, scl[i], scStereo ? scr[i] : scl[i], scStereo || stereo);
+                    else detect (b, l[i], stereo ? r[i] : l[i], stereo);
                 }
-                case Place::left:
-                case Place::right:
+                if (! legacyStepping) dynDb[s0 + m - 1] = dynCurve (20.0 * std::log10 (std::max (1.0e-9, b.env)), b.dyn, b.scale);
+                if (! legacyStepping)
                 {
-                    const bool left = b.place == Place::left;
-                    if (! stereo && ! left) break;     // mono : la voie droite n'existe pas
-                    const double x = left ? xl : xr;
-                    if (det) follow (b, tick (b.det, b.detSt[0], x));
-                    if (iir)
+                    // 2) conception pour la fin du pas
+                    b.dynPrev = b.dynOffset;
+                    b.dynOffset = dynDb[s0 + m - 1];
+                    if (filt) b.redesign (fs, b.dynOffset, false, true);
+                }
+                else if (s0 + m == len)
+                    b.dynOffset = dynCurve (20.0 * std::log10 (std::max (1.0e-9, b.env)), b.dyn, b.scale);   // 1.x : sous-bloc suivant
+            }
+            if (! filt) continue;
+
+            // 3) filtrage ; coefficients interpolés à chaque échantillon si la conception a changé
+            SectionRT now[9];
+            const SectionRT* coef = b.rt.data();
+            const bool interp = b.interp;
+            const bool byGain = false;
+            const double gSpan = b.dynOffset - b.dynPrev;
+            double og = b.cur.outGain;
+            for (int i = s0; i < s0 + m; ++i)
+            {
+                const double w = w0 + dw * (i + 1);
+                if (interp)
+                {
+                    // position entre prev et cur : celle du gain de l'échantillon (dynamique), sinon le temps
+                    double t = byGain ? (dynDb[i] - b.dynPrev) / gSpan : (double) (i - s0 + 1) / m;
+                    t = std::clamp (t, 0.0, 1.0);
+                    for (int sct = 0; sct < b.nsec; ++sct) lerpRT (b.prev.s[(size_t) sct], b.cur.s[(size_t) sct], t, now[sct]);
+                    coef = now;
+                    og = b.prev.outGain + (b.cur.outGain - b.prev.outGain) * t;
+                }
+                const double xl = l[i], xr = stereo ? r[i] : xl;
+                switch (b.place)
+                {
+                    case Place::stereo:
+                        l[i] = (float) (xl + w * (b.chain (0, xl, coef, og) - xl));
+                        if (stereo) r[i] = (float) (xr + w * (b.chain (1, xr, coef, og) - xr));
+                        break;
+                    case Place::left:
+                    case Place::right:
                     {
-                        const double y = x + w * (b.chain (0, x) - x);
+                        const bool left = b.place == Place::left;
+                        if (! stereo && ! left) break;     // mono : la voie droite n'existe pas
+                        const double x = left ? xl : xr;
+                        const double y = x + w * (b.chain (0, x, coef, og) - x);
                         if (left) l[i] = (float) y; else r[i] = (float) y;
-                    }
-                    break;
-                }
-                case Place::mid:
-                case Place::side:
-                {
-                    if (! stereo)
-                    {
-                        if (b.place == Place::side) break;     // mono : pas de côtés
-                        if (det) follow (b, tick (b.det, b.detSt[0], xl));
-                        if (iir) l[i] = (float) (xl + w * (b.chain (0, xl) - xl));
                         break;
                     }
-                    double m = 0.5 * (xl + xr), s = 0.5 * (xl - xr);
-                    double& v = b.place == Place::mid ? m : s;
-                    if (det) follow (b, tick (b.det, b.detSt[0], v));
-                    if (iir)
+                    case Place::mid:
+                    case Place::side:
                     {
-                        v = v + w * (b.chain (0, v) - v);
-                        l[i] = (float) (m + s);
-                        r[i] = (float) (m - s);
+                        if (! stereo)
+                        {
+                            if (b.place == Place::side) break;     // mono : pas de côtés
+                            l[i] = (float) (xl + w * (b.chain (0, xl, coef, og) - xl));
+                            break;
+                        }
+                        double mm = 0.5 * (xl + xr), ss = 0.5 * (xl - xr);
+                        double& v = b.place == Place::mid ? mm : ss;
+                        v = v + w * (b.chain (0, v, coef, og) - v);
+                        l[i] = (float) (mm + ss);
+                        r[i] = (float) (mm - ss);
+                        break;
                     }
-                    break;
                 }
             }
+            if (interp) { b.prev = b.cur; b.interp = false; }
         }
-
-        if (det)
-        {
-            const double lev = 20.0 * std::log10 (std::max (1.0e-9, b.env));
-            b.dynOffset = dynCurve (lev, b.dyn, b.scale);
-            b.dynOut.store ((float) b.dynOffset, std::memory_order_relaxed);
-        }
+        if (det) b.dynOut.store ((float) b.dynOffset, std::memory_order_relaxed);
     }
 
     double fs = 48000.0;
