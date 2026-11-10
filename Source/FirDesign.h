@@ -99,7 +99,7 @@ inline double requiredLength (const BandSpec& b, double fs, Mode mode, double ex
             tau = b.slope <= 6 ? A / W : 2.0 * std::max (q, 0.5) * std::sqrt (A) / W; K = 7; break;
         case Shape::lowCut: case Shape::highCut:
         {
-            const int order = std::clamp (b.slope / 6, 1, 16);
+            const int order = cutOrder (b);   // (3.0 : pente libre et Brickwall compris, voir EqMath.h)
             double qs[8]; bool first = false;
             const int nb = butterworthQs (order, qs, first);
             const double qm = nb > 0 ? qs[nb - 1] * q / 0.7071067811865476 : 0.5;
@@ -107,6 +107,10 @@ inline double requiredLength (const BandSpec& b, double fs, Mode mode, double ex
         }
         case Shape::bandPass: tau = 2.0 * q / W * std::sqrt ((double) std::clamp (b.slope / 12, 1, 8)); K = 9; break;
         case Shape::notch:    tau = 2.0 * q / W; K = 14; break;
+        // 3.0. Flat tilt : pas de résonance, mais la droite doit être tenue jusqu'à 20 Hz (mesuré : ±0,1 dB avec
+        // 8192 points à 44,1 / 48 kHz quand l'aigu monte, 16384 quand c'est le grave). All pass : rien à tenir.
+        case Shape::flatTilt: return gmax < 0.05 ? 0.0 : fs * (b.gainDb < 0 ? 0.30 : 0.15);
+        case Shape::allPass:  break;
     }
     (void) mode;   // Natural phase : même longueur (la latence n'en dépend pas, seule la charge CPU)
     return K * tau;
@@ -229,7 +233,7 @@ inline void design (const Request& rq, Result& out, Work& w)
     {
         const auto& b = rq.bands[(size_t) i];
         if (! b.active) continue;
-        eq::design (b, fs, des[i], true);
+        eq::designFir (b, fs, des[i], rq.mode == Mode::linear, N);   // (3.0 : Brickwall = mur idéal en Linear phase)
         anyMS = anyMS || (rq.stereo && (b.place == Place::mid || b.place == Place::side));
     }
     for (auto& v : w.M) v.resize ((size_t) M / 2 + 1);

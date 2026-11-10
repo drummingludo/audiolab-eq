@@ -101,7 +101,7 @@ inline Section listenSection (Shape shape, double freq, double q, double fs)
             s.k = 1.4142135623730951; s.m0 = 0; s.m1 = 0; s.m2 = 1; break;           // passe-bas
         case Shape::highShelf: case Shape::highCut:
             s.k = 1.4142135623730951; s.m0 = 1; s.m1 = -s.k; s.m2 = -1; break;      // passe-haut
-        case Shape::tiltShelf:
+        case Shape::tiltShelf: case Shape::flatTilt:
             s.k = 1.0 / 0.5; s.m0 = 0; s.m1 = s.k; s.m2 = 0; break;
         default:
             s.k = 1.0 / std::clamp (q, 0.3, 40.0); s.m0 = 0; s.m1 = s.k; s.m2 = 0; break;  // passe-bande 0 dB
@@ -409,7 +409,14 @@ struct DynSettings
     double thrDb = -30.0, rangeDb = -6.0;
     double attackMs = 10.0, releaseMs = 150.0;
     bool external = false;     // détecteur alimenté par le side-chain externe (s'il est branché)
+    // 3.0, seuil automatique : le seuil suit le niveau moyen du détecteur de la bande (thrDb est ignoré).
+    // Niveau moyen = moyenne de l'enveloppe du détecteur, constante de temps autoThrSeconds (pendant les
+    // premières secondes de signal : moyenne simple depuis le début, pour ne pas partir de zéro).
+    // Seuil = niveau moyen + 3 dB : le genou de 6 dB commence donc exactement au niveau habituel, et la
+    // bande n'agit que sur ce qui le dépasse. Plancher du niveau moyen : −80 dBFS.
+    bool autoThr = false;
 };
+constexpr double autoThrSeconds = 2.0, autoThrMarginDb = 3.0, autoThrFloor = 1.0e-4;
 
 class Engine
 {
@@ -464,6 +471,8 @@ public:
 
     // Décalage de gain dynamique actuel (dB), lu par l'interface
     float getDynOffset (int i) const { return bands[(size_t) i].dynOut.load (std::memory_order_relaxed); }
+    // Seuil automatique actuel (dBFS) d'une bande dont le seuil automatique est en service, lu par l'interface
+    float getAutoThreshold (int i) const { return bands[(size_t) i].autoThrOut.load (std::memory_order_relaxed); }
 
 
     // Traitement en place. R peut être nul (mono). bypassIIR : n'applique pas la chaîne IIR
@@ -554,6 +563,7 @@ private:
         bool init = false;
         // structure en cours (forme / pente / placement)
         Shape shape = Shape::bell; int slope = 12; Place place = Place::stereo;
+        double slopeFree = 0.0; bool brick = false;   // (coupes : pente libre, Brickwall)
         bool structure = false;
         double wet = 0, wetTarget = 0, wetStart = 0;
 
@@ -585,6 +595,9 @@ private:
         double env = 0, dynOffset = 0;
         double envA = 0.99, envR = 0.999, coefAtk = -1, coefRel = -1;
         std::atomic<float> dynOut { 0.0f };
+        // seuil automatique : niveau moyen du détecteur, nombre d'échantillons moyennés (plafonné à la constante de temps)
+        double avg = 0, avgCount = 0, avgMax = 96000.0, relHi = 1e300;
+        std::atomic<float> autoThrOut { -80.0f };
         // zones sans logarithme : sous le genou (gain 0) et au-delà de la plage (gain = plage)
         double mapThr = 1e9, mapRange = 1e9, mapScale = -1, envLo = 0, envHi = 1e300, dynFull = 0;
         GainCache cache;
@@ -595,6 +608,7 @@ private:
             coefAtk = coefRel = -1;
             init = false; structure = false; wet = 0; wetTarget = 0; wetStart = 0; nsec = 0; detValid = false;
             env = 0; dynOffset = 0; dynOut.store (0.0f);
+            avg = 0; avgCount = 0; autoThrOut.store (-80.0f);
             fresh = true; smooth = false; histValid = false; settle = 0; playDyn = false; rtOk = false;
             lastDesignOk = false;
             for (auto& h : hs) h = PDesign();
@@ -610,6 +624,7 @@ private:
         BandSpec specFor (double f, double q, double g) const
         {
             BandSpec s; s.active = true; s.shape = shape; s.slope = slope; s.place = place;
+            s.slopeFree = slopeFree; s.brick = brick;
             s.freq = f; s.q = q; s.gainDb = g;
             return s;
         }
@@ -624,12 +639,16 @@ private:
         void advance (double fs, int len, bool legacy)
         {
             const bool wantOn = target.active;
-            const bool structChanged = structure && (target.shape != shape || target.slope != slope || target.place != place);
+            // (pente libre et Brickwall : seulement pour les coupes, les autres formes n'en tiennent pas compte)
+            BandSpec cur = target; cur.slope = slope; cur.slopeFree = slopeFree;
+            const bool cutChanged = isCut (target.shape) && (target.brick != brick || cutSlopeTenths (target) != cutSlopeTenths (cur));
+            const bool structChanged = structure && (target.shape != shape || target.slope != slope || target.place != place || cutChanged);
 
             if (! init && wantOn)
             {
                 fLog = std::log (target.freq); gDb = target.gainDb * scale; qLog = std::log (target.q);
                 shape = target.shape; slope = target.slope; place = target.place;
+                slopeFree = target.slopeFree; brick = target.brick;
                 structure = true; init = true; clearStates();
                 lastF = -1; fresh = true;
             }
@@ -645,6 +664,7 @@ private:
                     if (structChanged && wantOn)
                     {
                         shape = target.shape; slope = target.slope; place = target.place;
+                        slopeFree = target.slopeFree; brick = target.brick;
                         clearStates(); lastF = -1; fresh = true;
                     }
                     else if (! wantOn) { init = false; env = 0; dynOffset = 0; dynOut.store (0.0f); }
@@ -673,6 +693,8 @@ private:
 
             detecting = dynOk && wantOn;
             if (! detecting) { dynOffset = 0; env = 0; detValid = false; dynOut.store (0.0f, std::memory_order_relaxed); }
+            if (! detecting || ! dyn.autoThr) { avg = 0; avgCount = 0; }   // le seuil automatique repart de zéro
+            avgMax = std::max (1.0, autoThrSeconds * fs);
 
             const double f = std::exp (fLog), q = std::exp (qLog);
             baseMoved = std::abs (f - lastF) > 1e-9 * f || std::abs (gDb - lastBase) > 1e-7 || std::abs (q - lastQ) > 1e-9 * q;
@@ -688,6 +710,7 @@ private:
                     const double w = std::abs (full), overFull = w >= 3.0 ? w : std::sqrt (12.0 * w) - 3.0;
                     envLo = std::pow (10.0, (dyn.thrDb - 3.0) / 20.0);
                     envHi = std::pow (10.0, (dyn.thrDb + overFull) / 20.0);
+                    relHi = std::pow (10.0, (autoThrMarginDb + overFull) / 20.0);
                 }
             }
 
@@ -798,6 +821,14 @@ private:
         // Gain dynamique (dB) pour un niveau de détecteur
         inline double dynGain (double e) const
         {
+            if (dyn.autoThr)
+            {
+                // seuil automatique : niveau rapporté au niveau moyen (seuil = moyenne + 3 dB, genou de 6 dB)
+                const double ref = std::max (avg, autoThrFloor);
+                if (e <= ref) return 0.0;
+                if (e >= ref * relHi) return dynFull;
+                return dynCurveOver (20.0 * std::log10 (e / ref) - autoThrMarginDb, dyn.rangeDb * scale);
+            }
             if (e <= envLo) return 0.0;
             if (e >= envHi) return dynFull;
             return dynCurve (20.0 * std::log10 (std::max (1.0e-9, e)), dyn, scale);
@@ -817,6 +848,23 @@ private:
     {
         const double x = std::abs (d);
         b.env = x > b.env ? b.envA * b.env + (1.0 - b.envA) * x : b.envR * b.env + (1.0 - b.envR) * x;
+        if (b.dyn.autoThr && (b.avgCount > 0 || b.env > autoThrFloor))
+        {
+            // niveau moyen : moyenne simple depuis le début du signal, puis lissage exponentiel (2 s)
+            b.avgCount = std::min (b.avgCount + 1.0, b.avgMax);
+            b.avg += (b.env - b.avg) / b.avgCount;
+        }
+    }
+
+    // Même courbe, à partir du dépassement du seuil (dB)
+    static double dynCurveOver (double over, double range)
+    {
+        const double W = 6.0;
+        double o;
+        if (over <= -W / 2) o = 0;
+        else if (over < W / 2) o = (over + W / 2) * (over + W / 2) / (2 * W);
+        else o = over;
+        return range < 0 ? -std::min (o, -range) : std::min (o, range);
     }
 
     // Courbe de réponse de la dynamique : genou doux de 6 dB, gain qui suit le dépassement
@@ -913,7 +961,7 @@ private:
                 if (ext) detect (b, scl[i], scStereo ? scr[i] : scl[i], scStereo || stereo);
                 else detect (b, l[i], stereo ? r[i] : l[i], stereo);
             }
-            b.dynOffset = dynCurve (20.0 * std::log10 (std::max (1.0e-9, b.env)), b.dyn, b.scale);
+            b.dynOffset = b.dyn.autoThr ? b.dynGain (b.env) : dynCurve (20.0 * std::log10 (std::max (1.0e-9, b.env)), b.dyn, b.scale);
             b.dynOut.store ((float) b.dynOffset, std::memory_order_relaxed);
         }
         if (! filt || b.nsec == 0) return;
@@ -960,6 +1008,8 @@ private:
         }
         b.dynOffset = dynLast;
         b.dynOut.store ((float) dynLast, std::memory_order_relaxed);
+        if (b.dyn.autoThr)
+            b.autoThrOut.store ((float) (20.0 * std::log10 (std::max (b.avg, autoThrFloor)) + autoThrMarginDb), std::memory_order_relaxed);
         if (! filt) return;
 
         if (b.histValid)

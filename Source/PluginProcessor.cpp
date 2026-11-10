@@ -30,7 +30,7 @@ public:
             for (const auto& b : snap.bands)
             {
                 if (! b.active) { key.push_back (-1); continue; }
-                key.insert (key.end(), { (double) b.shape, (double) b.slope, (double) b.place,
+                key.insert (key.end(), { (double) b.shape, (double) b.slope, (double) b.place, b.slopeFree, b.brick ? 1.0 : 0.0,   // (3.0 : pente libre, Brickwall)
                                          std::round (std::log (b.freq) * 2000.0), std::round (b.gainDb * 10.0), std::round (std::log (b.q) * 500.0) });
             }
             const bool display = proc.editorOpen.load();
@@ -114,6 +114,9 @@ BandSpec AudioLabEqProcessor::getBandSpec (int b, bool withScale) const
     s.freq = bandValue (b, P::fFreq);
     s.q = bandValue (b, P::fQ);
     s.gainDb = hasGain (s.shape) ? bandValue (b, P::fGain) * (withScale ? gainScale() : 1.0) : 0.0;
+    // 3.0 : pente libre (0 = pente de la liste) et Brickwall, pour les coupes seulement
+    s.slopeFree = isCut (s.shape) ? (double) bandValue (b, P::fSlopeFree) : 0.0;
+    s.brick = isCut (s.shape) && bandValue (b, P::fBrick) > 0.5f;
     return s;
 }
 
@@ -126,6 +129,7 @@ DynSettings AudioLabEqProcessor::getDyn (int b) const
     d.attackMs = bandValue (b, P::fAtt);
     d.releaseMs = bandValue (b, P::fRel);
     d.external = bandValue (b, P::fSc) > 0.5f;
+    d.autoThr = bandValue (b, P::fThrAuto) > 0.5f;
     return d;
 }
 
@@ -235,7 +239,8 @@ static bool sameSpec (const BandSpec& a, const BandSpec& b)
     if (a.active != b.active) return false;
     if (! a.active) return true;
     return a.shape == b.shape && a.slope == b.slope && a.place == b.place
-        && a.freq == b.freq && a.gainDb == b.gainDb && a.q == b.q;
+        && a.freq == b.freq && a.gainDb == b.gainDb && a.q == b.q
+        && a.slopeFree == b.slopeFree && a.brick == b.brick;
 }
 
 void AudioLabEqProcessor::computeAutoGain()
@@ -459,6 +464,9 @@ int AudioLabEqProcessor::createBand (Shape shape, float freq, float gain, float 
     setBandValue (b, P::fAtt, 10);
     setBandValue (b, P::fRel, 150);
     setBandValue (b, P::fSc, 0);
+    setBandValue (b, P::fSlopeFree, 0);
+    setBandValue (b, P::fBrick, 0);
+    setBandValue (b, P::fThrAuto, 0);
     setBandValue (b, P::fOn, 1);
     setBandValue (b, P::fUsed, 1);
     return b;
@@ -512,18 +520,31 @@ void AudioLabEqProcessor::setStateVector (const std::vector<float>& vin)
 {
     const size_t nGlobals = std::size (P::globalIds);
     std::vector<float> v = vin;
-    if (v.size() == (size_t) (maxBands * P::legacyBandFields + P::legacyGlobals))
+    // États A/B ou « annuler » aux anciens formats : 1.x (13 champs par bande, 4 réglages généraux) et
+    // 2.0 (14 champs, 5 réglages généraux). Les champs ajoutés depuis prennent leur valeur neutre
+    // (side-chain interne, pente de la liste, Brickwall et seuil automatique coupés) ; un réglage général
+    // absent garde sa valeur actuelle.
+    int oldFields = 0, oldGlobals = 0;
+    if (v.size() == (size_t) (maxBands * P::legacyBandFields + P::legacyGlobals)) { oldFields = P::legacyBandFields; oldGlobals = P::legacyGlobals; }
+    else if (v.size() == (size_t) (maxBands * P::v2BandFields) + nGlobals)        { oldFields = P::v2BandFields; oldGlobals = (int) nGlobals; }
+    if (oldFields > 0)
     {
-        // état A/B ou « annuler » d'une version 1.x : side-chain interne, résolution inchangée
         v.clear();
         size_t k = 0;
         for (int b = 0; b < maxBands; ++b)
         {
-            for (int f = 0; f < P::legacyBandFields; ++f) v.push_back (vin[k++]);
-            for (int f = P::legacyBandFields; f < P::numBandFields; ++f) v.push_back (bandParams[(size_t) b][(size_t) f]->getDefaultValue());
+            for (int f = 0; f < oldFields; ++f) v.push_back (vin[k++]);
+            for (int f = oldFields; f < P::numBandFields; ++f) v.push_back (bandParams[(size_t) b][(size_t) f]->getDefaultValue());
         }
-        for (int g = 0; g < P::legacyGlobals; ++g) v.push_back (vin[k++]);
-        for (size_t g = (size_t) P::legacyGlobals; g < nGlobals; ++g) v.push_back (apvts.getParameter (P::globalIds[g])->getValue());
+        // (le paramètre « shape » a gagné deux choix en 3.0 : sa valeur normalisée est ramenée à la nouvelle échelle)
+        const int shapeField = fieldIndex (P::fShape);
+        for (int b = 0; b < maxBands; ++b)
+        {
+            float& x = v[(size_t) (b * P::numBandFields + shapeField)];
+            x = (float) juce::roundToInt (x * (float) (numLegacyShapes - 1)) / (float) (numShapes - 1);
+        }
+        for (int g = 0; g < oldGlobals; ++g) v.push_back (vin[k++]);
+        for (size_t g = (size_t) oldGlobals; g < nGlobals; ++g) v.push_back (apvts.getParameter (P::globalIds[g])->getValue());
     }
     if (v.size() != (size_t) (maxBands * P::numBandFields) + nGlobals) return;
     size_t k = 0;
@@ -627,7 +648,17 @@ void AudioLabEqProcessor::setStateInformation (const void* data, int sizeInBytes
         const auto oldAtt = legacy (P::legacyAttack), oldRel = legacy (P::legacyRelease);
         const bool hasNew = ! legacy (P::bandId (0, P::fAtt).toRawUTF8()).isVoid();
         const bool hasRes = ! legacy (P::linRes).isVoid();
+        // Projet 1.x ou 2.0 : les paramètres de la 3.0 n'y sont pas (noté avant le remplacement de l'état)
+        std::array<std::array<bool, 3>, maxBands> has3 {};
+        const char* const fields3[] = { P::fSlopeFree, P::fBrick, P::fThrAuto };
+        for (int b = 0; b < maxBands; ++b)
+            for (size_t i = 0; i < 3; ++i) has3[(size_t) b][i] = ! legacy (P::bandId (b, fields3[i]).toRawUTF8()).isVoid();
         apvts.replaceState (state);
+        // … ils sont remis explicitement à leur valeur neutre : mêmes pentes, pas de Brickwall, seuil manuel
+        for (int b = 0; b < maxBands; ++b)
+            for (size_t i = 0; i < 3; ++i)
+                if (! has3[(size_t) b][i])
+                    if (auto* prm = bandParam (b, fields3[i])) prm->setValueNotifyingHost (prm->getDefaultValue());
         // Projet 1.x : la phase linéaire avait une seule longueur (8192 points à 48 kHz) = Medium
         if (! hasRes) setValue (apvts.getParameter (P::linRes), (float) P::resMediumIndex);
         if (! hasNew && ! oldAtt.isVoid() && ! oldRel.isVoid())

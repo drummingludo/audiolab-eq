@@ -4,6 +4,7 @@
 #include "PluginProcessor.h"
 #include <thread>
 #include <cstdio>
+#include <cstring>
 
 namespace P = audiolab::params;
 static int failures = 0;
@@ -330,6 +331,176 @@ int main()
             const double sec = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0);
             std::printf ("8. Charge %s : %.1f %% d'un cœur (10 s d'audio traités en %.2f s, FIR %d points)\n",
                          mode == 0 ? "zéro latence" : mode == 1 ? "phase linéaire" : "phase naturelle", 100.0 * sec / 10.0, sec, p.activeFirLength());
+        }
+    }
+
+
+    // ── 3.0 : nouveaux paramètres et relecture des anciens états ──────────
+    // Un état 2.0.0 (ou 1.x) ne contient ni bN_slopefree, ni bN_brick, ni bN_thrauto : il doit redonner les
+    // mêmes formes, les mêmes pentes et le même son, quoi que le plugin ait eu comme réglages avant.
+    {
+        namespace E = audiolab::eq;
+        const int slopes[] = { 12, 24, 18, 6, 48, 12, 36, 12 };
+        auto build = [&] (AudioLabEqProcessor& p)
+        {
+            p.setPlayConfigDetails (2, 2, 48000, 512);
+            p.prepareToPlay (48000, 512);
+            p.clearAllBands();
+            for (int b = 0; b < E::numLegacyShapes; ++b)   // les 8 formes des versions 1.x et 2.0
+                p.createBand ((E::Shape) b, 60.0f * std::pow (2.1f, (float) b), (b % 2) ? 4.0f : -5.0f, 0.9f + 0.2f * (float) b, slopes[b], (E::Place) (b % 5));
+            p.setBandValue (0, P::fDyn, 1); p.setBandValue (0, P::fThr, -40); p.setBandValue (0, P::fRange, -8);
+        };
+        auto render = [] (AudioLabEqProcessor& p, std::vector<float>& out)
+        {
+            juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi; juce::Random rnd (5);
+            out.clear();
+            for (int k = 0; k < 60; ++k)
+            {
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) buf.setSample (ch, i, rnd.nextFloat() * 0.6f - 0.3f);
+                p.processBlock (buf, midi);
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) out.push_back (buf.getSample (ch, i));
+            }
+        };
+        auto dirty = [] (AudioLabEqProcessor& p)   // réglages 3.0 non neutres, qui ne doivent pas survivre à la relecture
+        {
+            for (int b = 0; b < E::maxBands; ++b) { p.setBandValue (b, P::fSlopeFree, 33.3f); p.setBandValue (b, P::fBrick, 1); p.setBandValue (b, P::fThrAuto, 1); p.setBandValue (b, P::fShape, 9); }
+        };
+        auto sameSettings = [] (AudioLabEqProcessor& a, AudioLabEqProcessor& b)
+        {
+            bool ok = true;
+            for (int k = 0; k < E::maxBands; ++k)
+                for (int f = 0; f < P::v2BandFields; ++f)
+                    ok = ok && std::abs (a.bandValue (k, P::bandFields[f]) - b.bandValue (k, P::bandFields[f])) <= 1e-4f * std::max (1.0f, std::abs (a.bandValue (k, P::bandFields[f])));
+            return ok;
+        };
+        auto neutral3 = [] (AudioLabEqProcessor& a)
+        {
+            bool ok = true;
+            for (int k = 0; k < E::maxBands; ++k)
+                ok = ok && a.bandValue (k, P::fSlopeFree) == 0.0f && a.bandValue (k, P::fBrick) < 0.5f && a.bandValue (k, P::fThrAuto) < 0.5f;
+            return ok;
+        };
+
+        AudioLabEqProcessor p; build (p);
+        juce::MemoryBlock mb; p.getStateInformation (mb);
+        auto st = juce::ValueTree::fromXml (*juce::AudioProcessor::getXmlFromBinary (mb.getData(), (int) mb.getSize()));
+        int removed = 0; bool shapeIsIndex = false;
+        for (int i = st.getNumChildren(); --i >= 0;)
+        {
+            const auto id = st.getChild (i).getProperty ("id").toString();
+            if (id.endsWith ("_slopefree") || id.endsWith ("_brick") || id.endsWith ("_thrauto")) { st.removeChild (i, nullptr); ++removed; }
+            // (l'état garde l'index de la forme, pas sa valeur normalisée : il ne dépend pas du nombre de formes)
+            if (id == "b3_shape") shapeIsIndex = std::abs ((float) st.getChild (i).getProperty ("value") - 2.0f) < 1e-6f;
+        }
+        CHECK (removed == 3 * E::maxBands && shapeIsIndex, "état 2.0.0 reconstitué (%d paramètres 3.0 retirés)", removed);
+        juce::MemoryBlock old; juce::AudioProcessor::copyXmlToBinary (*st.createXml(), old);
+
+        AudioLabEqProcessor q; build (q); dirty (q);
+        q.setStateInformation (old.getData(), (int) old.getSize());
+        const bool okSet = sameSettings (p, q), okNeutral = neutral3 (q);
+        bool okShapes = true;
+        for (int b = 0; b < E::numLegacyShapes; ++b)
+            okShapes = okShapes && juce::roundToInt (q.bandValue (b, P::fShape)) == b && E::slopeValues[juce::roundToInt (q.bandValue (b, P::fSlope))] == slopes[b];
+        // même son : p n'a jamais quitté les réglages neutres, q revient d'un état 2.0.0 après des réglages 3.0
+        AudioLabEqProcessor p2; build (p2); p2.prepareToPlay (48000, 512);
+        AudioLabEqProcessor q2; build (q2); dirty (q2); q2.setStateInformation (old.getData(), (int) old.getSize());
+        q2.prepareToPlay (48000, 512);
+        std::vector<float> a, c; render (p2, a); render (q2, c);
+        float diff = 0; for (size_t i = 0; i < a.size(); ++i) diff = std::max (diff, std::abs (a[i] - c[i]));
+        std::printf ("11. État 2.0.0 relu (sans les paramètres 3.0, après des réglages 3.0 non neutres) : formes et pentes %s, autres réglages %s,\n"
+                     "    pente libre / Brickwall / seuil automatique remis au neutre : %s ; écart max de la sortie avec un plugin jamais déréglé : %.1e [seuil 0]\n",
+                     okShapes ? "identiques" : "DIFFÉRENTES", okSet ? "identiques" : "DIFFÉRENTS", okNeutral ? "oui" : "NON", diff);
+        CHECK (okShapes && okSet && okNeutral, "relecture d'un état 2.0.0");
+        CHECK (diff == 0.0f, "un état 2.0.0 relu ne donne pas le même son (%.2e)", diff);
+
+        // A/B et annuler aux anciens formats : 2.0 (14 champs par bande, 5 réglages généraux) et 1.x (13 et 4).
+        // La forme y est une valeur normalisée sur 8 choix (index / 7).
+        auto oldVector = [&] (int fields, int globals)
+        {
+            const auto v = p.getStateVector();
+            std::vector<float> o;
+            for (int b = 0; b < E::maxBands; ++b)
+                for (int f = 0; f < fields; ++f)
+                    o.push_back (std::strcmp (P::bandFields[f], P::fShape) == 0 ? (float) juce::roundToInt (p.bandValue (b, P::fShape)) / (float) (E::numLegacyShapes - 1)
+                                                                               : v[(size_t) (b * P::numBandFields + f)]);
+            for (int g = 0; g < globals; ++g) o.push_back (v[(size_t) (E::maxBands * P::numBandFields + g)]);
+            return o;
+        };
+        bool okAB = true, okUndo = true;
+        for (int fmt = 0; fmt < 2; ++fmt)
+        {
+            const auto o = oldVector (fmt == 0 ? P::v2BandFields : P::legacyBandFields, fmt == 0 ? 5 : P::legacyGlobals);
+            juce::StringArray sa; for (float x : o) sa.add (juce::String (x, 7));
+            // A/B : l'état B vient d'une ancienne session, A a des réglages 3.0
+            AudioLabEqProcessor r; build (r); dirty (r);
+            r.ui.setProperty ("slotB", sa.joinIntoString (" "), nullptr);
+            r.switchAB ("B");
+            bool sh = true;
+            for (int b = 0; b < E::numLegacyShapes; ++b)
+                sh = sh && juce::roundToInt (r.bandValue (b, P::fShape)) == b && E::slopeValues[juce::roundToInt (r.bandValue (b, P::fSlope))] == slopes[b];
+            // (1.x : pas de side-chain dans l'état, il revient à Internal comme dans p)
+            okAB = okAB && sh && neutral3 (r) && sameSettings (p, r);
+            // retour à A : les réglages 3.0 de A sont toujours là (format actuel)
+            r.switchAB ("A");
+            okAB = okAB && r.bandValue (2, P::fBrick) > 0.5f && std::abs (r.bandValue (2, P::fSlopeFree) - 33.3f) < 0.01f && juce::roundToInt (r.bandValue (2, P::fShape)) == 9;
+            // annuler : un état de l'historique à l'ancien format
+            AudioLabEqProcessor u; build (u); dirty (u);
+            u.setStateVector (o);
+            bool su = true;
+            for (int b = 0; b < E::numLegacyShapes; ++b)
+                su = su && juce::roundToInt (u.bandValue (b, P::fShape)) == b && E::slopeValues[juce::roundToInt (u.bandValue (b, P::fSlope))] == slopes[b];
+            okUndo = okUndo && su && neutral3 (u) && sameSettings (p, u);
+        }
+        std::printf ("12. A/B et annuler aux anciens formats (2.0 : 14 champs et 5 réglages généraux ; 1.x : 13 et 4) : A/B %s, annuler %s\n", okAB ? "OK" : "ÉCHEC", okUndo ? "OK" : "ÉCHEC");
+        CHECK (okAB, "A/B à l'ancien format");
+        CHECK (okUndo, "annuler à l'ancien format");
+
+        // Format actuel : les réglages 3.0 sont sauvegardés, relus, et suivent A/B et annuler
+        {
+            AudioLabEqProcessor n; build (n);
+            n.setBandValue (2, P::fSlopeFree, 17.5f); n.setBandValue (4, P::fBrick, 1); n.setBandValue (0, P::fThrAuto, 1);
+            n.setBandValue (5, P::fShape, (float) (int) E::Shape::flatTilt); n.setBandValue (6, P::fShape, (float) (int) E::Shape::allPass);
+            juce::MemoryBlock m3; n.getStateInformation (m3);
+            AudioLabEqProcessor n2; n2.setStateInformation (m3.getData(), (int) m3.getSize());
+            const bool okSave = std::abs (n2.bandValue (2, P::fSlopeFree) - 17.5f) < 0.01f && n2.bandValue (4, P::fBrick) > 0.5f && n2.bandValue (0, P::fThrAuto) > 0.5f
+                             && juce::roundToInt (n2.bandValue (5, P::fShape)) == 8 && juce::roundToInt (n2.bandValue (6, P::fShape)) == 9;
+            const auto spec = n2.getBandSpec (2), spec4 = n2.getBandSpec (4);
+            n.pushUndo(); n.setBandValue (2, P::fSlopeFree, 0.0f); n.setBandValue (5, P::fShape, 0);
+            const bool okU = n.undo() && std::abs (n.bandValue (2, P::fSlopeFree) - 17.5f) < 0.01f && juce::roundToInt (n.bandValue (5, P::fShape)) == 8;
+            n.switchAB ("B"); n.setBandValue (4, P::fBrick, 0); n.switchAB ("A");
+            const bool okB = n.bandValue (4, P::fBrick) > 0.5f;
+            n.switchAB ("B");
+            std::printf ("13. Réglages 3.0 : sauvegarde / relecture %s (bande 3 : %.1f dB/oct, bande 5 : Brickwall %s), annuler %s, A/B %s\n",
+                         okSave ? "OK" : "ÉCHEC", audiolab::eq::cutSlope (spec), audiolab::eq::isBrick (spec4) ? "oui" : "non", okU ? "OK" : "ÉCHEC", okB && n.bandValue (4, P::fBrick) < 0.5f ? "OK" : "ÉCHEC");
+            CHECK (okSave && okU && okB && n.bandValue (4, P::fBrick) < 0.5f, "réglages 3.0 : sauvegarde, annuler, A/B");
+        }
+
+        // Les 10 formes, pentes libres et Brickwall dans les trois modes de phase : sortie valide
+        {
+            AudioLabEqProcessor m; m.setPlayConfigDetails (2, 2, 44100, 512); m.prepareToPlay (44100, 512);
+            m.clearAllBands();
+            for (int b = 0; b < 20; ++b)
+            {
+                const int k = m.createBand ((E::Shape) (b % E::numShapes), 40.0f * std::pow (1.35f, (float) b), (float) (b % 5) - 2.0f, 1.0f, 12, (E::Place) (b % 5));
+                if (b % 3 == 0) m.setBandValue (k, P::fSlopeFree, 7.0f + 4.3f * (float) b);
+                if (b == 4 || b == 12) m.setBandValue (k, P::fBrick, 1);
+                if (b % 4 == 0) { m.setBandValue (k, P::fDyn, 1); m.setBandValue (k, P::fThrAuto, 1); }
+            }
+            juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi; juce::Random rnd (9);
+            bool bad = false; float pk = 0;
+            for (int mode = 0; mode < 3; ++mode)
+            {
+                m.setValue (m.apvts.getParameter (P::phase), (float) mode);
+                for (int k = 0; k < 120; ++k)
+                {
+                    for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) buf.setSample (ch, i, rnd.nextFloat() * 0.2f - 0.1f);
+                    m.processBlock (buf, midi);
+                    for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) { const float v = buf.getSample (ch, i); if (! std::isfinite (v)) bad = true; pk = std::max (pk, std::abs (v)); }
+                    if (mode > 0) std::this_thread::sleep_for (std::chrono::milliseconds (2));
+                }
+            }
+            std::printf ("14. 20 bandes (10 formes, pentes libres, Brickwall, seuil automatique), Zero latency puis Linear puis Natural phase : %s (crête %.2f)\n", bad ? "PROBLÈME" : "OK", pk);
+            CHECK (! bad && pk < 100.0f, "sortie invalide avec les formes 3.0");
         }
     }
 

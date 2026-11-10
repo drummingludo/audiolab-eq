@@ -24,9 +24,15 @@ constexpr const char* fRange = "range";
 constexpr const char* fAtt   = "att";
 constexpr const char* fRel   = "rel";
 constexpr const char* fSc    = "sc";      // 2.0 : source du détecteur dynamique (Internal / External)
-constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange, fAtt, fRel, fSc };
-constexpr int numBandFields = 14;
+// 3.0 (ajoutés à la fin ; valeur neutre = comportement des versions précédentes)
+constexpr const char* fSlopeFree = "slopefree";   // pente libre des coupes en dB/oct ; 0 = pente de la liste
+constexpr const char* fBrick     = "brick";       // Brickwall (coupes) : Off / On
+constexpr const char* fThrAuto   = "thrauto";     // seuil dynamique automatique : Off / On
+constexpr const char* bandFields[] = { fUsed, fOn, fFreq, fGain, fQ, fShape, fSlope, fPlace, fDyn, fThr, fRange, fAtt, fRel, fSc,
+                                       fSlopeFree, fBrick, fThrAuto };
+constexpr int numBandFields = 17;
 constexpr int legacyBandFields = 13;      // états A/B et annuler des versions 1.x
+constexpr int v2BandFields = 14;          // états A/B et annuler de la version 2.0 (5 réglages généraux)
 
 constexpr const char* outGain   = "out_gain";
 constexpr const char* gainScale = "gain_scale";
@@ -45,7 +51,14 @@ inline juce::String U (const char* s) { return juce::String::fromUTF8 (s); }
 inline juce::StringArray shapeNames()
 {
     return { U ("Bell"), U ("Low shelf"), U ("Low cut"), U ("High shelf"), U ("High cut"),
-             U ("Notch"), U ("Band pass"), U ("Tilt") };
+             U ("Notch"), U ("Band pass"), U ("Tilt"), U ("Flat tilt"), U ("All pass") };
+}
+inline juce::StringArray offOnNames() { return { U ("Off"), U ("On") }; }
+// Pente libre : 0 = pente de la liste ; sinon de 6 à 96 dB/oct
+inline juce::String fmtSlopeFree (float v)
+{
+    if (v <= 0.0f) return U ("List");
+    return juce::String (juce::jlimit (6.0f, 96.0f, v), 1) + " dB/oct";
 }
 inline juce::StringArray slopeNames()
 {
@@ -149,6 +162,10 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
         grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fRel), 2), pre + U ("Release"), releaseRange(), 150.0f,
             AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction ([] (float v, int) { return fmtMs (v); })));
         grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fSc), 3), pre + U ("Side-chain"), scNames(), 0));
+        grp->addChild (std::make_unique<AudioParameterFloat> (pid (bandId (b, fSlopeFree), 4), pre + U ("Free slope"), NormalisableRange<float> (0.0f, 96.0f, 0.1f), 0.0f,
+            AudioParameterFloatAttributes().withLabel ("dB/oct").withStringFromValueFunction ([] (float v, int) { return fmtSlopeFree (v); })));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fBrick), 4), pre + U ("Brickwall"), offOnNames(), 0));
+        grp->addChild (std::make_unique<AudioParameterChoice> (pid (bandId (b, fThrAuto), 4), pre + U ("Auto threshold"), offOnNames(), 0));
         layout.add (std::move (grp));
     }
 

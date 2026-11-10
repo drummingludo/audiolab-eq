@@ -20,11 +20,19 @@
 // 14. Bande dynamique ET automatisée en même temps ; sortie indépendante de la taille des blocs de l'hôte
 // 15. Coût CPU du moteur (information, sans seuil)
 // 16. Sections de correction : coût (conception, sections par bande, traitement), bande dynamique dans l'aigu
+// Formes et pentes 3.0 (« ./qt 3.0 » ne lance que ces sections) :
+// 17. Flat tilt : écart à la droite idéale (0,1 dB), symétrie +g / −g (0,01 dB), moteur, FIR
+// 18. All pass : module (±0,001 dB), phase à la fréquence de la bande, neutre en Linear phase
+// 19. Pentes libres : écart au Butterworth d'ordre fractionnaire (0,1 dB au-dessus de −24 dB), pente moyenne
+// 20. Brickwall : ondulation (0,1 dB), atténuation (−96 dB à un tiers d'octave), mur des FIR selon la résolution
+// 21. Seuil dynamique automatique : repos, dépassement, retour, déterminisme
+// 22. Stabilité avec les nouvelles formes et pentes, coût CPU
 #include "EqEngine.h"
 #include "FirDesign.h"
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace audiolab::eq;
@@ -239,8 +247,554 @@ static void runSweep (int mode, int hostBlock, double lagSamples, std::vector<fl
     }
 }
 
-int main()
+
+// ── Outils des sections 17 à 22 (formes et pentes 3.0) ──────────────────
+// Réponse impulsionnelle du moteur (voie gauche) pour un jeu de bandes, après 4096 échantillons de mise en route
+static std::vector<double> engineImpulse (const std::vector<BandSpec>& bands, double fs, int len)
 {
+    Engine e; e.prepare (fs);
+    for (size_t i = 0; i < bands.size(); ++i) e.setBand ((int) i, bands[i], DynSettings(), 1.0);
+    std::vector<float> l ((size_t) (4096 + len), 0.0f), r ((size_t) (4096 + len), 0.0f);
+    l[4096] = 1.0f; r[4096] = 1.0f;
+    for (int off = 0; off < 4096 + len; off += 512) e.process (l.data() + off, r.data() + off, std::min (512, 4096 + len - off), false);
+    return std::vector<double> (l.begin() + 4096, l.end());
+}
+
+static std::complex<double> dftAt (const std::vector<double>& h, double f, double fs)
+{
+    const double w = 2.0 * pi * f / fs;
+    std::complex<double> s (0, 0);
+    for (size_t n = 0; n < h.size(); ++n) s += h[n] * std::polar (1.0, -w * (double) n);
+    return s;
+}
+
+// Cible d'une coupe à pente libre : Butterworth d'ordre fractionnaire n = pente / 6
+static double fracIdealDb (bool lowCut, double fc, double slope, double f)
+{
+    const double x = lowCut ? fc / f : f / fc;
+    return -10.0 * std::log10 (1.0 + std::pow (x, 2.0 * slope / 6.0));
+}
+
+// Pente moyenne (dB/oct) d'une courbe entre ses passages à −12 et −36 dB (0 si un passage manque entre 20 Hz et 20 kHz)
+template <typename F>
+static double meanSlope (F&& magDb)
+{
+    double f12 = 0, f36 = 0, pm = 0, pf = 0;
+    for (int i = 0; i <= 4000; ++i)
+    {
+        const double f = 20.0 * std::pow (1000.0, i / 4000.0), m = magDb (f);
+        if (i > 0)
+            for (double lv : { -12.0, -36.0 })
+                if ((pm - lv) * (m - lv) < 0) (lv == -12.0 ? f12 : f36) = pf * std::pow (f / pf, (lv - pm) / (m - pm));
+        pm = m; pf = f;
+    }
+    return f12 > 0 && f36 > 0 ? 24.0 / std::abs (std::log2 (f36 / f12)) : 0.0;
+}
+
+static void testShapes30()
+{
+    const double rates[] = { 44100, 48000, 96000, 192000 };
+    using clk = std::chrono::steady_clock;
+
+    // ── 17. Flat tilt ────────────────────────────────────────────────────
+    std::printf ("17. Flat tilt : écart à la droite idéale (gain = écart 20 kHz − 20 Hz, 0 dB à la fréquence de la bande), 20 Hz – 20 kHz\n");
+    {
+        for (double fs : rates)
+        {
+            double w30 = 0, w60 = 0, wA = 0, wSym = 0;
+            for (double g : { -60.0, -45.0, -30.0, -18.0, -6.0, -1.0, 1.0, 6.0, 18.0, 30.0, 45.0, 60.0 })
+                for (double f0 : { 20.0, 200.0, 1000.0, 6000.0, 20000.0 })
+                {
+                    BandSpec b; b.active = true; b.shape = Shape::flatTilt; b.freq = f0; b.gainDb = g;
+                    BandSpec bi = b; bi.gainDb = -g;
+                    Design d, a, di; design (b, fs, d, false); design (b, fs, a, true); design (bi, fs, di, false);
+                    for (int i = 0; i <= 800; ++i)
+                    {
+                        const double f = 20.0 * std::pow (1000.0, i / 800.0);
+                        const double ideal = g / 60.0 * 20.0 * std::log10 (f / f0);
+                        const double e = std::abs (magnitudeDb (d, f, fs, false) - ideal);
+                        (std::abs (g) <= 30 ? w30 : w60) = std::max (std::abs (g) <= 30 ? w30 : w60, e);
+                        if (std::abs (g) <= 30) wA = std::max (wA, std::abs (magnitudeDb (a, f, fs, true) - ideal));
+                        wSym = std::max (wSym, std::abs (magnitudeDb (d, f, fs, false) + magnitudeDb (di, f, fs, false)));
+                    }
+                }
+            std::printf ("   %.1f kHz : gains jusqu'à ±30 dB %.3f dB [seuil 0.10] ; jusqu'à ±60 dB (échelle 200 %%) %.3f dB [seuil 0.10] ; cible des FIR %.4f dB [seuil 0.02] ; +g puis −g : %.1e dB [seuil 0.01]\n",
+                         fs / 1000, w30, w60, wA, wSym);
+            CHECK (w30 <= 0.10 && w60 <= 0.10, "Flat tilt à %.0f Hz : %.3f / %.3f dB", fs, w30, w60);
+            CHECK (wA <= 0.02, "Flat tilt, cible des FIR à %.0f Hz : %.4f dB", fs, wA);
+            CHECK (wSym <= 0.01, "Flat tilt, symétrie à %.0f Hz : %.2e dB", fs, wSym);
+        }
+        // moteur : réponse mesurée = droite idéale ; +g puis −g dans le moteur = plat
+        {
+            const double fs = 44100;
+            BandSpec b; b.active = true; b.shape = Shape::flatTilt; b.freq = 1000; b.gainDb = 12;
+            BandSpec bi = b; bi.gainDb = -12;
+            const auto h = engineImpulse ({ b }, fs, 1 << 17), hs = engineImpulse ({ b, bi }, fs, 1 << 15);
+            double e = 0, es = 0;
+            for (int i = 0; i <= 60; ++i)
+            {
+                const double f = 20.0 * std::pow (1000.0, i / 60.0);
+                e = std::max (e, std::abs (db (std::abs (dftAt (h, f, fs))) - 12.0 / 60.0 * 20.0 * std::log10 (f / 1000.0)));
+                es = std::max (es, std::abs (db (std::abs (dftAt (hs, f, fs)))));
+            }
+            std::printf ("   moteur, 44,1 kHz, +12 dB à 1 kHz : écart mesuré à la droite %.3f dB [seuil 0.10] ; +12 puis −12 dB : %.4f dB [seuil 0.01]\n", e, es);
+            CHECK (e <= 0.10, "Flat tilt, moteur : %.3f dB", e);
+            CHECK (es <= 0.01, "Flat tilt, moteur, symétrie : %.4f dB", es);
+        }
+        // Linear phase et Natural phase : FIR conçu sur la cible (longueur Auto), 20 Hz – 20 kHz
+        {
+            fir::Work w;
+            double wl = 0, wn = 0, wp = 0; int nMin = 1 << 30, nMax = 0;
+            for (double fs : { 44100.0, 48000.0, 96000.0 })
+                for (double g : { 3.0, 12.0, 30.0, -3.0, -12.0, -30.0 })
+                    for (int nat = 0; nat < 2; ++nat)
+                    {
+                        fir::Request rq; rq.fs = fs; rq.mode = nat ? fir::Mode::natural : fir::Mode::linear; rq.delay = fir::naturalDelay (fs);
+                        rq.bands[0].active = true; rq.bands[0].shape = Shape::flatTilt; rq.bands[0].freq = 1000; rq.bands[0].gainDb = g;
+                        rq.N = fir::chooseLength (fir::Res::automatic, rq.bands, fs, rq.mode);
+                        if (! nat) { nMin = std::min (nMin, rq.N / fir::rateMult (fs)); nMax = std::max (nMax, rq.N / fir::rateMult (fs)); }
+                        fir::Result r; fir::design (rq, r, w);
+                        Design a; design (rq.bands[0], fs, a, true);
+                        for (int i = 0; i <= 120; ++i)
+                        {
+                            const double f = 20.0 * std::pow (nat ? 900.0 : 1000.0, i / 120.0);
+                            const auto hf = fir::responseAt (r.h[0], nat ? rq.delay : rq.N / 2, fs, f);
+                            const double x = std::abs (db (std::abs (hf)) - g / 60.0 * 20.0 * std::log10 (f / 1000.0));
+                            if (nat) { wn = std::max (wn, x); wp = std::max (wp, std::abs (std::arg (hf / response (a, f, fs, true))) * 180.0 / pi); }
+                            else wl = std::max (wl, x);
+                        }
+                    }
+            std::printf ("   FIR, longueur Auto (%d à %d points à 44,1 / 48 kHz), gains ±3, ±12, ±30 dB, 44,1 / 48 / 96 kHz : Linear phase %.3f dB de la droite [seuil 0.12] ;\n"
+                         "      Natural phase (20 Hz – 18 kHz) %.3f dB de la droite, phase à %.2f° de la cible [seuils 0.10 dB, 1°]\n", nMin, nMax, wl, wn, wp);
+            CHECK (wl <= 0.12, "Flat tilt en Linear phase : %.3f dB", wl);
+            CHECK (wn <= 0.10 && wp <= 1.0, "Flat tilt en Natural phase : %.3f dB, %.2f°", wn, wp);
+        }
+    }
+
+    // ── 18. All pass ─────────────────────────────────────────────────────
+    std::printf ("18. All pass : module plat, rotation de phase à la fréquence de la bande (ordre 1 : pente 6 dB/oct ; ordre 2 : autres pentes, avec Q)\n");
+    {
+        double wMag = 0, wPh1 = 0, wPh2 = 0;
+        for (double fs : rates)
+            for (double f0 : { 30.0, 1000.0, 9000.0, 18000.0 })
+                for (double q : { 0.3, 0.71, 4.0, 20.0 })
+                    for (int slope : { 6, 12 })
+                    {
+                        BandSpec b; b.active = true; b.shape = Shape::allPass; b.freq = f0; b.q = q; b.slope = slope;
+                        Design d; design (b, fs, d, false);
+                        for (int i = 0; i <= 400; ++i) wMag = std::max (wMag, std::abs (magnitudeDb (d, 20.0 * std::pow (1000.0, i / 400.0), fs, false)));
+                        const double ph = std::arg (response (d, f0, fs, false)) * 180.0 / pi;
+                        if (slope == 6) wPh1 = std::max (wPh1, std::abs (ph + 90.0));
+                        else wPh2 = std::max (wPh2, std::abs (std::abs (ph) - 180.0));
+                    }
+        std::printf ("   conception (4 fréquences d'échantillonnage, Q 0.3–20) : module %.1e dB [seuil 0.001] ; phase à la fréquence de la bande : ordre 1 −90° ± %.1e°, ordre 2 −180° ± %.1e° [seuil 0.01°]\n", wMag, wPh1, wPh2);
+        CHECK (wMag <= 0.001, "All pass : module %.2e dB", wMag);
+        CHECK (wPh1 <= 0.01 && wPh2 <= 0.01, "All pass : phase %.2e / %.2e", wPh1, wPh2);
+        // test de nul dans le moteur : le module de la sortie est celui de l'entrée
+        double wEng = 0, phEng = 0;
+        for (int slope : { 6, 12 })
+        {
+            BandSpec b; b.active = true; b.shape = Shape::allPass; b.freq = 1000; b.q = 2; b.slope = slope;
+            const auto h = engineImpulse ({ b }, 48000, 1 << 14);
+            for (int i = 0; i <= 80; ++i) wEng = std::max (wEng, std::abs (db (std::abs (dftAt (h, 20.0 * std::pow (1000.0, i / 80.0), 48000)))));
+            const double ph = std::arg (dftAt (h, 1000, 48000)) * 180.0 / pi;
+            phEng = std::max (phEng, slope == 6 ? std::abs (ph + 90.0) : std::abs (std::abs (ph) - 180.0));
+        }
+        std::printf ("   moteur (réponse impulsionnelle, 48 kHz, 1 kHz Q 2) : module %.1e dB [seuil 0.001] ; phase à 1 kHz à %.1e° de −90° / −180° [seuil 0.01°]\n", wEng, phEng);
+        CHECK (wEng <= 0.001 && phEng <= 0.01, "All pass, moteur : %.2e dB, %.2e°", wEng, phEng);
+        // Linear phase : neutre (le FIR est un simple retard)
+        {
+            fir::Work w; fir::Request rq; rq.fs = 48000; rq.mode = fir::Mode::linear; rq.N = 4096; rq.delay = fir::naturalDelay (48000);
+            rq.bands[0].active = true; rq.bands[0].shape = Shape::allPass; rq.bands[0].freq = 1000; rq.bands[0].q = 2;
+            fir::Result r; fir::design (rq, r, w);
+            double e = 0;
+            for (int n = 0; n < rq.N; ++n) e = std::max (e, std::abs (r.h[0][(size_t) n] - (n == rq.N / 2 ? 1.0 : 0.0)));
+            // Natural phase : module et phase du passe-tout analogique
+            rq.mode = fir::Mode::natural; rq.N = 8192;
+            fir::Result rn; fir::design (rq, rn, w);
+            Design a; design (rq.bands[0], 48000, a, true);
+            double em = 0, ep = 0;
+            for (int i = 0; i <= 60; ++i)
+            {
+                const double f = 20.0 * std::pow (900.0, i / 60.0);
+                const auto hf = fir::responseAt (rn.h[0], rq.delay, 48000, f), ha = response (a, f, 48000, true);
+                em = std::max (em, std::abs (db (std::abs (hf)))); ep = std::max (ep, std::abs (std::arg (hf / ha)) * 180.0 / pi);
+            }
+            std::printf ("   Linear phase : FIR = retard pur à %.1e près [seuil 1e-9] (neutre) ; Natural phase (20 Hz – 18 kHz) : module %.4f dB, phase à %.3f° de l'analogique [seuils 0.01 dB, 1°]\n", e, em, ep);
+            CHECK (e <= 1e-9, "All pass en Linear phase : %.2e", e);
+            CHECK (em <= 0.01 && ep <= 1.0, "All pass en Natural phase : %.4f dB, %.3f°", em, ep);
+        }
+    }
+
+    // ── 19. Pentes libres ────────────────────────────────────────────────
+    std::printf ("19. Pentes libres des coupes : cible = Butterworth d'ordre fractionnaire, |H|² = 1/(1 + (f/fc)^(2n)), n = pente / 6 (Q 0.71)\n"
+                 "   écart mesuré là où la cible est au-dessus de −24 dB, de 20 Hz à 20 kHz ; pente moyenne entre −12 et −36 dB\n"
+                 "   (la cible elle-même a une pente moyenne de 0,992 × la consigne entre −12 et −36 dB : −0,76 dB/oct à 96 dB/oct)\n");
+    {
+        const double kIdeal = 24.0 / (0.5 * std::log2 ((std::pow (10.0, 3.6) - 1.0) / (std::pow (10.0, 1.2) - 1.0)) * 6.0);   // 0,9918
+        for (double fs : rates)
+        {
+            double worst = 0, wS = 0, wF = 0, worstA = 0, sT = 0, sTS = 0, sTF = 0, sN = 0, sN48 = 0; int maxN = 0, wLow = 0, nSl = 0;
+            for (int t = 61; t < 960; t += 4)
+                for (double fc : { 30.0, 120.0, 500.0, 2000.0, 6000.0, 12000.0, 18000.0 })
+                    for (int lowCut = 0; lowCut < 2; ++lowCut)
+                    {
+                        if (t % 60 == 0) continue;
+                        const double slope = t / 10.0;
+                        BandSpec b; b.active = true; b.shape = lowCut ? Shape::lowCut : Shape::highCut; b.freq = fc; b.q = 0.7071067811865476; b.slopeFree = slope;
+                        Design d, a; design (b, fs, d, false); design (b, fs, a, true);
+                        maxN = std::max (maxN, d.n);
+                        for (int i = 0; i <= 1000; ++i)
+                        {
+                            const double f = 20.0 * std::pow (1000.0, i / 1000.0), ideal = fracIdealDb (lowCut, fc, slope, f);
+                            if (ideal < -24.0) continue;
+                            const double e = std::abs (magnitudeDb (d, f, fs, false) - ideal);
+                            if (e > worst) { worst = e; wS = slope; wF = fc; wLow = lowCut; }
+                            worstA = std::max (worstA, std::abs (magnitudeDb (a, f, fs, true) - ideal));
+                        }
+                        const double sl = meanSlope ([&] (double f) { return magnitudeDb (d, f, fs, false); });
+                        if (sl > 0)
+                        {
+                            ++nSl;
+                            if (std::abs (sl - kIdeal * slope) > sT) { sT = std::abs (sl - kIdeal * slope); sTS = slope; sTF = fc; }
+                            sN = std::max (sN, std::abs (sl - slope));
+                            if (slope <= 48.0) sN48 = std::max (sN48, std::abs (sl - slope));
+                        }
+                    }
+            std::printf ("   %.1f kHz : écart %.3f dB (%s %.1f dB/oct à %.0f Hz) [seuil 0.10] ; prototype seul %.3f dB ; pente moyenne à %.2f dB/oct de celle de la cible (%.1f dB/oct à %.0f Hz) [seuil 0.50],\n"
+                         "      à %.2f dB/oct de la consigne (%.2f jusqu'à 48 dB/oct) [seuils 1.10 et 0.50] (%d mesures) ; %d sections au plus\n",
+                         fs / 1000, worst, wLow ? "coupe-bas" : "coupe-haut", wS, wF, worstA, sT, sTS, sTF, sN, sN48, nSl, maxN);
+            CHECK (worst <= 0.10, "pente libre à %.0f Hz : %.3f dB", fs, worst);
+            CHECK (sT <= 0.50, "pente libre à %.0f Hz : pente moyenne à %.2f dB/oct de la cible", fs, sT);
+            CHECK (sN <= 1.10 && sN48 <= 0.50, "pente libre à %.0f Hz : pente moyenne à %.2f dB/oct de la consigne (%.2f jusqu'à 48 dB/oct)", fs, sN, sN48);
+        }
+        // une pente libre multiple de 6 dB/oct donne exactement la coupe de la liste ; 0 = pente de la liste
+        {
+            bool same = true;
+            for (int s : { 6, 12, 24, 48, 96 })
+                for (int lowCut = 0; lowCut < 2; ++lowCut)
+                {
+                    BandSpec b; b.active = true; b.shape = lowCut ? Shape::lowCut : Shape::highCut; b.freq = 3000; b.q = 1.3; b.slope = s;
+                    BandSpec c = b; c.slope = 12; c.slopeFree = s;
+                    BandSpec z = b; z.slopeFree = 0.0; z.brick = false;
+                    Design d1, d2, d3; design (b, 44100, d1, false); design (c, 44100, d2, false); design (z, 44100, d3, false);
+                    same = same && d1.n == d2.n && d1.n == d3.n;
+                    for (int i = 0; i < d1.n && same; ++i)
+                        same = d1.s[(size_t) i].g == d2.s[(size_t) i].g && d1.s[(size_t) i].k == d2.s[(size_t) i].k && d1.s[(size_t) i].m2 == d2.s[(size_t) i].m2
+                            && d1.s[(size_t) i].g == d3.s[(size_t) i].g;
+                }
+            std::printf ("   pente libre de 6, 12, 24, 48 ou 96 dB/oct = coupe de la liste, coefficient pour coefficient : %s\n", same ? "oui" : "NON");
+            CHECK (same, "pente libre entière différente de la pente de la liste");
+        }
+        // Q : la section la plus résonante suit le réglage, comme pour les pentes de la liste (information)
+        {
+            BandSpec b; b.active = true; b.shape = Shape::highCut; b.freq = 1000; b.slopeFree = 21.0;
+            b.q = 0.7071067811865476; Design d0; design (b, 48000, d0, false);
+            b.q = 2.0; Design d1; design (b, 48000, d1, false);
+            double bump = -100; for (int i = 0; i <= 400; ++i) { const double f = 300.0 * std::pow (5.0, i / 400.0); bump = std::max (bump, magnitudeDb (d1, f, 48000, false) - magnitudeDb (d0, f, 48000, false)); }
+            std::printf ("   coupe-haut 21 dB/oct à 1 kHz, Q 2 au lieu de 0.71 : bosse de %.2f dB à la coupure (9,03 dB pour un facteur 2,83 sur le Q de la section résonante)\n", bump);
+            CHECK (bump > 6.0 && bump < 10.0, "Q d'une pente libre : %.2f dB", bump);
+        }
+        // moteur : réponse mesurée = cible
+        {
+            BandSpec b; b.active = true; b.shape = Shape::highCut; b.freq = 2000; b.q = 0.7071067811865476; b.slopeFree = 15.5;
+            const auto h = engineImpulse ({ b }, 44100, 1 << 14);
+            double e = 0;
+            for (int i = 0; i <= 80; ++i) { const double f = 20.0 * std::pow (1000.0, i / 80.0), id = fracIdealDb (false, 2000, 15.5, f); if (id > -24) e = std::max (e, std::abs (db (std::abs (dftAt (h, f, 44100))) - id)); }
+            std::printf ("   moteur, coupe-haut 15,5 dB/oct à 2 kHz, 44,1 kHz : écart mesuré à la cible %.3f dB [seuil 0.10]\n", e);
+            CHECK (e <= 0.10, "pente libre, moteur : %.3f dB", e);
+        }
+    }
+
+    // ── 20. Brickwall ────────────────────────────────────────────────────
+    std::printf ("20. Brickwall : elliptique d'ordre 12 (6 sections), −3 dB à la fréquence de la bande\n");
+    {
+        const double third = std::pow (2.0, 1.0 / 3.0);
+        for (double fs : rates)
+        {
+            double rip = 0, att = -1e9, m3 = 0, edge = 0;
+            for (double fc : { 25.0, 100.0, 1000.0, 8000.0, 12000.0, 15800.0, 19000.0 })
+                for (int lowCut = 0; lowCut < 2; ++lowCut)
+                {
+                    BandSpec b; b.active = true; b.shape = lowCut ? Shape::lowCut : Shape::highCut; b.freq = fc; b.brick = true;
+                    Design d; design (b, fs, d, false);
+                    m3 = std::max (m3, std::abs (magnitudeDb (d, fc, fs, false) + 3.0103));
+                    double firstStop = 0;
+                    for (int i = 0; i <= 8000; ++i)
+                    {
+                        const double f = 5.0 * std::pow (0.4999 * fs / 5.0, i / 8000.0);
+                        const double x = lowCut ? fc / f : f / fc, m = magnitudeDb (d, f, fs, false);
+                        if (x <= 0.95) rip = std::max (rip, std::abs (m));
+                        if (x >= third) att = std::max (att, m);
+                        if (x > 1 && m <= -96.0 && (firstStop == 0 || x < firstStop)) firstStop = x;
+                    }
+                    // largeur de la transition (−3 dB → −96 dB), en octaves : la plus grande rencontrée
+                    double xs = 1.0; while (xs < 4.0 && magnitudeDb (d, lowCut ? fc / xs : fc * xs, fs, false) > -96.0) xs *= 1.0005;
+                    if ((lowCut ? fc / xs : fc * xs) < 0.499 * fs) edge = std::max (edge, std::log2 (xs));
+                }
+            std::printf ("   %.1f kHz : ondulation en bande passante (jusqu'à 0,95 fc) %.3f dB [seuil 0.10] ; niveau max au-delà d'un tiers d'octave %.1f dB [seuil −96] ;\n"
+                         "      −96 dB atteints %.3f octave après la coupure ; écart au −3 dB à la coupure %.1e dB\n", fs / 1000, rip, att, edge, m3);
+            CHECK (rip <= 0.10, "Brickwall à %.0f Hz : ondulation %.3f dB", fs, rip);
+            CHECK (att <= -96.0, "Brickwall à %.0f Hz : atténuation %.1f dB", fs, att);
+            CHECK (edge <= 1.0 / 3.0 && m3 < 1e-6, "Brickwall à %.0f Hz : transition %.3f octave, −3 dB %.1e", fs, edge, m3);
+        }
+        // moteur : sinus un tiers d'octave au-delà de la coupure, niveau en sortie
+        {
+            const double fs = 48000, fc = 5000, f = fc * third * 1.001;
+            Engine e; e.prepare (fs);
+            BandSpec b; b.active = true; b.shape = Shape::highCut; b.freq = fc; b.brick = true;
+            e.setBand (0, b, DynSettings(), 1.0);
+            std::vector<float> l (48000), r (48000);
+            for (int i = 0; i < 48000; ++i) l[(size_t) i] = r[(size_t) i] = (float) (0.5 * std::sin (2 * pi * f * i / fs));
+            for (int off = 0; off < 48000; off += 480) e.process (l.data() + off, r.data() + off, 480, false);
+            double s = 0; for (int i = 24000; i < 48000; ++i) s += (double) l[(size_t) i] * l[(size_t) i];
+            const double lvl = db (std::sqrt (s / 24000) / (0.5 / std::sqrt (2.0)));
+            std::printf ("   moteur, coupe-haut 5 kHz à 48 kHz, sinus à 6,3 kHz : %.1f dB en sortie [seuil −96]\n", lvl);
+            CHECK (lvl <= -96.0, "Brickwall, moteur : %.1f dB", lvl);
+        }
+        // Linear phase : mur idéal, transition fixée par la longueur du FIR (48 kHz, coupe-haut 5 kHz et coupe-bas 100 Hz)
+        {
+            fir::Work w;
+            std::printf ("   Linear phase à 48 kHz (vrai mur, la transition dépend de la longueur du FIR) : largeur entre −0,1 dB et −96 dB, niveau max au-delà [seuils : 16 fs / N, −96 dB, ± 0.1 dB]\n");
+            for (auto res : { fir::Res::low, fir::Res::medium, fir::Res::high, fir::Res::max })
+            {
+                const int N = fir::lengthFor (res, 48000);
+                double width[2] = { 0, 0 }, stop[2] = { -1e9, -1e9 }, pass[2] = { 0, 0 };
+                for (int lowCut = 0; lowCut < 2; ++lowCut)
+                {
+                    const double fc = lowCut ? 100.0 : 5000.0;
+                    fir::Request rq; rq.fs = 48000; rq.mode = fir::Mode::linear; rq.N = N; rq.delay = fir::naturalDelay (48000);
+                    rq.bands[0].active = true; rq.bands[0].shape = lowCut ? Shape::lowCut : Shape::highCut; rq.bands[0].freq = fc; rq.bands[0].brick = true;
+                    fir::Result r; fir::design (rq, r, w);
+                    auto mag = [&] (double f) { return db (std::abs (fir::responseAt (r.h[0], N / 2, 48000, f))); };
+                    // bord de la bande passante (−0,1 dB) et début de la bande coupée (−96 dB), en s'éloignant de la coupure par pas de 0,25 Hz
+                    double fp = fc, fsb = fc;
+                    const double dir = lowCut ? -1.0 : 1.0;
+                    while (std::abs (fp - fc) < 0.9 * fc && mag (fp) < -0.1) fp -= dir * 0.25;
+                    while (std::abs (fsb - fc) < 0.9 * fc && mag (fsb) > -96.0) fsb += dir * 0.25;
+                    width[lowCut] = std::abs (fsb - fp);
+                    for (int i = 0; i <= 300; ++i)
+                    {
+                        const double f = lowCut ? 1.0 + (fsb - 1.0) * i / 300.0 : fsb + (23900.0 - fsb) * i / 300.0;
+                        if (f > 0.5) stop[lowCut] = std::max (stop[lowCut], mag (f));
+                        const double g = lowCut ? fp + (20000.0 - fp) * i / 300.0 : 20.0 + (fp - 20.0) * i / 300.0;
+                        pass[lowCut] = std::max (pass[lowCut], std::abs (mag (g)));
+                    }
+                }
+                std::printf ("      %5d points : coupe-haut 5 kHz %.1f Hz (%.3f octave), bande coupée ≤ %.1f dB, bande passante ± %.3f dB ; coupe-bas 100 Hz %.1f Hz, ≤ %.1f dB, ± %.3f dB\n",
+                             N, width[0], std::log2 ((5000.0 + width[0]) / 5000.0), stop[0], pass[0], width[1], stop[1], pass[1]);
+                // seuils : bande coupée ≤ −96 dB, bande passante ± 0,1 dB, transition ≤ 16 fs / N ; coupe-bas 100 Hz : à partir de 8192 points
+                // (à 4096 points la transition, 174 Hz, est plus large que la bande coupée elle-même)
+                CHECK (stop[0] <= -96.0 && pass[0] <= 0.1 && width[0] <= 16.0 * 48000.0 / N, "Brickwall en Linear phase, %d points : %.1f dB, ± %.3f dB, %.1f Hz", N, stop[0], pass[0], width[0]);
+                CHECK (N < 8192 || (stop[1] <= -96.0 && pass[1] <= 0.1 && width[1] <= 16.0 * 48000.0 / N), "Brickwall coupe-bas en Linear phase, %d points : %.1f dB, ± %.3f dB, %.1f Hz", N, stop[1], pass[1], width[1]);
+            }
+        }
+    }
+
+    // ── 21. Seuil dynamique automatique ──────────────────────────────────
+    std::printf ("21. Seuil automatique : le seuil suit le niveau moyen du détecteur (constante de temps %.0f s), seuil = moyenne + %.0f dB\n", autoThrSeconds, autoThrMarginDb);
+    {
+        const double fs = 48000;
+        // sinus 1 kHz : 6 s au niveau de base, saut de +9 dB, puis 12 s à ce nouveau niveau ; plage −12 dB, attaque 1 ms
+        auto run = [&] (double baseDb, int block, std::vector<float>& trace, std::vector<float>& out)
+        {
+            Engine e; e.prepare (fs);
+            BandSpec b; b.active = true; b.shape = Shape::bell; b.freq = 1000; b.q = 2; b.gainDb = 0;
+            DynSettings d; d.on = true; d.autoThr = true; d.thrDb = -30; d.rangeDb = -12; d.attackMs = 1; d.releaseMs = 50;
+            e.setBand (0, b, d, 1.0);
+            const int total = (int) (18 * fs);
+            out.assign ((size_t) total, 0.0f); trace.clear();
+            std::vector<float> r ((size_t) total);
+            for (int i = 0; i < total; ++i)
+            {
+                const double a = std::pow (10.0, (baseDb + (i >= 6 * fs ? 9.0 : 0.0)) / 20.0);
+                out[(size_t) i] = r[(size_t) i] = (float) (a * std::sin (2 * pi * 1000.0 * i / fs));
+            }
+            for (int off = 0; off < total; off += block)
+            {
+                const int n = std::min (block, total - off);
+                e.process (out.data() + off, r.data() + off, n, false);
+                if ((off / block) % std::max (1, 480 / block) == 0) trace.push_back (e.getDynOffset (0));
+            }
+            return e.getAutoThreshold (0);
+        };
+        std::vector<float> tr, o1, tr2, o2, tr3, o3, tr4, o4;
+        const float thrEnd = run (-20, 480, tr, o1);
+        auto at = [&] (const std::vector<float>& t, double sec) { return (double) t[(size_t) (sec * 100.0)]; };   // (une valeur toutes les 10 ms)
+        const double start = at (tr, 0.05), rest = at (tr, 5.9), hit = at (tr, 6.03), later = at (tr, 17.9);
+        double maxRest = 0; for (double s = 1.0; s < 5.95; s += 0.01) maxRest = std::max (maxRest, std::abs (at (tr, s)));
+        std::printf ("   niveau stable −20 dBFS : gain dynamique %.3f dB au départ (50 ms), %.3f dB au repos (au plus %.3f dB entre 1 et 6 s) [seuil 0.1]\n", start, rest, maxRest);
+        std::printf ("   saut de +9 dB : %.2f dB 30 ms après (attendu ≈ −6 : dépassement de 9 dB, seuil 3 dB au-dessus de la moyenne) [seuil −6 ± 0.5] ; %.3f dB 12 s après (le seuil a rejoint le nouveau niveau) [seuil 0.1]\n", hit, later);
+        std::printf ("   seuil lu à la fin : %.2f dBFS (crête du détecteur −11 dBFS + 3 dB = −8 ; l'enveloppe moyenne est un peu sous la crête) [seuil −8 ± 1]\n", thrEnd);
+        CHECK (std::abs (start) <= 0.1 && maxRest <= 0.1, "seuil automatique au repos : %.3f / %.3f dB", start, maxRest);
+        CHECK (std::abs (hit + 6.0) <= 0.5, "seuil automatique, saut de +9 dB : %.2f dB", hit);
+        CHECK (std::abs (later) <= 0.1, "seuil automatique, retour : %.3f dB", later);
+        CHECK (std::abs (thrEnd + 8.0) <= 1.0, "seuil automatique lu : %.2f dBFS", thrEnd);
+        // même comportement 30 dB plus bas (le seuil est relatif au niveau)
+        run (-50, 480, tr2, o2);
+        double dLvl = 0; for (size_t i = 0; i < tr.size(); ++i) dLvl = std::max (dLvl, (double) std::abs (tr[i] - tr2[i]));
+        // déterminisme : deux passes identiques bit à bit ; blocs de 480 ou de 96 échantillons
+        run (-20, 480, tr3, o3);
+        bool same = o1 == o3;
+        run (-20, 96, tr4, o4);
+        double dBlk = 0; for (size_t i = 0; i < o1.size(); ++i) dBlk = std::max (dBlk, (double) std::abs (o1[i] - o4[i]));
+        std::printf ("   même signal 30 dB plus bas : gain dynamique identique à %.4f dB près [seuil 0.10] ; deux passes : sorties %s ; blocs de 96 au lieu de 480 : écart max %.1f dB [seuil −130]\n",
+                     dLvl, same ? "identiques bit à bit" : "DIFFÉRENTES", db (dBlk));
+        CHECK (dLvl <= 0.10, "seuil automatique : dépend du niveau (%.4f dB)", dLvl);
+        CHECK (same, "seuil automatique : sortie non déterministe");
+        CHECK (db (dBlk) <= -130.0, "seuil automatique : dépend de la taille des blocs (%.1f dB)", db (dBlk));
+        // seuil automatique coupé : rien ne change par rapport au seuil manuel (même sortie qu'avec le champ par défaut)
+        {
+            auto manual = [&] (bool touch)
+            {
+                Engine e; e.prepare (fs);
+                BandSpec b; b.active = true; b.shape = Shape::bell; b.freq = 1000; b.q = 2;
+                DynSettings d; d.on = true; d.thrDb = -30; d.rangeDb = -12; d.attackMs = 1; d.releaseMs = 50;
+                if (touch) { d.autoThr = true; e.setBand (0, b, d, 1.0); std::vector<float> z (4800, 0.1f), z2 (4800, 0.1f); e.process (z.data(), z2.data(), 4800, false); e.prepare (fs); d.autoThr = false; }
+                e.setBand (0, b, d, 1.0);
+                std::vector<float> l (48000), r (48000);
+                for (int i = 0; i < 48000; ++i) l[(size_t) i] = r[(size_t) i] = (float) (0.3 * std::sin (2 * pi * 1000.0 * i / fs) * (i > 20000 ? 1.0 : 0.05));
+                e.process (l.data(), r.data(), 48000, false);
+                return l;
+            };
+            const bool eq = manual (false) == manual (true);
+            std::printf ("   seuil automatique coupé : le seuil manuel donne la même sortie qu'avant, bit à bit : %s\n", eq ? "oui" : "NON");
+            CHECK (eq, "le seuil manuel a changé");
+        }
+    }
+
+    // ── 22. Stabilité et coût des nouvelles formes ───────────────────────
+    std::printf ("22. Stabilité avec les formes et pentes 3.0 : 100 000 réglages aléatoires (10 formes, pentes libres 6–96 dB/oct, Brickwall, 44,1–192 kHz)\n");
+    {
+        std::mt19937 rng (7); std::uniform_real_distribution<double> U (0, 1);
+        int bad = 0, maxN = 0;
+        const double rr[] = { 44100, 48000, 88200, 96000, 176400, 192000 };
+        for (int it = 0; it < 100000; ++it)
+        {
+            BandSpec b; b.active = true; b.shape = (Shape) (int) (U (rng) * numShapes); b.freq = 20 * std::pow (1000.0, U (rng));
+            b.gainDb = U (rng) * 120 - 60; b.q = 0.025 * std::pow (1600.0, U (rng)); b.slope = slopeValues[(int) (U (rng) * 9)];
+            if (U (rng) < 0.6) b.slopeFree = U (rng) * 96.0;
+            b.brick = U (rng) < 0.15;
+            for (int an = 0; an < 2; ++an)
+            {
+                Design d; design (b, rr[it % 6], d, an == 1);
+                maxN = std::max (maxN, d.n);
+                bool ok = d.n <= maxSections && std::isfinite (d.outGain);
+                for (int i = 0; i < d.n && ok; ++i)
+                {
+                    const auto& s = d.s[(size_t) i];
+                    ok = s.g > 0 && std::isfinite (s.g) && (s.kind == Section::svf ? (s.k > 0 && std::isfinite (s.m0 + s.m1 + s.m2)) : std::isfinite (s.cLp + s.cHp));
+                }
+                if (! ok) { ++bad; break; }
+            }
+        }
+        std::printf ("   sections instables ou non finies (numérique et cible des FIR) : %d [seuil 0] ; %d sections au plus par bande (maximum prévu : %d)\n", bad, maxN, maxSections);
+        CHECK (bad == 0, "%d conceptions 3.0 instables", bad);
+        Engine eng; eng.prepare (44100);
+        double peak = 0; bool nan = false;
+        std::vector<float> l (256), r (256), sc (256);
+        for (int it = 0; it < 3000; ++it)
+        {
+            if (it % 5 == 0)
+                for (int bnd = 0; bnd < 8; ++bnd)
+                {
+                    BandSpec s; s.active = U (rng) < 0.8; s.shape = (Shape) (int) (U (rng) * numShapes); s.slope = slopeValues[(int) (U (rng) * 9)];
+                    s.place = (Place) (int) (U (rng) * 5); s.freq = 10 * std::pow (2000.0, U (rng)); s.gainDb = U (rng) * 40 - 20; s.q = 0.1 * std::pow (100.0, U (rng));
+                    if (U (rng) < 0.5) s.slopeFree = U (rng) * 96.0;
+                    s.brick = U (rng) < 0.2;
+                    DynSettings d; d.on = U (rng) < 0.5; d.thrDb = -60 * U (rng); d.rangeDb = U (rng) * 40 - 20; d.attackMs = 0.5 + 20 * U (rng); d.external = U (rng) < 0.3; d.autoThr = U (rng) < 0.5;
+                    eng.setBand (bnd, s, d, 1.0);
+                }
+            for (int i = 0; i < 256; ++i) { l[(size_t) i] = (float) (U (rng) - 0.5); r[(size_t) i] = (float) (U (rng) - 0.5); sc[(size_t) i] = (float) (U (rng) - 0.5); }
+            eng.process (l.data(), r.data(), 256, false, sc.data(), nullptr);
+            for (int i = 0; i < 256; ++i)
+            {
+                if (! std::isfinite (l[(size_t) i]) || ! std::isfinite (r[(size_t) i])) nan = true;
+                peak = std::max (peak, (double) std::max (std::abs (l[(size_t) i]), std::abs (r[(size_t) i])));
+            }
+        }
+        std::printf ("   automatisation aléatoire (8 bandes, nouvelles formes, pentes libres, Brickwall, seuil automatique) : crête %.1f, NaN : %s [seuil < 600]\n", peak, nan ? "oui" : "non");
+        CHECK (! nan && peak < 600, "moteur instable sous automatisation (formes 3.0)");
+
+        // coût (durées indicatives, mesurées ici)
+        std::printf ("   coût : conception (µs) et traitement d'une bande en stéréo à 44,1 kHz (%% d'un cœur, 10 s d'audio, meilleur de 3 passes)\n");
+        struct C { const char* name; BandSpec b; };
+        auto mk = [] (Shape s, double f, double g, double q, int slope, double sf, bool br) { BandSpec b; b.active = true; b.shape = s; b.freq = f; b.gainDb = g; b.q = q; b.slope = slope; b.slopeFree = sf; b.brick = br; return b; };
+        const C cs[] = { { "cloche 1 kHz +6 dB (repère)       ", mk (Shape::bell, 1000, 6, 1, 12, 0, false) },
+                         { "coupe-haut 24 dB/oct 8 kHz (repère)", mk (Shape::highCut, 8000, 0, 0.71, 24, 0, false) },
+                         { "Flat tilt +6 dB                   ", mk (Shape::flatTilt, 1000, 6, 1, 12, 0, false) },
+                         { "All pass ordre 2                  ", mk (Shape::allPass, 1000, 0, 2, 12, 0, false) },
+                         { "coupe-haut 27,3 dB/oct à 8 kHz    ", mk (Shape::highCut, 8000, 0, 0.71, 12, 27.3, false) },
+                         { "coupe-bas 9,5 dB/oct à 80 Hz      ", mk (Shape::lowCut, 80, 0, 0.71, 12, 9.5, false) },
+                         { "coupe-haut 90,5 dB/oct à 16 kHz   ", mk (Shape::highCut, 16000, 0, 0.71, 12, 90.5, false) },
+                         { "Brickwall coupe-haut 16 kHz       ", mk (Shape::highCut, 16000, 0, 0.71, 12, 0, true) } };
+        for (const auto& c : cs)
+        {
+            Design d; double acc = 0;
+            const int reps = 300;
+            auto t0 = clk::now();
+            for (int i = 0; i < reps; ++i) { BandSpec b = c.b; b.freq *= 1.0 + 1e-4 * i; if (hasGain (b.shape)) b.gainDb += 1e-3 * i; design (b, 44100, d, false); acc += d.outGain; }
+            const double us = std::chrono::duration<double, std::micro> (clk::now() - t0).count() / reps;
+            double best = 1e9;
+            for (int pass = 0; pass < 3; ++pass)
+            {
+                Engine e; e.prepare (44100);
+                e.setBand (0, c.b, DynSettings(), 1.0);
+                std::vector<float> l2 (512), r2 (512);
+                std::mt19937 g2 (3); std::uniform_real_distribution<float> V (-0.1f, 0.1f);
+                t0 = clk::now();
+                for (int k = 0; k < 861; ++k) { for (int i = 0; i < 512; ++i) { l2[(size_t) i] = V (g2); r2[(size_t) i] = V (g2); } e.process (l2.data(), r2.data(), 512, false); acc += l2[0]; }
+                best = std::min (best, std::chrono::duration<double> (clk::now() - t0).count());
+            }
+            static double empty = -1;
+            if (empty < 0)
+            {
+                // (temps du bruit seul et du moteur à vide, retiré des mesures)
+                Engine e; e.prepare (44100);
+                std::vector<float> l2 (512), r2 (512);
+                std::mt19937 g2 (3); std::uniform_real_distribution<float> V (-0.1f, 0.1f);
+                empty = 1e9;
+                for (int pass = 0; pass < 3; ++pass)
+                {
+                    t0 = clk::now();
+                    for (int k = 0; k < 861; ++k) { for (int i = 0; i < 512; ++i) { l2[(size_t) i] = V (g2); r2[(size_t) i] = V (g2); } e.process (l2.data(), r2.data(), 512, false); acc += l2[0]; }
+                    empty = std::min (empty, std::chrono::duration<double> (clk::now() - t0).count());
+                }
+            }
+            std::printf ("      %s : %d sections, conception %7.1f µs, traitement %.3f %%%s\n", c.name, d.n, us, std::max (0.0, best - empty) * 10.0, acc == 12345.678 ? "." : "");
+        }
+        // Flat tilt dont le gain est automatisé sans arrêt (une conception par sous-bloc de 32 échantillons)
+        {
+            double best = 1e9, acc = 0;
+            for (int pass = 0; pass < 3; ++pass)
+            {
+                Engine e; e.prepare (44100);
+                std::vector<float> l2 (512), r2 (512);
+                std::mt19937 g2 (3); std::uniform_real_distribution<float> V (-0.1f, 0.1f);
+                auto t0 = clk::now();
+                for (int k = 0; k < 861; ++k)
+                {
+                    BandSpec b; b.active = true; b.shape = Shape::flatTilt; b.freq = 1000; b.gainDb = 12.0 * std::sin (k * 0.05);
+                    e.setBand (0, b, DynSettings(), 1.0);
+                    for (int i = 0; i < 512; ++i) { l2[(size_t) i] = V (g2); r2[(size_t) i] = V (g2); }
+                    e.process (l2.data(), r2.data(), 512, false); acc += l2[0];
+                }
+                best = std::min (best, std::chrono::duration<double> (clk::now() - t0).count());
+            }
+            std::printf ("      Flat tilt dont le gain bouge sans arrêt (±12 dB) : %.2f %% d'un cœur, bruit et moteur à vide compris%s\n", best * 10.0, acc == 12345.678 ? "." : "");
+        }
+    }
+}
+
+int main (int argc, char** argv)
+{
+    // « ./qt 3.0 » : seulement les sections 17 à 22 (formes et pentes 3.0)
+    if (argc > 1 && std::string (argv[1]) == "3.0")
+    {
+        testShapes30();
+        std::printf ("\n%s (%d échec%s)\n", failures == 0 ? "TOUS LES TESTS PASSENT" : "DES TESTS ÉCHOUENT", failures, failures > 1 ? "s" : "");
+        return failures == 0 ? 0 : 1;
+    }
     std::printf ("Lab EQ 3.0 : banc qualité (sans JUCE)\n\n");
 
     // ── 1. Matched + correction ─────────────────────────────────────────
@@ -1060,6 +1614,8 @@ int main()
         CHECK (worst <= tolDynHf, "bande dynamique dans l'aigu : %.3f dB", worst);
     }
 
+    // ── 17 à 22 : formes et pentes 3.0 ───────────────────────────────────
+    testShapes30();
 
     std::printf ("\n%s (%d échec%s)\n", failures == 0 ? "TOUS LES TESTS PASSENT" : "DES TESTS ÉCHOUENT", failures, failures > 1 ? "s" : "");
     return failures == 0 ? 0 : 1;
