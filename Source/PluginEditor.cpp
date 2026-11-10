@@ -21,15 +21,13 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     auto& ap = proc.apvts;
     auto prm = [&] (const char* id) -> juce::RangedAudioParameter& { return *ap.getParameter (id); };
 
-    // Courbe + panneau flottant
+    // Courbe + bandeau de la bande
     display.onSelectionChanged = [this] { rebuildPanel(); };
     display.onMessage = [this] (const String& s) { toast.show (s); };
     display.onUndoRedo = [this] { rebuildPanel(); toast.show (U ("Undone / redone")); };
-    display.onCurvesChanged = [this] { placePanel(); };
+    display.onMeters = [this] { content.repaint (meterArea().expanded (2)); };
     content.addAndMakeVisible (display);
-    content.addAndMakeVisible (shadow);
-    content.addChildComponent (panel);
-    content.addChildComponent (overlay);
+    content.addAndMakeVisible (panel);
 
     // Barre du bas : phase, analyseur, réglages avancés, échelle, sortie, gain auto
     // (segments : Zero latency / Natural / Linear ; valeurs du paramètre : 0 / 2 / 1)
@@ -83,7 +81,7 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
         U ("Gain scale: multiplies the gain of every band (100 % = as is, 0 % = flat curve, 200 % = doubled). Double-click: 100 %"));
     vOut = std::make_unique<ArcKnob> (theme, prm (P::outGain), U ("Output"), "dB", Fam::teal2, ArcKnob::Size::small,
         [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Output gain. Double-click: 0 dB"));
-    for (auto* v : { vScale.get(), vOut.get() }) v->onGestureStart = [this] { proc.pushUndo(); };
+    for (auto* v : { vScale.get(), vOut.get() }) { v->labelLeft = true; v->onGestureStart = [this] { proc.pushUndo(); }; }
 
     autoBtn.setTooltip (U ("Auto gain: compensates the average loudness added or removed by the EQ, to compare at equal level"));
     autoBtn.onClick = [this]
@@ -170,69 +168,10 @@ juce::String AudioLabEqEditor::sideChainText() const
     return proc.sideChainConnected() ? U ("Side-chain input: connected") : U ("Side-chain input: not connected");
 }
 
-// ── Panneau flottant ────────────────────────────────────────────────────
+// ── Bandeau de la bande ────────────────────────────────────────────────────
 void AudioLabEqEditor::rebuildPanel()
 {
     panel.rebuild();
-    placePanel();
-}
-
-void AudioLabEqEditor::placePanel()
-{
-    if (! panel.isVisible() || display.getSelection().isEmpty())
-    {
-        if (panel.isVisible()) panel.setVisible (false);
-        shadow.repaint();
-        overlay.update();
-        return;
-    }
-    // Comme Pro-Q : toujours en bas de la courbe, il suit la bande de gauche à droite.
-    const auto r = display.plot().translated ((float) display.getX(), (float) display.getY());
-    float cx = 0;
-    for (int b : display.getSelection()) cx += display.nodePos (b).x;
-    cx = cx / (float) display.getSelection().size() + (float) display.getX();
-    const int w = panel.getWidth(), h = panel.getHeight();
-    const int x = juce::jlimit (juce::roundToInt (r.getX()) + 12, juce::roundToInt (r.getRight()) - 12 - w, juce::roundToInt (cx - w * 0.5f));
-    const juce::Rectangle<int> nb (x, juce::roundToInt (r.getBottom()) - 12 - h, w, h);
-    if (panel.getBounds() != nb) { panel.setBounds (nb); shadow.repaint(); }
-    overlay.update();
-}
-
-void AudioLabEqEditor::NodeOverlay::update()
-{
-    juce::Array<int> now;
-    if (ed.panel.isVisible())
-    {
-        const auto zone = ed.panel.getBounds().toFloat().expanded (14);
-        for (int b : ed.display.getSelection())
-            if (zone.contains (ed.display.nodePos (b) + ed.display.getPosition().toFloat())) now.add (b);
-    }
-    shown = now;
-    const bool vis = ! now.isEmpty();
-    if (vis) setBounds (ed.panel.getBounds().expanded (16));
-    if (isVisible() != vis) setVisible (vis);
-    if (vis) repaint();
-}
-
-void AudioLabEqEditor::NodeOverlay::paint (juce::Graphics& g)
-{
-    g.addTransform (juce::AffineTransform::translation ((float) (ed.display.getX() - getX()), (float) (ed.display.getY() - getY())));
-    for (int b : shown) ed.display.paintNode (g, b);
-}
-
-bool AudioLabEqEditor::NodeOverlay::hitTest (int x, int y)
-{
-    const juce::Point<float> pt ((float) (x + getX() - ed.display.getX()), (float) (y + getY() - ed.display.getY()));
-    for (int b : shown) if (ed.display.nodePos (b).getDistanceFrom (pt) < 13.0f) return true;
-    return false;
-}
-
-void AudioLabEqEditor::Shadow::paint (juce::Graphics& g)
-{
-    if (! ed.panel.isVisible()) return;
-    juce::Path box; box.addRoundedRectangle (ed.panel.getBounds().toFloat(), 12);
-    const bool dark = ed.theme.pal().dark;
-    juce::DropShadow (juce::Colours::black.withAlpha (dark ? 0.6f : 0.16f), 36, { 0, 14 }).drawForPath (g, box);
 }
 
 void AudioLabEqEditor::timerCallback()
@@ -251,7 +190,7 @@ void AudioLabEqEditor::timerCallback()
     // le panneau suit les changements faits ailleurs (automation, menu, molette…)
     const auto& sel = display.getSelection();
     if (sel.size() != panel.getCount() || (panel.getCount() > 0 && sel[0] != panel.getBand())) rebuildPanel();
-    else { panel.sync(); placePanel(); }
+    else panel.sync();
 }
 
 // ── Mise en page ────────────────────────────────────────────────────────
@@ -267,13 +206,14 @@ void AudioLabEqEditor::Content::paint (juce::Graphics& g)
 {
     const auto& p = ed.theme.pal();
     g.fillAll (p.win);
+    ed.display.paintMeters (g, ed.meterArea().toFloat());
     if (! ed.advOpen) return;
     // panneau des réglages avancés (« Surface », coins 12, marge intérieure 16)
     g.setColour (p.surface); g.fillRoundedRectangle (24, 632, 1072, 58, 12);
     g.setColour (p.text2); g.setFont (ed.theme.ui (12));
     g.drawText (U ("Linear phase resolution"), juce::Rectangle<float> (40, 648, 150, 26), juce::Justification::centredLeft, false);
     // à droite : état du side-chain ; au milieu : latence (place restante)
-    const auto f11 = ed.theme.ui (11);
+    const auto f11 = ed.theme.ui (12);
     const float right = 1096 - 16, sw = juce::GlyphArrangement::getStringWidth (f11, ed.scText) + 2;
     const float x0 = (float) ed.resSeg.getRight() + 24, sepX = right - sw - 12;
     g.setFont (f11);
@@ -287,24 +227,22 @@ void AudioLabEqEditor::Content::paint (juce::Graphics& g)
 void AudioLabEqEditor::Content::resized()
 {
     auto& e = ed;
-    // courbe 1040 × 520 en (16, 16) ; à droite l'échelle dB et les crêtes ; dessous le clavier
-    // écran 1000 × 520 en (24, 24) (marges de 24) ; à droite l'échelle dB et les barres de sortie ; dessous le clavier
-    e.display.setBounds (24, 24, 1000 + (int) EqDisplay::rightGutter, 520 + (int) EqDisplay::bottomGutter);
-    e.shadow.setBounds (getLocalBounds());
-    e.toast.setBounds (24, 24, 1000, 520);
+    // écran 1072 × 400 en (24, 24) ; clavier de 16 à y = 432 ; bandeau de bande 1072 × 104 à y = 464
+    e.display.setBounds (24, 24, 1072 + (int) EqDisplay::rightGutter, 400 + (int) EqDisplay::bottomGutter);
+    e.panel.setBounds (24, 464, BandPanel::panelW, BandPanel::panelH);
+    e.toast.setBounds (24, 24, 1072, 400);
 
     // barre du bas : y = 584, hauteur 32, écarts de 16
     const int y = 584, h = 32;
-    e.phaseSeg.setBounds (24, y, juce::roundToInt (e.phaseSeg.idealWidth()), h);
-    e.analyzerBox.setBounds (e.phaseSeg.getRight() + 16, y, 200, h);
-    e.advBtn.setBounds (e.analyzerBox.getRight() + 16, y + 2, juce::roundToInt (e.advBtn.idealWidth()), 28);
+    e.phaseSeg.setBounds (24, y, 320, h);            // 3 segments de 104, marge intérieure 4
+    e.analyzerBox.setBounds (360, y, 176, h);
+    e.advBtn.setBounds (552, y, juce::roundToInt (e.advBtn.idealWidth()), h);
     // panneau avancé : une ligne de 26 px à y = 648
     e.resSeg.setBounds (40 + 150, 648, juce::roundToInt (e.resSeg.idealWidth()), 26);
     int rx = baseW - 24;
     const int aw = juce::roundToInt (e.autoBtn.idealWidth());
     e.autoBtn.setBounds (rx - aw, y, aw, h); rx -= aw + 16;
     const int ow = e.vOut->idealWidth(), sw = e.vScale->idealWidth();
-    e.vOut->setBounds (rx - ow, y + 2, ow, 28); rx -= ow + 16;
-    e.vScale->setBounds (rx - sw, y + 2, sw, 28);
-    e.placePanel();
+    e.vOut->setBounds (rx - ow, y, ow, h); rx -= ow + 16;
+    e.vScale->setBounds (rx - sw, y, sw, h);
 }

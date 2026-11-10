@@ -44,10 +44,12 @@ public:
     std::function<void()> onCurvesChanged;   // poignées déplacées : le panneau flottant suit
 
     static constexpr double fMin = 20.0, fMax = 20000.0;
-    static constexpr float rightGutter = 72.0f, bottomGutter = 24.0f;
-    // Échelle dB comme Pro-Q : 0 dB au-dessus du milieu (y = 216 sur 520) pour laisser la place
-    // au panneau de bande en bas ; vers −7 dB la courbe passe derrière le panneau, la grille continue.
-    static constexpr float curveTop = 12.0f, curveBottom = 420.0f;
+    static constexpr float rightGutter = 0.0f, bottomGutter = 24.0f;
+    // 3.0 : écran 1072 × 400, 0 dB au centre (y = 200), 16 px par dB à ±12 dB (2 modules de 8 px)
+    static constexpr float curveTop = 8.0f, curveBottom = 392.0f;
+    // niveaux de sortie, dessinés dans la barre du bas (deux barres horizontales)
+    void paintMeters (juce::Graphics&, juce::Rectangle<float> area) const;
+    std::function<void()> onMeters;
     void paintNode (juce::Graphics&, int band) const;
     int hitBandAt (juce::Point<float> p) const { return hitBand (p); }
 
@@ -90,7 +92,6 @@ private:
     void paintAnalyzer (juce::Graphics&, const std::vector<float>& col, juce::Colour c, bool fill);
     void paintPiano (juce::Graphics&);
     void paintReadout (juce::Graphics&, int band);
-    void paintMeters (juce::Graphics&);
 
     Theme& theme;
     AudioLabEqProcessor& proc;

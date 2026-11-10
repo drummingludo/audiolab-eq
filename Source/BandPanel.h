@@ -1,4 +1,4 @@
-// Audio Lab EQ — panneau flottant de la bande sélectionnée, ancré sous la courbe.
+// Lab EQ 3.0 — bandeau fixe de la bande sélectionnée, sous la courbe et le clavier (1072 × 104).
 // Une bande : forme, pente, placement, active / écouter / supprimer, fréquence, gain, Q,
 // dynamique (seuil, plage, attaque, retour). Plusieurs bandes : placement, active, supprimer.
 #pragma once
@@ -58,21 +58,18 @@ inline void trash (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour c)
 class BandPanel : public juce::Component
 {
 public:
-    static constexpr int panelW = 580, singleH = 208, multiH = 88;
+    static constexpr int panelW = 1072, panelH = 104;
 
     BandPanel (Theme& t, AudioLabEqProcessor& p, EqDisplay& d)
         : theme (t), proc (p), display (d),
           onBtn (t, PillButton::Style::ibtn, {}), soloBtn (t, PillButton::Style::ibtn, {}),
-          delBtn (t, PillButton::Style::rst, {}), closeBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String ("Dynamic"))
+          delBtn (t, PillButton::Style::rst, {}), dynBtn (t, PillButton::Style::ibtn, juce::String ("Dynamic"))
     {
         namespace P = params;
         setInterceptsMouseClicks (true, true);
         onBtn.icon = icons::power;      onBtn.iconOnly = true;
         soloBtn.icon = icons::headphones; soloBtn.iconOnly = true;
         delBtn.icon = icons::trash;     delBtn.iconOnly = true;
-        closeBtn.icon = icons::cross;   closeBtn.iconOnly = true;
-        closeBtn.setTooltip (fr ("Close the panel (Esc)"));
-        closeBtn.onClick = [this] { display.clearSelection(); };
         onBtn.setTooltip (fr ("Turn the band on / off (double-click the handle)"));
         soloBtn.setTooltip (fr ("Listen only to the part of the spectrum this band processes (or Alt + click and hold the handle)"));
         delBtn.setTooltip (fr ("Delete the band (Delete key)"));
@@ -127,10 +124,10 @@ public:
         placeBox.onChange = [this] { applyChoice (placeBox, params::fPlace); };
 
         for (juce::Component* c : { (juce::Component*) &onBtn, (juce::Component*) &soloBtn, (juce::Component*) &delBtn,
-                                    (juce::Component*) &closeBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox,
+                                    (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox,
                                     (juce::Component*) &placeBox, (juce::Component*) &scBox })
             addChildComponent (c);
-        setVisible (false);
+        setSize (panelW, panelH);
     }
 
     int getBand() const { return band; }
@@ -146,7 +143,7 @@ public:
         kFreq.reset(); kGain.reset(); kQ.reset(); kThr.reset(); kRange.reset(); kAtt.reset(); kRel.reset();
 
         const bool single = count == 1, any = count >= 1;
-        for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &closeBtn, (juce::Component*) &placeBox }) c->setVisible (any);
+        for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &delBtn, (juce::Component*) &placeBox }) c->setVisible (any);
         for (auto* c : { (juce::Component*) &soloBtn, (juce::Component*) &dynBtn, (juce::Component*) &shapeBox, (juce::Component*) &slopeBox, (juce::Component*) &scBox })
             c->setVisible (single);
 
@@ -154,10 +151,11 @@ public:
         {
             const int b = band;
             using K = ArcKnob;
-            const auto M = K::Size::main, S = K::Size::small;
+            const auto M = K::Size::main, S = K::Size::small;   // attaque et retour : petits (réglages secondaires)
             // teal : fréquence, gain, Q, seuil (forme de la courbe, niveau) ; orange : plage, attaque, retour (action, temps)
             kFreq = std::make_unique<K> (theme, *proc.bandParam (b, P::fFreq), fr ("Frequency"), "Hz", Fam::teal, M,
-                [] (float v) { return P::fmtHzShort (v); }, 20.0f, fr ("Centre or cut-off frequency"));
+                [] (float v) { return v < 1000.0f ? juce::String (juce::roundToInt (v)) : juce::String (v / 1000.0f, 2); }, 20.0f, fr ("Centre or cut-off frequency"));
+            kFreq->unitFmt = [] (float v) { return juce::String (v < 1000.0f ? "Hz" : "kHz"); };
             kGain = std::make_unique<K> (theme, *proc.bandParam (b, P::fGain), "Gain", "dB", Fam::teal, M,
                 [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Band gain (bells, shelves, tilt)"));
             kQ = std::make_unique<K> (theme, *proc.bandParam (b, P::fQ), "Q", "Q", Fam::teal, M,
@@ -178,10 +176,9 @@ public:
             title = fr ("Band ") + juce::String (b + 1);
         }
         else if (any) title = juce::String (count) + fr (" bands selected");
-        else title = {};
+        else title = fr ("No band selected");
 
-        setVisible (any);
-        setSize (panelW, single ? singleH : multiH);
+        setSize (panelW, panelH);
         layout();
         sync();
         repaint();
@@ -224,67 +221,58 @@ public:
     void paint (juce::Graphics& g) override
     {
         const auto& p = theme.pal();
-        auto b = getLocalBounds().toFloat();
-        juce::Path box; box.addRoundedRectangle (b.reduced (0.5f), 12);
-        g.setColour (p.surface); g.fillPath (box);
-        g.setColour (p.rail); g.strokePath (box, juce::PathStrokeType (1));
+        g.setColour (p.surface); g.fillRoundedRectangle (getLocalBounds().toFloat(), 12);
 
-        if (count == 0) return;
         float x = 16;
         if (count == 1)
         {
-            // pastille numérotée de la bande choisie
-            g.setColour (p.select); g.fillEllipse (x, 20, 20, 20);
-            g.setColour (p.text); g.setFont (theme.ui (10, 600));
-            g.drawText (juce::String (band + 1), juce::Rectangle<float> (x, 20, 20, 20), juce::Justification::centred, false);
-            x += 28;
+            // pastille numérotée de la bande choisie (24 px, comme la poignée)
+            g.setColour (p.select); g.fillEllipse (x, 20, 24, 24);
+            g.setColour (p.text); g.setFont (theme.ui (12, 600));
+            g.drawText (juce::String (band + 1), juce::Rectangle<float> (x, 20, 24, 24), juce::Justification::centred, false);
+            x += 32;
         }
-        g.setColour (p.text); g.setFont (theme.ui (14, 600));
-        g.drawText (title, juce::Rectangle<float> (x, 16, count == 1 ? 70.0f : 200.0f, 28), juce::Justification::centredLeft, false);
+        g.setColour (count == 0 ? p.text2 : p.text); g.setFont (theme.ui (16, 600));
+        g.drawText (title, juce::Rectangle<float> (x, 16, count == 1 ? 96.0f : 320.0f, 32), juce::Justification::centredLeft, false);
         g.setColour (p.rail);
-        g.fillRect (sepCloseX, 21.0f, 1.0f, 18.0f);   // avant la croix de fermeture
-        if (count == 1) g.fillRect (sepX, 58.0f, 1.0f, 84.0f);
+        if (count == 1) { g.fillRect (sep1, 16.0f, 1.0f, 72.0f); g.fillRect (sep2, 16.0f, 1.0f, 72.0f); }
         else
         {
             g.setColour (p.text2); g.setFont (theme.ui (12));
-            g.drawText (fr ("Drag a handle to move the whole selection · Shift: fine adjustment"),
-                        juce::Rectangle<float> (16, 56, (float) getWidth() - 32, 18), juce::Justification::centredLeft, false);
+            g.drawText (count == 0 ? fr ("Click a handle to edit a band · Double-click the curve to add one · Drag on the background to select several")
+                                   : fr ("Drag a handle to move the whole selection · Shift: fine adjustment"),
+                        juce::Rectangle<float> (16, 56, (float) getWidth() - 32, 32), juce::Justification::centredLeft, false);
         }
     }
 
 private:
     void layout()
     {
-        // marge intérieure 16 ; ligne 1 : … · active · écouter · supprimer | fermer
-        const int y1 = 16, h1 = 28, right = getWidth() - 16;
-        closeBtn.setBounds (right - 28, y1, 28, h1);
-        sepCloseX = (float) right - 28 - 9;
-        delBtn.setBounds (right - 28 - 18 - 28, y1, 28, h1);
+        // grille 3.0 : marge intérieure 16, deux rangées de 32 (y = 16 et 56), écarts de 8 ;
+        // identité | fréquence, gain, Q (potentiomètres de 64 au pas de 80) | dynamique
+        const int y1 = 16, y2 = 56, h = 32;
         if (count == 1)
         {
-            soloBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
-            onBtn.setBounds (soloBtn.getX() - 4 - 28, y1, 28, h1);
-            shapeBox.setBounds (118, y1, 100, h1);
-            slopeBox.setBounds (224, y1, 96, h1);
-            placeBox.setBounds (326, y1, juce::jmin (88, onBtn.getX() - 12 - 326), h1);
-
-            // ligne 2 : potentiomètres 72 px (colonnes de 80), dynamique ; ligne 3 : attaque, retour
-            const int y2 = 58, kw = 80, kh = 94;
-            int x = 16;
-            for (auto* k : { kFreq.get(), kGain.get(), kQ.get() }) { k->setBounds (x, y2, kw, kh); x += kw + 6; }
-            sepX = (float) x + 4; x += 14;
-            dynBtn.setBounds (x, y2 + 22, 88, 28);
-            x = dynBtn.getRight() + 8;
-            kThr->setBounds (x, y2, kw, kh);
-            kRange->setBounds (x + kw + 6, y2, kw, kh);
-            kAtt->setBounds (x + 4, y2 + kh + 12, kAtt->idealWidth(), 28);
-            kRel->setBounds (x + kw + 10, y2 + kh + 12, kRel->idealWidth(), 28);
-            scBox.setBounds (dynBtn.getX(), y2 + kh + 12, dynBtn.getWidth(), 28);   // sous « Dynamic »
+            onBtn.setBounds (16, y2, 32, h);
+            soloBtn.setBounds (56, y2, 32, h);
+            delBtn.setBounds (96, y2, 32, h);
+            shapeBox.setBounds (152, y1, 104, h);
+            slopeBox.setBounds (264, y1, 104, h);
+            placeBox.setBounds (152, y2, 104, h);
+            int cx = 440;
+            for (auto* k : { kFreq.get(), kGain.get(), kQ.get() }) { k->setBounds (cx - 40, 12, 80, 88); cx += 80; }
+            dynBtn.setBounds (672, y1, 88, h);
+            scBox.setBounds (672, y2, 88, h);
+            kThr->setBounds (816 - 40, 12, 80, 88);
+            kRange->setBounds (896 - 40, 12, 80, 88);
+            kAtt->setBounds (960, y1, 96, h);
+            kRel->setBounds (960, y2, 96, h);
         }
-        else
+        else if (count > 1)
         {
-            onBtn.setBounds (delBtn.getX() - 4 - 28, y1, 28, h1);
-            placeBox.setBounds (224, y1, 104, h1);
+            delBtn.setBounds (getWidth() - 16 - 32, y1, 32, h);
+            onBtn.setBounds (delBtn.getX() - 8 - 32, y1, 32, h);
+            placeBox.setBounds (onBtn.getX() - 16 - 104, y1, 104, h);
         }
     }
 
@@ -312,8 +300,8 @@ private:
     EqDisplay& display;
     int band = -1, count = 0;
     juce::String title;
-    float sepX = 246, sepCloseX = 0;
-    PillButton onBtn, soloBtn, delBtn, closeBtn, dynBtn;
+    static constexpr float sep1 = 384.0f, sep2 = 656.0f;
+    PillButton onBtn, soloBtn, delBtn, dynBtn;
     juce::ComboBox shapeBox, slopeBox, placeBox, scBox;
     std::unique_ptr<ArcKnob> kFreq, kGain, kQ, kThr, kRange, kAtt, kRel;
 };
