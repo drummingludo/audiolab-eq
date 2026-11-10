@@ -10,6 +10,12 @@
 //    du sous-bloc, puis chaque échantillon prend le gain que le détecteur lui donne (interpolation
 //    des coefficients suivant le gain de l'échantillon) : plus de raies à fs/32 ;
 //  - side-chain externe par bande (Internal / External) pour le détecteur.
+//
+// 3.0 :
+//  - une bande peut recevoir des sections de correction (EqMath.h) : leur nombre change avec les
+//    réglages ; une section qui apparaît ou disparaît est interpolée depuis / vers une section neutre ;
+//  - quand un réglage bouge, chaque conception part de la précédente (suivi : rapide et continu) ;
+//  - cache des bandes dynamiques à plusieurs sections, chaque intervalle vérifié avant d'être interpolé.
 #pragma once
 #include "EqMath.h"
 #include <atomic>
@@ -108,6 +114,8 @@ public:
     // Mesures « avant » (1.x) : coefficients changés par paliers de 32 échantillons, gain dynamique
     // du sous-bloc précédent. Uniquement pour le banc de test.
     bool legacyStepping = false;
+    // Nombre maximal de sections de correction par bande (0 = conceptions de la 2.0, pour les mesures « avant »).
+    int corrections = maxCorrections;
 
     void prepare (double sampleRate)
     {
@@ -163,6 +171,7 @@ public:
             for (int bi = 0; bi < maxBands; ++bi)
             {
                 auto& b = bands[(size_t) bi];
+                b.maxCorr = corrections;
                 b.advance (fs, len, legacyStepping);
                 if (b.wet <= 0.0 && b.wetTarget <= 0.0 && ! b.detecting) continue;
                 processBand (b, l, r, len, bypassIIR, sl, sr);
@@ -230,12 +239,13 @@ private:
         double wet = 0, wetTarget = 0, wetStart = 0;
         // conceptions : début (prev) et fin (cur) du sous-bloc ; coefficients de cur précalculés
         Design prev, cur;
-        std::array<SectionRT, 9> rt {};
+        std::array<SectionRT, maxSections> rt {};
         int nsec = 0;
         bool interp = false;          // prev ≠ cur : coefficients interpolés à chaque échantillon
         bool fresh = true;            // pas encore de conception (première, ou nouvelle structure)
-        double st[2][9][2] {};
+        double st[2][maxSections][2] {};
         double lastF = -1, lastG = 1e9, lastQ = -1, lastBase = 1e9;
+        int maxCorr = maxCorrections;
         bool baseMoved = false;       // fréquence / gain / Q ont bougé dans ce sous-bloc
 
         // dynamique
@@ -322,19 +332,57 @@ private:
             if (legacy || ! detecting) redesign (fs, dynOffset, legacy);
         }
 
+        // Section neutre (traversée) gardant les pôles de s : sert d'extrémité quand une section de
+        // correction apparaît ou disparaît, pour que la transition reste une interpolation.
+        static Section neutral (Section s)
+        {
+            s.m0 = 1.0; s.m1 = 0.0; s.m2 = 0.0; s.cLp = 1.0; s.cHp = 1.0;
+            return s;
+        }
+        static bool isNeutral (const Section& s)
+        {
+            return s.kind == Section::svf ? (s.m0 == 1.0 && s.m1 == 0.0 && s.m2 == 0.0) : (s.cLp == 1.0 && s.cHp == 1.0);
+        }
+        // Retire les sections neutres laissées en fin de chaîne par une transition terminée
+        void trim()
+        {
+            while (cur.n > 0 && isNeutral (cur.s[(size_t) cur.n - 1])) --cur.n;
+            nsec = cur.n;
+        }
+
         // Nouvelle conception pour la fin du sous-bloc (gain de base lissé + décalage dynamique)
         void redesign (double fs, double dynDb, bool legacy, bool useCache = false)
         {
             const double f = std::exp (fLog), q = std::exp (qLog), g = gDb + dynDb;
             const bool changed = fresh || std::abs (f - lastF) > 1e-9 * f || std::abs (g - lastG) > 1e-7 || std::abs (q - lastQ) > 1e-9 * q;
-            if (! changed) { if (interp) { prev = cur; interp = false; } return; }
+            if (! changed) { if (interp) { prev = cur; interp = false; } trim(); return; }
+            trim();
             BandSpec s; s.active = true; s.shape = shape; s.slope = slope; s.place = place;
             s.freq = f; s.q = q; s.gainDb = g;
             prev = cur;
-            if (useCache) designCached (s, fs, dynDb);
-            else design (s, fs, cur, false);
-            if (fresh || legacy || prev.n != cur.n) { prev = cur; interp = false; }
-            else interp = true;
+            // la conception précédente sert de départ à la nouvelle (sections de correction : quelques
+            // passes d'ajustement au lieu d'une recherche complète, et une solution qui suit les réglages)
+            const Design* hint = fresh || legacy ? nullptr : &prev;
+            if (useCache && ! baseMoved && ! fresh) designCached (s, fs, dynDb);
+            else designMatched (s, fs, cur, maxCorr, hint);
+            if (fresh || legacy || prev.n == 0 || cur.n == 0)
+            {
+                if (prev.n == 0) for (auto& c : st) for (auto& x : c) x[0] = x[1] = 0.0;   // (états laissés par un ancien réglage)
+                prev = cur; interp = false;
+            }
+            else
+            {
+                // le nombre de sections change (correction qui apparaît / disparaît) : le côté le plus court
+                // est complété par des sections neutres de mêmes pôles, et on interpole comme d'habitude
+                for (int i = prev.n; i < cur.n; ++i)
+                {
+                    prev.s[(size_t) i] = neutral (cur.s[(size_t) i]);
+                    st[0][i][0] = st[0][i][1] = st[1][i][0] = st[1][i][1] = 0.0;
+                }
+                for (int i = cur.n; i < prev.n; ++i) cur.s[(size_t) i] = neutral (prev.s[(size_t) i]);
+                prev.n = cur.n = std::max (prev.n, cur.n);
+                interp = true;
+            }
             fresh = false;
             nsec = cur.n;
             for (int i = 0; i < nsec; ++i) toRT (cur.s[(size_t) i], rt[(size_t) i]);
@@ -342,24 +390,45 @@ private:
         }
 
         // Bande dynamique : conceptions mises en cache tous les 0,25 dB sur la plage du gain dynamique
-        // (fréquence, Q et gain de base fixés), le gain du moment est interpolé entre les deux voisines.
-        // Une conception « matched » coûte ≈ 1,3 µs ; sans cache, 6000 par seconde et par bande dynamique.
-        static constexpr int cacheSize = 128;
-        struct Cached { Section s; double outGain = 1; };
-        std::array<Cached, cacheSize> cache {};
-        std::array<bool, cacheSize> cacheOk {};
+        // (fréquence, Q et gain de base fixés), le gain du moment est interpolé entre les deux voisines,
+        // section par section (une section absente d'un côté y est neutre, avec les pôles de l'autre).
+        // Chaque intervalle est vérifié à son premier usage : si la conception interpolée en son milieu
+        // s'écarte de l'analogique (sections de correction trop différentes d'un bord à l'autre), cet
+        // intervalle n'est pas interpolé : conception directe à chaque pas, en partant de la précédente.
+        static constexpr int cacheSize = 128, cacheSecs = 1 + maxCorrections;   // 1 section + corrections
+        static constexpr double cellTol = 0.0058;              // ≈ 0,025 dB
+        struct Cached { Section s[cacheSecs]; int n = 0; double outGain = 1; };
+        std::vector<Cached> cache = std::vector<Cached> ((size_t) cacheSize);
+        std::array<signed char, cacheSize> cacheOk {}, cellOk {};   // intervalle : 0 inconnu, 1 interpolable, −1 non
         double cKeyF = -1, cKeyQ = -1, cKeyBase = 1e9, cKeyRange = 1e9, cMin = 0, cStep = 0.25;
         int cKeyShape = -1, cKeySlope = -1;
 
+        static void lerpCached (const Cached& a, const Cached& b, double t, Design& o)
+        {
+            o.n = std::max (a.n, b.n);
+            for (int j = 0; j < o.n; ++j)
+            {
+                const Section sa = j < a.n ? a.s[j] : neutral (b.s[j]);
+                const Section sb = j < b.n ? b.s[j] : neutral (a.s[j]);
+                auto& x = o.s[(size_t) j];
+                x = sb;
+                x.g = sa.g + (sb.g - sa.g) * t; x.k = sa.k + (sb.k - sa.k) * t;
+                x.m0 = sa.m0 + (sb.m0 - sa.m0) * t; x.m1 = sa.m1 + (sb.m1 - sa.m1) * t; x.m2 = sa.m2 + (sb.m2 - sa.m2) * t;
+            }
+            o.outGain = a.outGain + (b.outGain - a.outGain) * t;
+        }
+
         void designCached (const BandSpec& s, double fs, double dynDb)
         {
+            // gain total nul : traversée exacte
+            if (std::abs (s.gainDb) < 1e-9) { cur.n = 0; cur.outGain = 1.0; return; }
             const double range = dyn.rangeDb * scale;
             if (cKeyF != s.freq || cKeyQ != s.q || cKeyBase != gDb || cKeyRange != range || cKeyShape != (int) s.shape || cKeySlope != s.slope)
             {
                 cKeyF = s.freq; cKeyQ = s.q; cKeyBase = gDb; cKeyRange = range; cKeyShape = (int) s.shape; cKeySlope = s.slope;
                 cMin = std::min (0.0, range);
                 cStep = std::max (0.25, std::abs (range) / (cacheSize - 2));
-                cacheOk.fill (false);
+                cacheOk.fill (0); cellOk.fill (0);
             }
             const double pos = std::clamp ((dynDb - cMin) / cStep, 0.0, (double) (cacheSize - 2));
             const int i0 = (int) pos;
@@ -369,19 +438,31 @@ private:
                 if (! cacheOk[(size_t) i])
                 {
                     BandSpec e = s; e.gainDb = gDb + cMin + i * cStep;
-                    design (e, fs, tmp, false);
-                    if (tmp.n != 1) { design (s, fs, cur, false); return; }   // (toutes les formes à gain : 1 section)
-                    cache[(size_t) i] = { tmp.s[0], tmp.outGain };
-                    cacheOk[(size_t) i] = true;
+                    // départ : une entrée voisine déjà conçue, sinon la conception en cours
+                    Design h; h.n = 0;
+                    for (int nb : { i - 1, i + 1 })
+                        if (h.n == 0 && nb >= 0 && nb < cacheSize && cacheOk[(size_t) nb])
+                        {
+                            h.n = cache[(size_t) nb].n;
+                            for (int j = 0; j < h.n; ++j) h.s[(size_t) j] = cache[(size_t) nb].s[j];
+                        }
+                    designMatched (e, fs, tmp, maxCorr, h.n > 0 ? &h : &prev);
+                    if (tmp.n > cacheSecs) { designMatched (s, fs, cur, maxCorr, &prev); return; }   // (n'arrive pas : formes à gain)
+                    auto& c = cache[(size_t) i];
+                    c.n = tmp.n; c.outGain = tmp.outGain;
+                    for (int j = 0; j < tmp.n; ++j) c.s[j] = tmp.s[(size_t) j];
+                    cacheOk[(size_t) i] = 1;
                 }
             const auto& a = cache[(size_t) i0];
             const auto& b = cache[(size_t) i0 + 1];
-            cur.n = 1;
-            auto& o = cur.s[0];
-            o = b.s;
-            o.g = a.s.g + (b.s.g - a.s.g) * t; o.k = a.s.k + (b.s.k - a.s.k) * t;
-            o.m0 = a.s.m0 + (b.s.m0 - a.s.m0) * t; o.m1 = a.s.m1 + (b.s.m1 - a.s.m1) * t; o.m2 = a.s.m2 + (b.s.m2 - a.s.m2) * t;
-            cur.outGain = a.outGain + (b.outGain - a.outGain) * t;
+            if (cellOk[(size_t) i0] == 0)
+            {
+                BandSpec e = s; e.gainDb = gDb + cMin + (i0 + 0.5) * cStep;
+                lerpCached (a, b, 0.5, tmp);
+                cellOk[(size_t) i0] = designError (e, fs, tmp) <= cellTol ? 1 : -1;
+            }
+            if (cellOk[(size_t) i0] < 0) { designMatched (s, fs, cur, maxCorr, &prev); return; }
+            lerpCached (a, b, t, cur);
         }
 
         // Chaîne de la bande pour un échantillon ; coef : coefficients (interpolés ou non)
@@ -470,7 +551,7 @@ private:
             if (! filt) continue;
 
             // 3) filtrage ; coefficients interpolés à chaque échantillon si la conception a changé
-            SectionRT now[9];
+            SectionRT now[maxSections];
             const SectionRT* coef = b.rt.data();
             const bool interp = b.interp;
             const bool byGain = false;

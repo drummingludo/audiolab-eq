@@ -1,19 +1,24 @@
-// Banc qualité d'Audio Lab EQ 2.0, SANS JUCE (moteur seul) :
-//   clang++ -O2 -std=c++17 -I Source tests/quality_test.cpp -o qt && ./qt
+// Banc qualité de Lab EQ 3.0, SANS JUCE (moteur seul) :
+//   g++ -O2 -std=c++17 -I Source tests/quality_test.cpp -o qt && ./qt
 // Mesures chiffrées avec seuils ; renvoie 1 si un seuil n'est pas tenu.
-//  1. Zéro latence « matched » : écart à l'analogique jusqu'à 20 kHz, 44,1 / 48 / 96 / 192 kHz (avant = bilinéaire 1.x)
-//  2. Réponse mesurée du moteur = courbe affichée (impulsion → FFT)
-//  3. Même son d'une fréquence d'échantillonnage à l'autre
+//  1. Zéro latence : écart à l'analogique de 20 Hz à 20 kHz, 44,1 / 48 / 96 / 192 kHz
+//     (bilinéaire 1.x → matched 2.0 → matched + sections de correction 3.0), seuil 0,1 dB partout.
+//     Convention : cloches / étagères / tilt sur tout le spectre ; coupes et passe-bande dans la zone
+//     utile (là où l'analogique est au-dessus de −24 dB) ; notch au-dessus de −3 dB.
+//  2. Réponse mesurée du moteur = courbe affichée (impulsion → FFT), y compris après un balayage
+//  3. Même courbe d'une fréquence d'échantillonnage à l'autre (seuil 0,05 dB)
 //  4. Tests de nul (bandes à 0 dB : sortie = entrée, bit à bit)
-//  5. EQ dynamique : raies parasites sur un sinus avec attaque rapide (avant / après)
-//  6. Balayage rapide d'un réglage : bruit d'escalier (avant / après)
+//  5. EQ dynamique : raies parasites (grave et aigu), exactitude du gain dynamique dans l'aigu
+//  6. Balayage rapide d'un réglage : bruit d'escalier (grave et aigu)
 //  7. Phase linéaire (Auto, 48 kHz) : cloche 50 Hz −12 dB Q 8, notch 60 Hz Q 10, coupe-bas 30 Hz 48 dB/oct (avant = 1.x)
 //  8. Natural phase : module et phase = analogique
 //  9. Latences annoncées
 // 10. Side-chain externe
 // 11. Stabilité (réglages aléatoires)
+// 12. Coût : temps de conception, sections par bande, temps de traitement
 #include "EqEngine.h"
 #include "FirDesign.h"
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -25,10 +30,28 @@ static int failures = 0;
 static double db (double x) { return 20.0 * std::log10 (std::max (1e-15, x)); }
 
 // écart max (dB) entre la conception numérique et le prototype analogique, 20 Hz – 20 kHz
-static double errVsAnalog (const BandSpec& b, double fs, bool bilinear, double floorDb, double* atF = nullptr)
+// mode : 0 = bilinéaire (1.x), 1 = matched sans correction (2.0), 2 = conception actuelle (3.0)
+static double errOf (const BandSpec& b, double fs, const Design& dd, double floorDb, double* atF = nullptr, int npts = 1200)
+{
+    Design da;
+    design (b, fs, da, true);
+    double e = 0;
+    for (int i = 0; i < npts; ++i)
+    {
+        const double f = 20.0 * std::pow (1000.0, i / (npts - 1.0));
+        const double ra = magnitudeDb (da, f, fs, true);
+        if (ra < floorDb) continue;
+        const double x = std::abs (magnitudeDb (dd, f, fs, false) - ra);
+        if (x > e) { e = x; if (atF) *atF = f; }
+    }
+    return e;
+}
+
+static double errVsAnalog (const BandSpec& b, double fs, int mode, double floorDb, double* atF = nullptr, int* nsec = nullptr)
 {
     Design dd, da;
-    if (bilinear) designBilinear (b, fs, dd); else design (b, fs, dd, false);
+    if (mode == 0) designBilinear (b, fs, dd); else if (mode == 1) designMatched (b, fs, dd, 0); else design (b, fs, dd, false);
+    if (nsec) *nsec = dd.n;
     design (b, fs, da, true);
     double e = 0;
     for (int i = 0; i < 1200; ++i)
@@ -78,6 +101,28 @@ static double blockLines (const std::vector<float>& y, int start, int n, double 
     return db (worst / fund);
 }
 
+// Bruit large bande loin de la fondamentale (|f − f0| > 1,5 kHz), en dB sous la fondamentale : un réglage
+// modulé lentement ne crée des raies que tout près de f0 ; ce qui reste au loin vient des transitions
+// (paliers, sections qui apparaissent ou disparaissent).
+static double farNoise (const std::vector<float>& y, int start, int n, double fs, double f0)
+{
+    std::vector<double> x ((size_t) n);
+    for (int i = 0; i < n; ++i) x[(size_t) i] = y[(size_t) (start + i)] * bh (i, n);
+    std::vector<fir::cd> X;
+    fftReal (x, X, n);
+    const int k0 = (int) std::lround (f0 * n / fs);
+    double fund = 0, far = 0;
+    for (int k = k0 - 4; k <= k0 + 4; ++k) fund += std::norm (X[(size_t) k]);
+    for (int k = (int) (50.0 * n / fs); k < n / 2 - 8; ++k)
+    {
+        const double f = k * fs / n;
+        bool nearHarm = false;
+        for (int h = 1; h * f0 < 0.5 * fs; ++h) if (std::abs (f - h * f0) < 1500.0) nearHarm = true;
+        if (! nearHarm) far += std::norm (X[(size_t) k]);
+    }
+    return 10.0 * std::log10 (std::max (1e-30, far / fund));
+}
+
 // 1.x : FIR de phase linéaire (échantillonnage à N points, fenêtre de Blackman-Harris sur tout le FIR)
 static std::vector<double> legacyLinearFir (const BandSpec& b, double fs, int N)
 {
@@ -93,51 +138,108 @@ static std::vector<double> legacyLinearFir (const BandSpec& b, double fs, int N)
 
 int main()
 {
-    std::printf ("Audio Lab EQ 2.0 : banc qualité (sans JUCE)\n\n");
+    std::printf ("Lab EQ 3.0 : banc qualité (sans JUCE)\n\n");
 
-    // ── 1. Matched ──────────────────────────────────────────────────────
-    std::printf ("1. Zéro latence : écart max à l'analogique jusqu'à 20 kHz (avant = bilinéaire 1.x → après = matched 2.0)\n");
+    // ── 1. Matched + correction ─────────────────────────────────────────
+    std::printf ("1. Zéro latence : écart max à l'analogique de 20 Hz à 20 kHz (1.x bilinéaire → 2.0 matched → 3.0 matched + correction)\n"
+                 "   zone mesurée : tout le spectre (cloche, étagères, tilt) ; analogique ≥ −24 dB (coupes, passe-bande) ; ≥ −3 dB (notch)\n");
     {
         BandSpec b; b.active = true; b.shape = Shape::bell; b.freq = 16000; b.gainDb = 6; b.q = 1;
         Design d, a, l; design (b, 44100, d, false); design (b, 44100, a, true); designBilinear (b, 44100, l);
         const double v = magnitudeDb (d, 20000, 44100, false), va = magnitudeDb (a, 20000, 44100, true), vl = magnitudeDb (l, 20000, 44100, false);
-        std::printf ("   cloche 16 kHz +6 dB Q 1 à 20 kHz (44,1 kHz) : analogique %+.2f dB ; avant %+.2f ; après %+.2f\n", va, vl, v);
-        CHECK (std::abs (v - va) <= 0.5, "cloche 16 kHz : %.2f dB au lieu de %.2f", v, va);
+        std::printf ("   cloche 16 kHz +6 dB Q 1 à 20 kHz (44,1 kHz) : analogique %+.2f dB ; 1.x %+.2f ; 3.0 %+.3f\n", va, vl, v);
+        CHECK (std::abs (v - va) <= 0.1, "cloche 16 kHz : %.2f dB au lieu de %.2f", v, va);
     }
-    struct Fam { const char* name; Shape s; std::vector<double> g, q; std::vector<int> sl; double floor; double fmax; double tol441, tolHi; };
-    // tolérances : cloches / étagères / tilt ≤ 0,5 dB partout ; coupes et passe-bande : zone utile (≥ −24 dB),
-    // fréquences de coupure jusqu'à 10 kHz (au-delà : limite connue près de Nyquist, voir la fiche)
+    struct Fam { const char* name; Shape s; std::vector<double> g, q; std::vector<int> sl; double floor; };
+    const double tolZl = 0.1;   // seuil unique : toutes les formes, toutes les fréquences d'échantillonnage
     const std::vector<Fam> fams = {
-        { "cloche",      Shape::bell,      { -18, -12, -6, 6, 12, 18 }, { 0.1, 0.3, 0.71, 1, 2, 5, 10, 40 }, { 12 },   -200, 20000, 0.5, 0.5 },
-        { "low shelf",   Shape::lowShelf,  { -18, -6, 6, 18 },          { 0.3, 0.71, 1, 2 },                 { 6, 12 }, -200, 20000, 0.5, 0.5 },
-        { "high shelf",  Shape::highShelf, { -18, -6, 6, 18 },          { 0.3, 0.71, 1, 2 },                 { 6, 12 }, -200, 20000, 0.5, 0.5 },
-        { "tilt",        Shape::tiltShelf, { -12, -6, 6, 12 },          { 0.71, 1, 2 },                      { 6, 12 }, -200, 20000, 0.5, 0.5 },
-        { "notch",       Shape::notch,     { 0 },                       { 1, 2, 5, 10, 40 },                 { 12 },    -3,   20000, 0.7, 0.7 },
-        { "coupe-bas",   Shape::lowCut,    { 0 },                       { 0.71, 1, 2 },                      { 6, 12, 18, 24, 48, 96 }, -24, 5000, 0.5, 0.5 },
-        { "coupe-haut",  Shape::highCut,   { 0 },                       { 0.71, 1, 2 },                      { 6, 12, 18, 24, 48, 96 }, -24, 20000, 1.5, 1.0 },
-        { "passe-bande", Shape::bandPass,  { 0 },                       { 0.71, 1, 2, 5 },                   { 12, 24 }, -24, 10000, 1.5, 1.0 } };
+        { "cloche",      Shape::bell,      { -18, -12, -6, 6, 12, 18 }, { 0.1, 0.3, 0.71, 1, 2, 5, 10, 40 }, { 12 },   -200 },
+        { "low shelf",   Shape::lowShelf,  { -18, -6, 6, 18 },          { 0.3, 0.71, 1, 2, 4, 10 },          { 6, 12 }, -200 },
+        { "high shelf",  Shape::highShelf, { -18, -6, 6, 18 },          { 0.3, 0.71, 1, 2, 4, 10 },          { 6, 12 }, -200 },
+        { "tilt",        Shape::tiltShelf, { -12, -6, 6, 12 },          { 0.3, 0.71, 1, 2, 4, 10 },          { 6, 12 }, -200 },
+        { "notch",       Shape::notch,     { 0 },                       { 1, 2, 5, 10, 40 },                 { 12 },    -3 },
+        { "coupe-bas",   Shape::lowCut,    { 0 },                       { 0.71, 1, 2 },                      { 6, 12, 18, 24, 48, 72, 96 }, -24 },
+        { "coupe-haut",  Shape::highCut,   { 0 },                       { 0.71, 1, 2 },                      { 6, 12, 18, 24, 48, 72, 96 }, -24 },
+        { "passe-bande", Shape::bandPass,  { 0 },                       { 0.71, 1, 2, 5 },                   { 12, 24, 48 }, -24 } };
+    const double testFreqs[] = { 20.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 5000.0, 8000.0, 10000.0, 12000.0, 14000.0, 16000.0, 18000.0, 20000.0 };
+    double secBefore[8] {}, secAfter[8] {}; int secMax[8] {}, secCount[8] {};   // (sections par bande, pour le point 12, à 44,1 kHz)
     for (double fs : { 44100.0, 48000.0, 96000.0, 192000.0 })
     {
         std::printf ("   %.1f kHz :\n", fs / 1000);
+        int fi = 0;
         for (const auto& fm : fams)
         {
-            double wa = 0, wb = 0, wf = 0, wFreq = 0;
-            for (double f : { 30.0, 100.0, 300.0, 1000.0, 3000.0, 5000.0, 8000.0, 10000.0, 12000.0, 16000.0, 20000.0 })
-            {
-                if (f > fm.fmax) continue;
+            double wa = 0, wm = 0, wb = 0, wf = 0, wFreq = 0;
+            for (double f : testFreqs)
                 for (double g : fm.g) for (double q : fm.q) for (int sl : fm.sl)
                 {
                     BandSpec b; b.active = true; b.shape = fm.s; b.freq = f; b.gainDb = g; b.q = q; b.slope = sl;
-                    double at = 0;
-                    const double e = errVsAnalog (b, fs, false, fm.floor, &at);
+                    double at = 0; int n0 = 0, n1 = 0;
+                    const double e = errVsAnalog (b, fs, 2, fm.floor, &at, &n1);
                     if (e > wa) { wa = e; wf = at; wFreq = f; }
-                    wb = std::max (wb, errVsAnalog (b, fs, true, fm.floor));
+                    wm = std::max (wm, errVsAnalog (b, fs, 1, fm.floor, nullptr, &n0));
+                    wb = std::max (wb, errVsAnalog (b, fs, 0, fm.floor));
+                    if (fs < 46000) { secBefore[fi] += n0; secAfter[fi] += n1; secMax[fi] = std::max (secMax[fi], n1); ++secCount[fi]; }
                 }
-            }
-            const double tol = fs < 46000 ? fm.tol441 : fm.tolHi;
-            std::printf ("      %-11s avant %6.2f dB → après %5.2f dB (pire : bande à %.0f Hz, écart à %.0f Hz) [seuil %.1f]\n", fm.name, wb, wa, wFreq, wf, tol);
-            CHECK (wa <= tol, "%s à %.0f Hz : écart %.2f dB", fm.name, fs, wa);
+            std::printf ("      %-11s 1.x %6.2f dB → 2.0 %6.3f dB → 3.0 %.3f dB (pire : bande à %.0f Hz, écart à %.0f Hz) [seuil %.2f]\n", fm.name, wb, wm, wa, wFreq, wf, tolZl);
+            CHECK (wa <= tolZl, "%s à %.0f Hz : écart %.3f dB", fm.name, fs, wa);
+            ++fi;
         }
+    }
+    {
+        // réglages tirés au hasard (pas seulement la grille ci-dessus), la moitié entre 5 et 20 kHz
+        std::mt19937 rng (7); std::uniform_real_distribution<double> U (0, 1);
+        for (double fs : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        {
+            double w = 0; int over = 0; BandSpec wb;
+            const int N = 6000;
+            for (int it = 0; it < N; ++it)
+            {
+                BandSpec b; b.active = true; b.shape = (Shape) (int) (U (rng) * 8);
+                b.freq = U (rng) < 0.5 ? 20 * std::pow (1000.0, U (rng)) : 5000 * std::pow (4.0, U (rng));
+                b.gainDb = U (rng) * 36 - 18; b.slope = slopeValues[(int) (U (rng) * 9)];
+                const bool sh = b.shape == Shape::lowShelf || b.shape == Shape::highShelf || b.shape == Shape::tiltShelf;
+                b.q = b.shape == Shape::bell ? 0.1 * std::pow (400.0, U (rng)) : sh ? 0.3 * std::pow (10.0 / 0.3, U (rng))
+                    : b.shape == Shape::notch ? std::pow (40.0, U (rng)) : 0.5 * std::pow (10.0, U (rng));
+                const double fl = b.shape == Shape::notch ? -3 : (isCut (b.shape) || b.shape == Shape::bandPass) ? -24 : -200;
+                const double e = errVsAnalog (b, fs, 2, fl);
+                if (e > w) { w = e; wb = b; }
+                if (e > tolZl) ++over;
+            }
+            std::printf ("   %.1f kHz, %d réglages au hasard (toutes formes, Q : cloche 0.1–40, étagères 0.3–10, notch 1–40, coupes 0.5–5) :\n"
+                         "      pire %.3f dB (forme %d, %.0f Hz, %+.1f dB, Q %.2f, %d dB/oct), au-dessus du seuil : %d [seuil %.2f]\n",
+                         fs / 1000, N, w, (int) wb.shape, wb.freq, wb.gainDb, wb.q, wb.slope, over, tolZl);
+            CHECK (w <= tolZl, "réglages au hasard à %.0f Hz : %.3f dB", fs, w);
+        }
+    }
+    {
+        // réglage qui bouge : chaque conception part de la précédente (comme dans le moteur)
+        struct C { const char* n; Shape s; double g, q; int sl; double fl; };
+        const C cs[] = { { "cloche +12 Q 2", Shape::bell, 12, 2, 12, -200 }, { "cloche −9 Q 0.5", Shape::bell, -9, 0.5, 12, -200 }, { "high shelf +8", Shape::highShelf, 8, 0.71, 12, -200 },
+                         { "high shelf −6 Q 3", Shape::highShelf, -6, 3, 12, -200 }, { "tilt +5", Shape::tiltShelf, 5, 0.71, 12, -200 }, { "notch Q 4", Shape::notch, 0, 4, 12, -3 },
+                         { "coupe-haut 24", Shape::highCut, 0, 0.71, 24, -24 }, { "coupe-haut 72 Q 1.5", Shape::highCut, 0, 1.5, 72, -24 },
+                         { "coupe-bas 36", Shape::lowCut, 0, 0.71, 36, -24 }, { "passe-bande 24 Q 2", Shape::bandPass, 0, 2, 24, -24 } };
+        double w = 0; const char* wn = ""; double wfs = 0;
+        for (double fs : { 44100.0, 48000.0, 96000.0 })
+            for (const auto& c : cs)
+            {
+                BandSpec b; b.active = true; b.shape = c.s; b.gainDb = c.g; b.q = c.q; b.slope = c.sl;
+                Design d, h; bool have = false;
+                auto step = [&]
+                {
+                    designMatched (b, fs, d, maxCorrections, have ? &h : nullptr);
+                    const double e = errOf (b, fs, d, c.fl, nullptr, 400);
+                    if (e > w) { w = e; wn = c.n; wfs = fs; }
+                    h = d; have = d.n > 0;
+                };
+                for (int i = 0; i <= 1200; ++i) { b.freq = 1000.0 * std::pow (20.0, i <= 600 ? i / 600.0 : (1200 - i) / 600.0); step(); }   // fréquence 1 → 20 → 1 kHz
+                if (hasGain (c.s)) { b.freq = 14000; for (int i = 0; i <= 600; ++i) { b.gainDb = 15.0 * std::sin (2 * pi * i / 600.0); step(); } b.gainDb = c.g; }
+                b.freq = 12000;
+                for (int i = 0; i <= 600; ++i) { b.q = (hasGain (c.s) || c.s == Shape::notch ? 0.3 : 0.5) * std::pow (hasGain (c.s) || c.s == Shape::notch ? 33.0 : 8.0, 0.5 - 0.5 * std::cos (2 * pi * i / 600.0)); step(); }
+            }
+        std::printf ("   réglage qui bouge (conceptions enchaînées, balayages de fréquence, de gain et de Q, 10 formes, 44,1 / 48 / 96 kHz) :\n"
+                     "      pire %.3f dB (%s à %.1f kHz) [seuil %.2f]\n", w, wn, wfs / 1000, tolZl);
+        CHECK (w <= tolZl, "conceptions enchaînées : %.3f dB", w);
     }
 
     // ── 2. Moteur = courbe affichée ──────────────────────────────────────
@@ -178,6 +280,52 @@ int main()
             }
         std::printf ("   14 formes, 44,1 et 96 kHz : écart max %.4f dB [seuil 0.05]\n", worst);
         CHECK (worst < 0.05, "réponse du moteur ≠ courbe affichée (%.3f dB)", worst);
+
+        // Après un balayage : le moteur a suivi le réglage de proche en proche (chaque conception part de la
+        // précédente), alors que l'affichage conçoit directement le réglage final. Les deux tiennent la même
+        // cible analogique : on mesure l'écart entre ce qu'on entend et ce qui est affiché.
+        struct Sweep { Shape s; double f0, f1, g0, g1, q; int sl; };
+        const Sweep sweeps[] = { { Shape::bell, 3000, 14000, 9, 9, 1.5, 12 }, { Shape::bell, 16000, 16000, -12, 12, 3, 12 }, { Shape::highShelf, 10000, 10000, -8, 8, 0.71, 12 },
+                                 { Shape::highShelf, 2000, 12000, 6, 6, 2, 12 }, { Shape::highCut, 6000, 17000, 0, 0, 0.71, 48 }, { Shape::lowCut, 2000, 12000, 0, 0, 1, 24 },
+                                 { Shape::notch, 4000, 15000, 0, 0, 3, 12 }, { Shape::tiltShelf, 9000, 9000, -6, 6, 0.71, 12 } };
+        double worstS = 0, worstA = 0;
+        for (double fs : { 44100.0, 48000.0 })
+            for (const auto& c : sweeps)
+            {
+                BandSpec sp; sp.active = true; sp.shape = c.s; sp.freq = c.f0; sp.gainDb = c.g0; sp.q = c.q; sp.slope = c.sl;
+                eng.prepare (fs);
+                for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+                eng.setBand (0, sp, {}, 1.0);
+                std::vector<float> l (4096, 0.0f), r (4096, 0.0f);
+                eng.process (l.data(), r.data(), 4096, false);
+                for (int k = 1; k <= 300; ++k)
+                {
+                    sp.freq = c.f0 * std::pow (c.f1 / c.f0, k / 300.0); sp.gainDb = c.g0 + (c.g1 - c.g0) * k / 300.0;
+                    eng.setBand (0, sp, {}, 1.0);
+                    eng.process (l.data(), r.data(), 64, false);
+                }
+                for (int k = 0; k < 4; ++k) eng.process (l.data(), r.data(), 4096, false);
+                const int n = 65536;
+                std::vector<float> xl ((size_t) n, 0.0f), xr ((size_t) n, 0.0f);
+                xl[0] = xr[0] = 1.0f;
+                eng.process (xl.data(), xr.data(), n, false);
+                std::vector<double> x (xl.begin(), xl.end());
+                std::vector<fir::cd> X; fftReal (x, X, n);
+                Design d, da; design (sp, fs, d, false); design (sp, fs, da, true);
+                const double fl = c.s == Shape::notch ? -3 : (isCut (c.s) ? -24 : -200);
+                for (int k = 1; k < n / 2; ++k)
+                {
+                    const double f = k * fs / n;
+                    if (f < 20 || f > 20000) continue;
+                    const double ra = magnitudeDb (da, f, fs, true);
+                    if (ra < fl) continue;
+                    const double got = db (std::abs (X[(size_t) k]));
+                    worstS = std::max (worstS, std::abs (got - magnitudeDb (d, f, fs, false)));
+                    worstA = std::max (worstA, std::abs (got - ra));
+                }
+            }
+        std::printf ("   après un balayage (8 réglages aigus, 44,1 et 48 kHz) : moteur / courbe affichée %.3f dB ; moteur / analogique %.3f dB [seuils 0.05 et 0.10]\n", worstS, worstA);
+        CHECK (worstS <= 0.05 && worstA <= 0.1, "moteur après balayage : %.3f dB de la courbe affichée, %.3f dB de l'analogique", worstS, worstA);
     }
 
     // ── 3. Même son à toutes les fréquences d'échantillonnage ─────────────
@@ -186,27 +334,40 @@ int main()
         struct Case { Shape s; double f, g, q; int sl; };
         const Case cases[] = { { Shape::bell, 12000, 8, 1.5, 12 }, { Shape::bell, 18000, -6, 2, 12 }, { Shape::highShelf, 10000, 6, 0.71, 12 },
                                { Shape::lowShelf, 5000, -9, 1, 12 }, { Shape::highShelf, 15000, 4, 0.71, 6 }, { Shape::notch, 15000, 0, 3, 12 },
-                               { Shape::tiltShelf, 4000, 6, 0.71, 12 } };
-        double before = 0, after = 0;
+                               { Shape::tiltShelf, 4000, 6, 0.71, 12 },
+                               // 3.0 : étagères résonantes, coupes raides tout en haut, passe-bande, cloches extrêmes
+                               { Shape::highShelf, 3000, 9, 4, 12 }, { Shape::highShelf, 6000, -12, 10, 12 }, { Shape::lowShelf, 10000, 6, 10, 12 }, { Shape::tiltShelf, 8000, -6, 4, 12 },
+                               { Shape::highCut, 16000, 0, 0.71, 48 }, { Shape::highCut, 16000, 0, 0.71, 72 }, { Shape::highCut, 16000, 0, 0.71, 96 },
+                               { Shape::highCut, 20000, 0, 0.71, 48 }, { Shape::highCut, 20000, 0, 1, 72 }, { Shape::highCut, 20000, 0, 0.71, 96 },
+                               { Shape::lowCut, 16000, 0, 0.71, 48 }, { Shape::lowCut, 20000, 0, 0.71, 96 }, { Shape::bandPass, 12000, 0, 2, 24 },
+                               { Shape::bell, 20000, 18, 0.3, 12 }, { Shape::bell, 16000, -18, 10, 12 } };
+        const int nCases = (int) (sizeof (cases) / sizeof (cases[0]));
+        double v1 = 0, v2 = 0, after = 0, after7 = 0;
+        int ci = 0;
         for (const auto& c : cases)
         {
             BandSpec s; s.active = true; s.shape = c.s; s.freq = c.f; s.gainDb = c.g; s.q = c.q; s.slope = c.sl;
             Design ref; design (s, 192000, ref, false);
+            const double fl = c.s == Shape::notch ? -3 : (isCut (c.s) || c.s == Shape::bandPass) ? -24 : -200;   // (même zone utile qu'au point 1)
             for (double fs : { 44100.0, 48000.0, 96000.0 })
             {
-                Design d, l; design (s, fs, d, false); designBilinear (s, fs, l);
+                Design d, m, l; design (s, fs, d, false); designMatched (s, fs, m, 0); designBilinear (s, fs, l);
                 for (int i = 0; i < 400; ++i)
                 {
                     const double f = 20 * std::pow (1000.0, i / 399.0);
                     const double r = magnitudeDb (ref, f, 192000, false);
-                    if (c.s == Shape::notch && r < -3) continue;
-                    after = std::max (after, std::abs (magnitudeDb (d, f, fs, false) - r));
-                    before = std::max (before, std::abs (magnitudeDb (l, f, fs, false) - r));
+                    if (r < fl) continue;
+                    const double e = std::abs (magnitudeDb (d, f, fs, false) - r);
+                    after = std::max (after, e);
+                    if (ci < 7) after7 = std::max (after7, e);
+                    v2 = std::max (v2, std::abs (magnitudeDb (m, f, fs, false) - r));
+                    v1 = std::max (v1, std::abs (magnitudeDb (l, f, fs, false) - r));
                 }
             }
+            ++ci;
         }
-        std::printf ("   7 réglages aigus : avant %.2f dB → après %.2f dB [seuil 0.6]\n", before, after);
-        CHECK (after <= 0.6, "courbe différente selon la fréquence d'échantillonnage (%.2f dB)", after);
+        std::printf ("   %d réglages aigus : 1.x %.2f dB → 2.0 %.2f dB → 3.0 %.3f dB (les 7 réglages du banc 2.0 : %.3f dB) [seuil 0.05]\n", nCases, v1, v2, after, after7);
+        CHECK (after <= 0.05, "courbe différente selon la fréquence d'échantillonnage (%.3f dB)", after);
     }
 
     // ── 4. Tests de nul ──────────────────────────────────────────────────
@@ -263,6 +424,77 @@ int main()
         std::printf ("   avant (paliers de 32 éch.) %.1f dB → après (gain à chaque échantillon) %.1f dB [seuil : −90 dB]\n", res[1], res[0]);
         CHECK (res[0] <= -90.0, "raies parasites de l'EQ dynamique (%.1f dB)", res[0]);
     }
+    {
+        // même mesure dans l'aigu à 44,1 kHz : la bande a une section de correction, ses conceptions
+        // viennent du cache des bandes dynamiques (interpolation section par section)
+        const double fs = 44100;
+        Engine eng; eng.prepare (fs);
+        for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+        BandSpec s; s.active = true; s.shape = Shape::bell; s.freq = 10000; s.gainDb = 0; s.q = 1.5;
+        DynSettings d; d.on = true; d.thrDb = -30; d.rangeDb = -12; d.attackMs = 0.5; d.releaseMs = 20;
+        eng.setBand (0, s, d, 1.0);
+        const int n = 1 << 17;
+        std::vector<float> l ((size_t) n + 8192), r;
+        for (int i = 0; i < (int) l.size(); ++i)
+            l[(size_t) i] = (float) (0.25 * (1.0 + 0.8 * std::sin (2 * pi * 4.0 * i / fs)) * std::sin (2 * pi * 9001.0 * i / fs));
+        r = l;
+        for (int off = 0; off < (int) l.size(); off += 441) eng.process (l.data() + off, r.data() + off, std::min (441, (int) l.size() - off), false);
+        const double res = blockLines (l, 8192, n, fs, 9001.0);
+        std::printf ("   aigu (cloche 10 kHz dynamique, sinus 9001 Hz, 44,1 kHz) : %.1f dB [seuil : −90 dB]\n", res);
+        CHECK (res <= -90.0, "raies parasites de l'EQ dynamique dans l'aigu (%.1f dB)", res);
+    }
+    {
+        // Exactitude du gain dynamique dans l'aigu : side-chain externe constant → gain dynamique fixe X ;
+        // la réponse mesurée (impulsion → FFT) doit être celle de l'analogique au gain de base + X.
+        struct C { Shape s; double f, g, q, range, fs; };
+        const C cs[] = { { Shape::bell, 12000, 3, 2, -9, 44100 }, { Shape::bell, 16000, 0, 1, 12, 44100 }, { Shape::highShelf, 9000, 4, 0.71, -10, 48000 },
+                         { Shape::bell, 15000, -3, 4, -12, 48000 }, { Shape::highShelf, 12000, 0, 1, 8, 44100 } };
+        double worst = 0, wX = 0; int wi = 0, ci = 0;
+        for (const auto& c : cs)
+        {
+            for (double frac : { 0.13, 0.37, 0.61, 0.89 })
+            {
+                Engine eng; eng.prepare (c.fs);
+                for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+                BandSpec s; s.active = true; s.shape = c.s; s.freq = c.f; s.gainDb = c.g; s.q = c.q;
+                DynSettings d; d.on = true; d.thrDb = -40; d.rangeDb = c.range; d.attackMs = 5; d.releaseMs = 2000; d.external = true;
+                eng.setBand (0, s, d, 1.0);
+                // niveau du side-chain : dépassement du seuil = fraction de la plage (au-dessus du genou de 6 dB)
+                const double amp = std::pow (10.0, (-40.0 + 3.0 + frac * std::abs (c.range)) / 20.0);
+                const double fsc = c.s == Shape::bell ? c.f : 0.45 * c.fs * 0.9;   // (détecteur : passe-bande, ou passe-haut pour l'étagère)
+                const int n = 65536, pre = 6 * 65536;
+                std::vector<float> l ((size_t) n, 0.0f), r ((size_t) n, 0.0f), sc ((size_t) n);
+                long t = 0;
+                for (int k = 0; k < pre / n; ++k)
+                {
+                    for (int i = 0; i < n; ++i, ++t) sc[(size_t) i] = (float) (amp * std::sin (2 * pi * fsc * t / c.fs));
+                    std::fill (l.begin(), l.end(), 0.0f); r = l;
+                    eng.process (l.data(), r.data(), n, false, sc.data(), nullptr);
+                }
+                const double x0 = eng.getDynOffset (0);
+                for (int i = 0; i < n; ++i, ++t) sc[(size_t) i] = (float) (amp * std::sin (2 * pi * fsc * t / c.fs));
+                std::fill (l.begin(), l.end(), 0.0f); l[0] = 1.0f; r = l;
+                eng.process (l.data(), r.data(), n, false, sc.data(), nullptr);
+                const double x1 = eng.getDynOffset (0);
+                std::vector<double> x (l.begin(), l.end());
+                std::vector<fir::cd> X; fftReal (x, X, n);
+                BandSpec e = s; e.gainDb = c.g + 0.5 * (x0 + x1);
+                Design da; design (e, c.fs, da, true);
+                double w = 0;
+                for (int k = 1; k < n / 2; ++k)
+                {
+                    const double f = k * c.fs / n;
+                    if (f < 20 || f > 20000) continue;
+                    w = std::max (w, std::abs (db (std::abs (X[(size_t) k])) - magnitudeDb (da, f, c.fs, true)));
+                }
+                w = std::max (0.0, w - 0.5 * std::abs (x1 - x0));   // (dérive du gain pendant la mesure)
+                if (w > worst) { worst = w; wX = 0.5 * (x0 + x1); wi = ci; }
+            }
+            ++ci;
+        }
+        std::printf ("   gain dynamique fixe dans l'aigu (5 bandes × 4 niveaux, side-chain externe) : écart max à l'analogique %.3f dB (bande %d, gain dynamique %+.2f dB) [seuil 0.10]\n", worst, wi + 1, wX);
+        CHECK (worst <= 0.1, "bande dynamique dans l'aigu : %.3f dB", worst);
+    }
 
     // ── 6. Réglage qui bouge : bruit d'escalier ──────────────────────────
     std::printf ("6. Fréquence d'une cloche +12 dB modulée (1 kHz × 2^(±1.5) à 3 Hz), sinus 3001 Hz : raie max à f0 ± k·fs/32\n");
@@ -288,6 +520,59 @@ int main()
         }
         std::printf ("   avant %.1f dB → après %.1f dB [seuil : 20 dB de mieux]\n", res[1], res[0]);
         CHECK (res[0] <= res[1] - 20.0, "escalier quand un réglage bouge (%.1f dB)", res[0]);
+    }
+    {
+        // même mesure dans l'aigu à 44,1 kHz (cloche 8 kHz × 2^(±1) : la section de correction apparaît,
+        // évolue et disparaît à chaque passage), sinus 5001 Hz
+        const double fs = 44100;
+        double res[3] {}, noise[3] {};
+        for (int mode = 0; mode < 3; ++mode)   // 0 : 3.0 ; 1 : paliers de 32 éch. (1.x) ; 2 : interpolation sans correction (2.0)
+        {
+            Engine eng; eng.legacyStepping = mode == 1; eng.corrections = mode == 2 ? 0 : maxCorrections; eng.prepare (fs);
+            for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+            const int n = 1 << 17, tot = n + 8192;
+            std::vector<float> l ((size_t) tot), r;
+            for (int i = 0; i < tot; ++i) l[(size_t) i] = (float) (0.1 * std::sin (2 * pi * 5001.0 * i / fs));
+            r = l;
+            for (int off = 0; off < tot; off += 32)
+            {
+                BandSpec s; s.active = true; s.shape = Shape::bell; s.gainDb = 12; s.q = 2;
+                s.freq = 8000.0 * std::pow (2.0, 1.0 * std::sin (2 * pi * 3.0 * off / fs));
+                eng.setBand (0, s, {}, 1.0);
+                eng.process (l.data() + off, r.data() + off, std::min (32, tot - off), false);
+            }
+            res[mode] = blockLines (l, 8192, n, fs, 5001.0);
+            noise[mode] = farNoise (l, 8192, n, fs, 5001.0);
+        }
+        std::printf ("   aigu (cloche 4 – 16 kHz, sinus 5001 Hz, 44,1 kHz) : raie max avant %.1f dB → après %.1f dB [seuil : 20 dB de mieux]\n", res[1], res[0]);
+        std::printf ("      bruit large bande loin du sinus : paliers 1.x %.1f dB ; sans correction (2.0) %.1f dB ; 3.0 %.1f dB [seuil : −90 dB]\n", noise[1], noise[2], noise[0]);
+        CHECK (res[0] <= res[1] - 20.0, "escalier quand un réglage bouge dans l'aigu (%.1f dB)", res[0]);
+        CHECK (noise[0] <= -90.0, "bruit de transition des sections de correction (%.1f dB)", noise[0]);
+    }
+    {
+        // coupe-haut 48 dB/oct balayé de 6 à 19 kHz (0,5 Hz), sinus 3001 Hz dans la bande passante : les
+        // sections réajustées et les corrections changent sans cesse ; même mesure de bruit large bande
+        const double fs = 44100;
+        double noise[2] {};
+        for (int mode = 0; mode < 2; ++mode)
+        {
+            Engine eng; eng.corrections = mode == 1 ? 0 : maxCorrections; eng.prepare (fs);
+            for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+            const int n = 1 << 17, tot = n + 8192;
+            std::vector<float> l ((size_t) tot), r;
+            for (int i = 0; i < tot; ++i) l[(size_t) i] = (float) (0.1 * std::sin (2 * pi * 3001.0 * i / fs));
+            r = l;
+            for (int off = 0; off < tot; off += 32)
+            {
+                BandSpec s; s.active = true; s.shape = Shape::highCut; s.q = 0.71; s.slope = 48;
+                s.freq = 6000.0 * std::pow (19.0 / 6.0, 0.5 + 0.5 * std::sin (2 * pi * 0.5 * off / fs));
+                eng.setBand (0, s, {}, 1.0);
+                eng.process (l.data() + off, r.data() + off, std::min (32, tot - off), false);
+            }
+            noise[mode] = farNoise (l, 8192, n, fs, 3001.0);
+        }
+        std::printf ("   coupe-haut 48 dB/oct balayé 6 – 19 kHz, sinus 3001 Hz : bruit large bande sans correction (2.0) %.1f dB ; 3.0 %.1f dB [seuil : −90 dB]\n", noise[1], noise[0]);
+        CHECK (noise[0] <= -90.0, "bruit de transition du coupe-haut balayé (%.1f dB)", noise[0]);
     }
 
     // ── 7. Phase linéaire ────────────────────────────────────────────────
@@ -456,6 +741,89 @@ int main()
         }
         std::printf ("   automatisation aléatoire (8 bandes, dynamique, side-chain) : crête %.1f, NaN : %s [seuil < 300]\n", peak, nan ? "oui" : "non");
         CHECK (! nan && peak < 300, "moteur instable sous automatisation");
+    }
+
+    // ── 12. Coût ─────────────────────────────────────────────────────────
+    // (durées mesurées sur cette machine : indicatives, sans seuil)
+    std::printf ("12. Coût (durées indicatives, mesurées ici)\n");
+    {
+        std::printf ("   sections par bande à 44,1 kHz, réglages du point 1 (moyenne 2.0 → 3.0, maximum 3.0) :\n     ");
+        for (int i = 0; i < 8; ++i) std::printf (" %s %.2f → %.2f (max %d)%s", fams[(size_t) i].name, secBefore[i] / secCount[i], secAfter[i] / secCount[i], secMax[i], i == 3 ? "\n     " : i < 7 ? " ;" : "\n");
+        auto usPer = [] (const BandSpec& b0, double fs, int mode)
+        {
+            BandSpec b = b0; Design d, h; double acc = 0;
+            designMatched (b, fs, h);
+            const int N = 2000;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < N; ++i)
+            {
+                b.freq = b0.freq * std::pow (2.0, 0.25 * std::sin (i * 0.002));   // réglage qui glisse (± 1/4 d'octave)
+                if (mode == 0) designMatched (b, fs, d, 0);
+                else if (mode == 1) designMatched (b, fs, d);
+                else { designMatched (b, fs, d, maxCorrections, &h); h = d; }
+                acc += d.outGain;
+            }
+            const double us = std::chrono::duration<double, std::micro> (std::chrono::steady_clock::now() - t0).count() / N;
+            return acc > 0 ? us : 0.0;
+        };
+        struct C { const char* n; Shape s; double f, g, q; int sl; };
+        const C cs[] = { { "cloche 1 kHz +6 dB Q 1", Shape::bell, 1000, 6, 1, 12 }, { "cloche 8 kHz +6 dB Q 1", Shape::bell, 8000, 6, 1, 12 }, { "cloche 16 kHz −12 dB Q 4", Shape::bell, 16000, -12, 4, 12 },
+                         { "high shelf 8 kHz +6 dB", Shape::highShelf, 8000, 6, 0.71, 12 }, { "notch 10 kHz Q 5", Shape::notch, 10000, 0, 5, 12 }, { "coupe-bas 80 Hz 24 dB/oct", Shape::lowCut, 80, 0, 0.71, 24 },
+                         { "coupe-haut 16 kHz 24 dB/oct", Shape::highCut, 16000, 0, 0.71, 24 }, { "coupe-haut 16 kHz 96 dB/oct", Shape::highCut, 16000, 0, 0.71, 96 }, { "passe-bande 10 kHz 24 dB/oct", Shape::bandPass, 10000, 0, 2, 24 } };
+        std::printf ("   temps d'une conception à 44,1 kHz (µs) : 2.0 | 3.0 première conception | 3.0 réglage qui bouge (départ = conception précédente) ; sections 2.0 → 3.0\n");
+        for (const auto& c : cs)
+        {
+            BandSpec b; b.active = true; b.shape = c.s; b.freq = c.f; b.gainDb = c.g; b.q = c.q; b.slope = c.sl;
+            Design d0, d1; designMatched (b, 44100, d0, 0); designMatched (b, 44100, d1);
+            std::printf ("      %-28s %6.1f | %6.1f | %6.1f ; %d → %d\n", c.n, usPer (b, 44100, 0), usPer (b, 44100, 1), usPer (b, 44100, 2), d0.n, d1.n);
+        }
+        // traitement : une section SVF sur un signal
+        {
+            Section sc; sc.g = 0.3; sc.k = 1.0; sc.m0 = 1.0; sc.m1 = 0.5; sc.m2 = 0.1;
+            SectionRT rt; toRT (sc, rt);
+            double st[2] {}, acc = 0;
+            const int N = 4000000;
+            const auto t0 = std::chrono::steady_clock::now();
+            double x = 0.1;
+            for (int i = 0; i < N; ++i) { x = 0.999 * x + 1e-4; acc += tick (rt, st, x + (i & 1 ? 0.01 : -0.01)); }
+            const double ns = std::chrono::duration<double, std::nano> (std::chrono::steady_clock::now() - t0).count() / N;
+            std::printf ("   traitement : %.1f ns par section et par échantillon%s, soit %.3f %% d'un cœur par section de correction en stéréo à 44,1 kHz (%.3f %% à 96 kHz)\n",
+                         ns, acc != 0 ? "" : " ", ns * 1e-9 * 2 * 44100 * 100, ns * 1e-9 * 2 * 96000 * 100);
+        }
+        // moteur complet, 44,1 kHz stéréo : 8 bandes dans l'aigu, fixes puis une cloche balayée, puis une bande dynamique
+        auto engineLoad = [] (int corr, int scenario)
+        {
+            const double fs = 44100;
+            Engine eng; eng.corrections = corr; eng.prepare (fs);
+            for (int b = 0; b < maxBands; ++b) eng.setBand (b, BandSpec(), DynSettings(), 1.0);
+            const double fr[8] = { 3000, 5000, 7000, 9000, 11000, 13000, 15000, 17000 };
+            for (int b = 0; b < 8; ++b)
+            {
+                BandSpec s; s.active = true; s.shape = b == 6 ? Shape::highShelf : b == 7 ? Shape::highCut : Shape::bell; s.freq = fr[b]; s.gainDb = b % 2 ? -5 : 6; s.q = b == 7 ? 0.71 : 1.5; s.slope = b == 7 ? 24 : 12;
+                DynSettings d; d.on = scenario == 2 && b == 4; d.thrDb = -40; d.rangeDb = -9; d.attackMs = 1; d.releaseMs = 60;
+                eng.setBand (b, s, d, 1.0);
+            }
+            std::mt19937 rng (3); std::uniform_real_distribution<float> U (-0.3f, 0.3f);
+            const int blk = 256, nb = 800;
+            std::vector<float> l ((size_t) blk), r ((size_t) blk);
+            double t = 0;
+            for (int k = 0; k < nb + 20; ++k)
+            {
+                for (int i = 0; i < blk; ++i) { l[(size_t) i] = U (rng) * (1.0f + (float) std::sin (k * 0.3)); r[(size_t) i] = l[(size_t) i]; }
+                if (scenario == 1)
+                {
+                    BandSpec s; s.active = true; s.shape = Shape::bell; s.gainDb = 6; s.q = 1.5; s.freq = 9000.0 * std::pow (2.0, 0.8 * std::sin (k * 0.05));
+                    eng.setBand (2, s, {}, 1.0);
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                eng.process (l.data(), r.data(), blk, false);
+                if (k >= 20) t += std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+            }
+            return 100.0 * t / (nb * blk / fs);
+        };
+        const char* names[3] = { "8 bandes fixes dans l'aigu (3 – 17 kHz)", "les mêmes, dont une cloche balayée sans arrêt (5 – 16 kHz)", "les mêmes, dont une cloche dynamique à 11 kHz" };
+        std::printf ("   moteur complet, 44,1 kHz stéréo, %% d'un cœur (2.0 sans correction → 3.0) :\n");
+        for (int sc = 0; sc < 3; ++sc) std::printf ("      %-60s %.2f %% → %.2f %%\n", names[sc], engineLoad (0, sc), engineLoad (maxCorrections, sc));
     }
 
     std::printf ("\n%s (%d échec%s)\n", failures == 0 ? "TOUS LES TESTS PASSENT" : "DES TESTS ÉCHOUENT", failures, failures > 1 ? "s" : "");

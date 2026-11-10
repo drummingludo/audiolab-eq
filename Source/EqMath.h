@@ -16,6 +16,13 @@
 //    liberté supplémentaire suit la pente analogique jusqu'à 20 kHz.
 // Chaque biquad obtenu est remis sous la forme du SVF existant (g, k, m0, m1, m2) : tout biquad
 // stable s'y ramène exactement, et response() (en tan) donne alors la réponse RÉELLE du filtre numérique.
+//
+// 3.0 : écart à l'analogique < 0,1 dB de 20 Hz à 20 kHz, à toutes les fréquences d'échantillonnage.
+// Une seule section d'ordre 2 par section analogique ne suffit pas près de Nyquist : quand l'écart de la
+// conception matched dépasse 0,015 dB, la bande reçoit 1 à 3 sections SVF de correction (phase minimale,
+// gain 1 en continu, aucune latence) ajustées sur le module, en même temps que les sections de base des
+// cloches, étagères et coupe-haut (conception directe du module, départ = conception matched).
+// Voir matched::correct. Une bande loin de Nyquist garde exactement sa conception 2.0.
 #pragma once
 #include <array>
 #include <algorithm>
@@ -68,9 +75,14 @@ struct Section
     double cLp = 1, cHp = 0;           // 1er ordre : y = cLp·lp + cHp·hp
 };
 
+// Nombre maximal de sections d'une bande : 8 SVF + 1er ordre éventuel (coupes), plus les sections
+// de correction du mode zéro latence (voir matched::correct).
+constexpr int maxCorrections = 3;
+constexpr int maxSections = 9 + maxCorrections;
+
 struct Design
 {
-    std::array<Section, 9> s {};
+    std::array<Section, maxSections> s {};
     int n = 0;
     double outGain = 1.0;
 };
@@ -255,6 +267,18 @@ inline double mag2 (const ASec& a, double w)
     return (a.cLp * a.cLp + a.cHp * a.cHp * x * x) / (1.0 + x * x);
 }
 
+// Réglages des sections de correction (voir plus bas). Les écarts sont des écarts de puissance
+// relatifs, mesurés sur les points de calcul : 0,0023 ≈ 0,01 dB.
+constexpr double corrThreshold = 0.0035;        // (≈ 0,015 dB) au-dessus : la bande reçoit une section de correction
+constexpr double corrThreshold2 = 0.0046;       // (≈ 0,02 dB) au-dessus : une section de correction de plus
+constexpr double corrThresholdTrack = 0.0058;   // (≈ 0,025 dB) suivi d'un réglage qui bouge : au-dessus, recherche complète
+constexpr double corrThresholdKeep = 0.0116;    // (≈ 0,05 dB) au-dessus, la solution suivie est abandonnée (nouveau départ)
+constexpr int corrIterations = 40;              // passes au plus d'une recherche complète
+constexpr int corrHintIterations = 10;          // passes au plus d'un suivi
+constexpr int corrStarts = 2;                   // points de départ essayés pour une nouvelle section
+constexpr double corrMaxQ = 8.0;                // Q maximal des pôles et des zéros d'une section de correction
+constexpr double corrPullMin = 1e-7, corrPullNear = 1e-2, corrPullFar = 1e-6;   // rappel vers la conception sans correction
+
 struct Phi { double p0, p1, p2; };
 inline Phi phi (double w)
 {
@@ -407,8 +431,11 @@ inline double checkSection (const Pts& p, const ASec& a, const double* b, double
 
 enum class Kind { general, lowpassLike, highpass, bandpass, notch, firstOrder };
 
-// Une section analogique → une section SVF numérique (vrai si réussi)
-inline bool section (const ASec& a, Kind kind, double Wz, double Qz, double fs, bool invert, Section& out)
+// Biquad numérique b0 + b1 z⁻¹ + b2 z⁻² / 1 + a1 z⁻¹ + a2 z⁻²
+struct Bq { double b[3] = { 1, 0, 0 }; double a1 = 0, a2 = 0; };
+
+// Une section analogique → un biquad numérique (vrai si réussi)
+inline bool sectionBiquad (const ASec& a, Kind kind, double Wz, double Qz, double fs, Bq& out)
 {
     const Grid& g = gridFor (fs);
     double a1, a2;   // pôles par invariance impulsionnelle (ou pôle exact + e^{-π} au 1er ordre)
@@ -572,22 +599,529 @@ inline bool section (const ASec& a, Kind kind, double Wz, double Qz, double fs, 
         considerFull (bb, 2.0 * (gb * gb - 1.0) / D, (1.0 - a.k * gb + gb * gb) / D);
     }
     if (bestErr >= 1e17) return false;
+    out.b[0] = b[0]; out.b[1] = b[1]; out.b[2] = b[2]; out.a1 = ba1; out.a2 = ba2;
+    return true;
+}
 
+// Biquad → section SVF ; invert : H⁻¹ = A/B (B est à phase minimale : ses zéros deviennent des pôles stables)
+inline bool toSection (const Bq& q, bool invert, Section& out)
+{
     if (invert)
     {
-        // H⁻¹ = A/B (B est à phase minimale : ses zéros deviennent des pôles stables)
-        if (! (std::abs (b[0]) > 1e-300) || std::abs (b[2] / b[0]) >= 0.999999) return false;
-        const double s = 1.0 / b[0];
-        const double nb[3] = { s, ba1 * s, ba2 * s };
-        return svfFromBiquad (nb, b[1] * s, b[2] * s, out);
+        if (! (std::abs (q.b[0]) > 1e-300) || std::abs (q.b[2] / q.b[0]) >= 0.999999) return false;
+        const double s = 1.0 / q.b[0];
+        const double nb[3] = { s, q.a1 * s, q.a2 * s };
+        return svfFromBiquad (nb, q.b[1] * s, q.b[2] * s, out);
     }
-    return svfFromBiquad (b, ba1, ba2, out);
+    return svfFromBiquad (q.b, q.a1, q.a2, out);
+}
+
+// Une section analogique → une section SVF numérique (vrai si réussi)
+inline bool section (const ASec& a, Kind kind, double Wz, double Qz, double fs, bool invert, Section& out)
+{
+    Bq q;
+    return sectionBiquad (a, kind, Wz, Qz, fs, q) && toSection (q, invert, out);
+}
+
+// ── Sections de correction (3.0) ─────────────────────────────────────────
+// Une section numérique d'ordre 2 ne peut pas suivre exactement le module analogique jusqu'à 20 kHz
+// quand la bande agit près de Nyquist (ou quand ses pôles sont très amortis). On mesure donc le résidu
+// R(ω) = |cible analogique|² / |filtre obtenu|² de la bande entière, et s'il dépasse le seuil on ajoute
+// une section correctrice C telle que |C|² ≈ R. C est décrite directement dans le domaine du SVF
+// (s = j·tan(ω/2)) par une paire de pôles (g, k) et une paire de zéros (gz, kz), tous libres :
+//   C(s) = ((s/gz)² + kz·s/gz + 1) / ((s/g)² + k·s/g + 1)
+// g, k, gz, kz > 0 : toujours stable, à phase minimale, gain exactement 1 en continu, et son inverse
+// (pôles ↔ zéros) l'est aussi. Ajustement non linéaire (Levenberg-Marquardt sur les logarithmes des
+// quatre paramètres, erreur relative de puissance) avec des poids de Lawson (vers le minimax).
+struct Corr { double g = 1, k = 1.4, gz = 1, kz = 1.4; };
+
+struct CGrid
+{
+    static constexpr int fixedMax = 48, maxPts = 76;
+    static constexpr double aboveWeight = 0.05;
+    double fs = 0, wAudible = pi, top = pi;
+    int n = 0;
+    double w[fixedMax] {}, wt[fixedMax] {};
+
+    void init (double rate)
+    {
+        fs = rate; n = 0;
+        const double c = 2.0 * pi / fs;
+        wAudible = c * 20000.0;
+        top = 0.998 * pi;
+        for (int i = 0; i < 8; ++i) { w[n] = c * 20.0 * std::pow (100.0, i / 8.0); wt[n++] = 1.0; }    // 20 Hz … 2 kHz
+        for (int i = 0; i < 10; ++i) { w[n] = c * (2000.0 + 1000.0 * i); wt[n++] = 1.0; }              // 2 … 11 kHz
+        for (int i = 0; i <= 18; ++i) { w[n] = c * (11000.0 + 500.0 * i); wt[n++] = 1.0; }             // 11 … 20 kHz
+        // au-dessus de 20 kHz : la courbe reste sage, sans gêner la précision dans l'audible
+        for (int i = 1; i <= 4; ++i) { w[n] = wAudible + (top - wAudible) * i / 4.0; wt[n++] = aboveWeight; }
+    }
+};
+
+inline const CGrid& cgridFor (double fs)
+{
+    static thread_local CGrid g;
+    if (g.fs != fs) g.init (fs);
+    return g;
+}
+
+struct CPts
+{
+    int n = 0;
+    double w[CGrid::maxPts], wt[CGrid::maxPts], R[CGrid::maxPts], t2[CGrid::maxPts];   // t2 = tan²(ω/2)
+};
+
+inline double bqMag2 (const Bq& q, const Phi& p)
+{
+    const double s1 = q.b[0] + q.b[1] + q.b[2], s2 = q.b[0] - q.b[1] + q.b[2];
+    const double t1 = 1.0 + q.a1 + q.a2, t2 = 1.0 - q.a1 + q.a2;
+    const double num = s1 * s1 * p.p0 + s2 * s2 * p.p1 - 4.0 * q.b[0] * q.b[2] * p.p2;
+    const double den = t1 * t1 * p.p0 + t2 * t2 * p.p1 - 4.0 * q.a2 * p.p2;
+    return num / std::max (1e-300, den);
+}
+
+inline double corrMag2 (const Corr& c, double t2)
+{
+    const double v = t2 / (c.g * c.g), vz = t2 / (c.gz * c.gz);
+    return ((1.0 - vz) * (1.0 - vz) + c.kz * c.kz * vz) / ((1.0 - v) * (1.0 - v) + c.k * c.k * v);
+}
+
+// gain : gain en continu de la section (1 pour une correction)
+inline void corrToSection (const Corr& c, bool invert, double gain, Section& s)
+{
+    const double g = invert ? c.gz : c.g, k = invert ? c.kz : c.k, gz = invert ? c.g : c.gz, kz = invert ? c.k : c.kz;
+    const double r = g / gz, G = invert ? 1.0 / gain : gain;
+    s.kind = Section::svf; s.g = g; s.k = k;
+    s.m0 = G * r * r; s.m1 = G * (kz * r - k * r * r); s.m2 = G * (1.0 - r * r);
+}
+
+// Résolution de M x = r par Cholesky (M symétrique définie positive, n ≤ 12). Faux si échec.
+constexpr int maxFreeBase = 3;   // sections de base réajustées avec les corrections
+constexpr int fitMaxParams = 4 * (maxCorrections + maxFreeBase);
+inline bool cholSolve (double M[fitMaxParams][fitMaxParams], double* r, int n)
+{
+    for (int j = 0; j < n; ++j)
+    {
+        double d = M[j][j];
+        for (int k = 0; k < j; ++k) d -= M[j][k] * M[j][k];
+        if (! (d > 1e-300)) return false;
+        d = std::sqrt (d);
+        M[j][j] = d;
+        for (int i = j + 1; i < n; ++i)
+        {
+            double v = M[i][j];
+            for (int k = 0; k < j; ++k) v -= M[i][k] * M[j][k];
+            M[i][j] = v / d;
+        }
+    }
+    for (int i = 0; i < n; ++i) { double v = r[i]; for (int k = 0; k < i; ++k) v -= M[i][k] * r[k]; r[i] = v / M[i][i]; }
+    for (int i = n - 1; i >= 0; --i) { double v = r[i]; for (int k = i + 1; k < n; ++k) v -= M[k][i] * r[k]; r[i] = v / M[i][i]; }
+    return true;
+}
+
+// Écart d'un rapport de puissances à 1, symétrique (0,1 dB ↔ 0,0233)
+inline double ratioErr (double r) { return r >= 1.0 ? r - 1.0 : 1.0 / std::max (1e-300, r) - 1.0; }
+
+// Ajuste ensemble m sections c[0..m) (départ → résultat) pour que le produit de leurs |C|² suive le
+// résidu p.R. wide[i] : section de base (bornes larges) ; sinon section de correction (Q borné).
+// Renvoie l'écart max pondéré.
+// stopAt : écart sous lequel on s'arrête.
+// pull : rappel (poids) vers « sections de base = ctr (conception matched), corrections neutres
+// (zéros = pôles) ». Fort quand l'écart à corriger est petit, faible quand il est grand : la solution
+// part continûment de la conception sans correction, ce qui permet d'interpoler les coefficients quand
+// une correction apparaît ou disparaît en cours de réglage. Il lève aussi l'indétermination des
+// sections presque neutres.
+// track : suivi d'une solution voisine (réglage qui bouge). Pas de recherche du minimax par étapes :
+// les poids viennent une fois pour toutes de l'écart au point de départ, et l'on fait toujours au
+// moins un pas, pour que la solution glisse avec les réglages au lieu d'avancer par à-coups.
+inline double fitSections (const CPts& p, Corr* c, const bool* wide, int m, int maxIt, double stopAt,
+                           const Corr* ctr, double pull, bool track, int* passes = nullptr)
+{
+    constexpr int NP = fitMaxParams;
+    const int np = 4 * m;
+    double lo[NP], hi[NP], th[NP];
+    for (int s = 0; s < m; ++s)
+    {
+        const double kLo = wide[s] ? 1e-4 : 1.0 / corrMaxQ, kHi = wide[s] ? 1e4 : 6.0;
+        lo[4 * s] = lo[4 * s + 2] = std::log (1e-4); hi[4 * s] = hi[4 * s + 2] = std::log (1e4);
+        lo[4 * s + 1] = lo[4 * s + 3] = std::log (kLo); hi[4 * s + 1] = hi[4 * s + 3] = std::log (kHi);
+        th[4 * s] = std::log (c[s].g); th[4 * s + 1] = std::log (c[s].k); th[4 * s + 2] = std::log (c[s].gz); th[4 * s + 3] = std::log (c[s].kz);
+    }
+    double th0[NP], thc[NP];
+    for (int a = 0; a < np; ++a) th0[a] = thc[a] = th[a] = std::clamp (th[a], lo[a], hi[a]);
+    for (int s = 0; s < m; ++s)
+        if (wide[s] && ctr != nullptr)
+        {
+            thc[4 * s] = std::log (ctr[s].g); thc[4 * s + 1] = std::log (ctr[s].k); thc[4 * s + 2] = std::log (ctr[s].gz); thc[4 * s + 3] = std::log (ctr[s].kz);
+        }
+    int nPass = 0;
+    double lw[CGrid::maxPts], e[CGrid::maxPts];
+    for (int i = 0; i < p.n; ++i) lw[i] = 1.0;
+
+    // une passe : coût, écart max, équations normales (triangle inférieur)
+    auto pass = [&] (const double* t, double (*Nn)[NP], double* r, double& emax)
+    {
+        double ig2[NP / 4], k2[NP / 4], igz2[NP / 4], kz2[NP / 4];
+        for (int s = 0; s < m; ++s) { ig2[s] = std::exp (-2.0 * t[4 * s]); k2[s] = std::exp (2.0 * t[4 * s + 1]); igz2[s] = std::exp (-2.0 * t[4 * s + 2]); kz2[s] = std::exp (2.0 * t[4 * s + 3]); }
+        double cost = 0; emax = 0;
+        ++nPass;
+        for (int a = 0; a < np; ++a)
+        {
+            for (int b = 0; b < a; ++b) Nn[a][b] = 0;
+            const double dt = t[a] - th0[a];
+            Nn[a][a] = corrPullMin; r[a] = corrPullMin * dt; cost += corrPullMin * dt * dt;
+        }
+        for (int s = 0; s < m; ++s)
+        {
+            if (wide[s])
+                for (int a = 4 * s; a < 4 * s + 4; ++a) { const double dt = t[a] - thc[a]; Nn[a][a] += pull; r[a] += pull * dt; cost += pull * dt * dt; }
+            else
+                for (int a = 4 * s; a < 4 * s + 2; ++a)
+                {
+                    const double dt = t[a + 2] - t[a];   // ln (gz / g), ln (kz / k)
+                    Nn[a][a] += pull; Nn[a + 2][a + 2] += pull; Nn[a + 2][a] -= pull;
+                    r[a] -= pull * dt; r[a + 2] += pull * dt; cost += pull * dt * dt;
+                }
+        }
+        for (int i = 0; i < p.n; ++i)
+        {
+            if (! (p.wt[i] > 0)) { e[i] = 0; continue; }
+            double q = 1.0 / p.R[i], J[NP];
+            for (int s = 0; s < m; ++s)
+            {
+                const double v = p.t2[i] * ig2[s], vz = p.t2[i] * igz2[s];
+                const double f = (1.0 - v) * (1.0 - v) + k2[s] * v, fz = (1.0 - vz) * (1.0 - vz) + kz2[s] * vz;
+                const double invf = 1.0 / f, invfz = 1.0 / fz;
+                q *= fz * invf;
+                J[4 * s] = -2.0 * v * (2.0 * (1.0 - v) - k2[s]) * invf; J[4 * s + 1] = -2.0 * k2[s] * v * invf;
+                J[4 * s + 2] = 2.0 * vz * (2.0 * (1.0 - vz) - kz2[s]) * invfz; J[4 * s + 3] = 2.0 * kz2[s] * vz * invfz;
+            }
+            // écart symétrique ≈ ln q, sans logarithme : 2 (q − 1)/(q + 1)
+            const double iq = 1.0 / (q + 1.0);
+            const double res = 2.0 * (q - 1.0) * iq, dq = 4.0 * q * iq * iq;
+            e[i] = p.wt[i] * std::abs (res);
+            emax = std::max (emax, e[i]);
+            const double om = p.wt[i] * lw[i], y = om * res, oj = om * dq;
+            cost += y * y;
+            for (int a = 0; a < np; ++a) { J[a] *= oj; r[a] += J[a] * y; for (int b = 0; b <= a; ++b) Nn[a][b] += J[a] * J[b]; }
+        }
+        return cost;
+    };
+
+    double N[NP][NP], rhs[NP];
+    double emax = 0, best = 1e300, bestTh[NP];
+    auto keep = [&] { if (emax < best) { best = emax; for (int a = 0; a < np; ++a) bestTh[a] = th[a]; } };
+    double cost = pass (th, N, rhs, emax);
+    double lambda = 1e-2;
+    int sinceLawson = 0, lawsonRounds = 0;
+    if (track)
+    {
+        if (emax > 0)
+        {
+            for (int i = 0; i < p.n; ++i) { const double x = e[i] / emax; lw[i] = x * x + 0.1; }
+            cost = pass (th, N, rhs, emax);
+        }
+        lambda = 1e-3;
+        for (int it = 0; it < maxIt; ++it)
+        {
+            double M[NP][NP], dlt[NP];
+            for (int a = 0; a < np; ++a)
+            {
+                for (int b = 0; b < a; ++b) M[a][b] = N[a][b];
+                M[a][a] = N[a][a] * (1.0 + lambda) + 1e-14;
+                dlt[a] = -rhs[a];
+            }
+            if (! cholSolve (M, dlt, np)) { lambda *= 10.0; if (lambda > 1e8) break; continue; }
+            double tn[NP], N2[NP][NP], r2[NP], em2 = 0;
+            for (int a = 0; a < np; ++a) tn[a] = std::clamp (th[a] + std::clamp (dlt[a], -1.0, 1.0), lo[a], hi[a]);
+            const double c2 = pass (tn, N2, r2, em2);
+            if (c2 < cost)
+            {
+                const bool done = c2 > 0.97 * cost;
+                for (int a = 0; a < np; ++a) { th[a] = tn[a]; rhs[a] = r2[a]; for (int b = 0; b <= a; ++b) N[a][b] = N2[a][b]; }
+                cost = c2; emax = em2; lambda = std::max (1e-7, lambda * 0.3);
+                if (done || emax < stopAt) break;
+            }
+            else { lambda *= 6.0; if (lambda > 1e6) break; }
+        }
+        if (passes != nullptr) *passes += nPass;
+        for (int s = 0; s < m; ++s) { c[s].g = std::exp (th[4 * s]); c[s].k = std::exp (th[4 * s + 1]); c[s].gz = std::exp (th[4 * s + 2]); c[s].kz = std::exp (th[4 * s + 3]); }
+        return emax;
+    }
+    for (int it = 0; it < maxIt; ++it)
+    {
+        keep();
+        if (best < stopAt) break;
+        double M[NP][NP], dlt[NP];
+        for (int a = 0; a < np; ++a)
+        {
+            for (int b = 0; b < a; ++b) M[a][b] = N[a][b];
+            M[a][a] = N[a][a] * (1.0 + lambda) + 1e-14;
+            dlt[a] = -rhs[a];
+        }
+        if (! cholSolve (M, dlt, np)) { lambda *= 10.0; if (lambda > 1e8) break; continue; }
+        double tn[NP], N2[NP][NP], r2[NP], em2 = 0;
+        for (int a = 0; a < np; ++a) tn[a] = std::clamp (th[a] + std::clamp (dlt[a], -1.0, 1.0), lo[a], hi[a]);
+        const double c2 = pass (tn, N2, r2, em2);
+        const bool better = c2 < cost;
+        const bool stalled = better && c2 > 0.998 * cost;
+        if (better)
+        {
+            for (int a = 0; a < np; ++a) { th[a] = tn[a]; rhs[a] = r2[a]; for (int b = 0; b <= a; ++b) N[a][b] = N2[a][b]; }
+            cost = c2; emax = em2; lambda = std::max (1e-7, lambda * 0.3);
+        }
+        else lambda *= 6.0;
+        ++sinceLawson;
+        if ((stalled || lambda > 1e5 || sinceLawson >= 10) && it < maxIt - 2)
+        {
+            // poids de Lawson : les points où l'écart est le plus grand pèsent davantage
+            keep();
+            if (++lawsonRounds > 4) break;
+            pass (th, N, rhs, emax);   // (e[] du point courant)
+            double mx = 0;
+            for (int i = 0; i < p.n; ++i) { lw[i] *= std::max (e[i], 1e-9); mx = std::max (mx, lw[i]); }
+            for (int i = 0; i < p.n; ++i) lw[i] = lw[i] / mx + 0.03;
+            cost = pass (th, N, rhs, emax);
+            lambda = 1e-2; sinceLawson = 0;
+        }
+    }
+    keep();
+    if (passes != nullptr) *passes += nPass;
+    for (int s = 0; s < m; ++s) { c[s].g = std::exp (bestTh[4 * s]); c[s].k = std::exp (bestTh[4 * s + 1]); c[s].gz = std::exp (bestTh[4 * s + 2]); c[s].kz = std::exp (bestTh[4 * s + 3]); }
+    return best;
+}
+
+inline int& statPasses() { static thread_local int n = 0; return n; }   // (mesure du coût : passes d'ajustement)
+
+// Section d'une conception existante → (g, k, gz, kz) de la version non inversée. Faux si impossible.
+inline bool fromHint (const Section& s, bool invert, Corr& c)
+{
+    if (s.kind != Section::svf) return false;
+    const double n2 = s.m0, n1 = s.m0 * s.k + s.m1, n0 = s.m0 + s.m2;
+    if (! (n2 > 1e-12 && n1 > 1e-12 && n0 > 1e-12 && s.g > 0 && s.k > 0)) return false;
+    c.g = s.g; c.k = s.k; c.gz = s.g * std::sqrt (n0 / n2); c.kz = n1 / std::sqrt (n0 * n2);
+    if (invert) { std::swap (c.g, c.gz); std::swap (c.k, c.kz); }
+    return std::isfinite (c.g + c.k + c.gz + c.kz);
+}
+
+// Zone utile des formes qui atténuent : sous ce niveau (puissance), l'écart relatif compte de moins en moins
+enum class Soft { none, cut, notch };
+
+// Résultat de la correction d'une bande
+struct Corrected
+{
+    bool replaced[maxSections] {};   // section de base réajustée avec les corrections
+    Corr base[maxSections]; double baseGain[maxSections] {};
+    int n = 0;
+    Corr c[maxCorrections];
+};
+
+// Calcule jusqu'à maxCorr sections de correction pour la bande bq[0..n). feat : (W, Q) des résonances
+// et des zéros. freeBase : les sections de base (les maxFreeBase plus résonantes) sont réajustées en
+// même temps que les corrections : conception directe du module, en partant de la conception matched.
+// Les sections à zéros imposés (coupe-bas, passe-bande, notch) ne sont jamais réajustées.
+// hint : sections d'une conception voisine de la même bande (réglages proches), pour repartir de sa
+// solution : quelques passes suffisent, et la solution suit continûment les réglages.
+inline void correct (const ASec* as, int na, const double (*feat)[2], int nfeat, Soft soft, double fs,
+                     const Bq* bq, int n, int maxCorr, bool freeBase, bool invert, const Section* hint, int hintN,
+                     int cutSide, int cutOrder, Corrected& out)
+{
+    out.n = 0;
+    for (int i = 0; i < n; ++i) out.replaced[i] = false;
+    if (maxCorr <= 0) return;
+    const CGrid& g = cgridFor (fs);
+    CPts p;
+    p.n = g.n;
+    for (int i = 0; i < g.n; ++i) { p.w[i] = g.w[i]; p.wt[i] = g.wt[i]; }
+    const double wLo = 2.0 * pi * 20.0 / fs;
+    for (int f = 0; f < nfeat; ++f)
+    {
+        const double W = feat[f][0], d = 0.5 / std::max (0.5, feat[f][1]);
+        if (! (W > 0)) continue;
+        for (double m : { -1.0, -0.5, 0.0, 0.5, 1.0 })
+        {
+            const double w = W * std::pow (2.0, m * d);
+            if (w > wLo && w < g.top && p.n < CGrid::maxPts)
+            {
+                p.w[p.n] = w; p.wt[p.n] = w <= g.wAudible ? 1.0 : CGrid::aboveWeight;
+                ++p.n;
+            }
+        }
+    }
+    if (soft == Soft::cut && cutOrder > 0 && nfeat > 0)
+    {
+        // coupes, passe-bande : la pente jusqu'au bas de la zone utile (−27 dB) est échantillonnée de près
+        // (cutSide : +1 coupe-haut, −1 coupe-bas, 0 les deux côtés)
+        const double span = std::pow (10.0, 2.7 / (2.0 * cutOrder));
+        for (int side : { -1, 1 })
+        {
+            // côté atténué : 6 points jusqu'à −27 dB ; côté passant d'une coupe : 4 points sur une demi-octave
+            const bool stopSide = cutSide == 0 || side == cutSide;
+            for (int j = 1; j <= (stopSide ? 6 : 4); ++j)
+            {
+                const double w = feat[0][0] * (stopSide ? std::pow (span, side * j / 6.0) : std::pow (2.0, side * j / 8.0));
+                if (w > wLo && w < g.top && p.n < CGrid::maxPts)
+                {
+                    p.w[p.n] = w; p.wt[p.n] = w <= g.wAudible ? 1.0 : CGrid::aboveWeight;
+                    ++p.n;
+                }
+            }
+        }
+    }
+    const double floorP = soft == Soft::cut ? 2.0e-3 : 0.25;   // −27 dB (coupes, passe-bande) ; −6 dB (notch)
+    double e0 = 0, T[CGrid::maxPts];
+    Phi ph[CGrid::maxPts];
+    int worst = 0;
+    for (int i = 0; i < p.n; ++i)
+    {
+        ph[i] = phi (p.w[i]);
+        p.t2[i] = ph[i].p1 / ph[i].p0;
+        double D = 1.0;
+        T[i] = 1.0;
+        for (int j = 0; j < na; ++j) T[i] *= mag2 (as[j], p.w[i]);
+        for (int j = 0; j < n; ++j) D *= bqMag2 (bq[j], ph[i]);
+        if (! (T[i] > 1e-200 && D > 1e-200 && std::isfinite (T[i]) && std::isfinite (D))) { p.R[i] = 1.0; T[i] = 0.0; p.wt[i] = 0.0; continue; }
+        if (soft != Soft::none && T[i] < floorP) p.wt[i] *= T[i] / floorP;
+        p.R[i] = T[i] / D;
+        const double e = p.wt[i] * ratioErr (p.R[i]);
+        if (e > e0) { e0 = e; worst = i; }
+    }
+    if (e0 <= corrThreshold) return;
+
+    // sections de base réajustées : mises sous la forme (g, k, gz, kz, gain)
+    int freeIdx[maxFreeBase], nb = 0;
+    Corr cur[maxFreeBase + maxCorrections];
+    double gain[maxFreeBase];
+    bool wide[maxFreeBase + maxCorrections];
+    if (freeBase)
+    {
+        Corr rep[maxSections]; double rg[maxSections]; bool ok[maxSections];
+        for (int i = 0; i < n; ++i)
+        {
+            Section sb;
+            ok[i] = toSection (bq[i], false, sb);
+            if (! ok[i]) continue;
+            const double n2 = sb.m0, n1 = sb.m0 * sb.k + sb.m1, n0 = sb.m0 + sb.m2;
+            ok[i] = n2 > 1e-9 * n0 && n1 > 1e-9 * n0 && n0 > 1e-12;
+            if (ok[i]) { rep[i].g = sb.g; rep[i].k = sb.k; rep[i].gz = sb.g * std::sqrt (n0 / n2); rep[i].kz = n1 / std::sqrt (n0 * n2); rg[i] = n0; }
+            else if (n == 1 && as[0].svf && as[0].m0 > 0 && as[0].m0 + as[0].m2 > 0 && as[0].m0 * as[0].k + as[0].m1 > 0)
+            {
+                // numérateur matched inutilisable (zéro sur le cercle) : pôles matched, zéros de l'analogique
+                // reportés à leur fréquence (étagères très résonantes près de Nyquist)
+                const auto& a = as[0];
+                const double Wz = a.W * std::sqrt ((a.m0 + a.m2) / a.m0), kz = (a.m0 * a.k + a.m1) / std::sqrt (a.m0 * (a.m0 + a.m2));
+                rep[i].g = sb.g; rep[i].k = sb.k;
+                rep[i].gz = Wz < 0.98 * pi ? std::tan (0.5 * Wz) : std::tan (0.49 * pi) * Wz / (0.98 * pi);
+                rep[i].kz = kz * sb.k / a.k; rg[i] = a.m0 + a.m2;
+                ok[i] = true;
+            }
+        }
+        while (nb < maxFreeBase)
+        {
+            int bi = -1;   // la plus résonante parmi celles qui restent
+            for (int i = 0; i < n; ++i)
+            {
+                bool used = ! ok[i];
+                for (int j = 0; j < nb; ++j) used = used || freeIdx[j] == i;
+                if (! used && (bi < 0 || rep[i].k < rep[bi].k)) bi = i;
+            }
+            if (bi < 0) break;
+            freeIdx[nb] = bi; cur[nb] = rep[bi]; gain[nb] = rg[bi]; ++nb;
+        }
+        // cible des sections libres : analogique / (sections figées × gains)
+        e0 = 0;
+        for (int i = 0; i < p.n; ++i)
+        {
+            if (! (p.wt[i] > 0)) continue;
+            double D = 1.0;
+            for (int j = 0; j < n; ++j)
+            {
+                bool isFree = false;
+                for (int f = 0; f < nb; ++f) isFree = isFree || freeIdx[f] == j;
+                if (! isFree) D *= bqMag2 (bq[j], ph[i]);
+            }
+            for (int f = 0; f < nb; ++f) D *= gain[f] * gain[f];
+            p.R[i] = T[i] / D;
+            double q = 1.0 / p.R[i];
+            for (int f = 0; f < nb; ++f) q *= corrMag2 (cur[f], p.t2[i]);
+            const double e = p.wt[i] * ratioErr (q);
+            if (e > e0) { e0 = e; worst = i; }
+        }
+    }
+    for (int i = 0; i < maxFreeBase + maxCorrections; ++i) wide[i] = i < nb;
+    // rappel vers la conception sans correction : fort juste au-dessus du seuil, faible ensuite
+    const double x = corrThreshold / e0;
+    const double pull = std::max (corrPullFar, corrPullNear * x * x * x);
+    Corr ctr[maxFreeBase + maxCorrections];
+    for (int f = 0; f < nb; ++f) ctr[f] = cur[f];
+    int m = nb;          // sections actuellement ajustées (base comprise)
+    bool tracked = false;
+    if (hint != nullptr && hintN > n && hintN - n <= maxCorr)
+    {
+        const int mh = hintN - n;
+        Corr t[maxFreeBase + maxCorrections];
+        bool okH = true;
+        for (int f = 0; f < nb; ++f) if (! fromHint (hint[freeIdx[f]], invert, t[f])) t[f] = cur[f];
+        for (int j = 0; j < mh; ++j) okH = okH && fromHint (hint[n + j], invert, t[nb + j]);
+        if (okH)
+        {
+            double e = fitSections (p, t, wide, nb + mh, corrHintIterations, 0.5 * corrThreshold, ctr, pull, true, &statPasses());
+            // le suivi ne suffit plus : recherche complète à partir de la solution suivie (elle reste voisine)
+            if (e > corrThresholdTrack) e = fitSections (p, t, wide, nb + mh, corrIterations / 2, corrThreshold2, ctr, pull, false, &statPasses());
+            if (e <= corrThresholdKeep)
+            {
+                // (si l'écart reste au-dessus du seuil de suivi, la boucle ci-dessous ajoute une section à cette solution)
+                m = nb + mh; e0 = e; tracked = true;
+                for (int i = 0; i < m; ++i) cur[i] = t[i];
+            }
+        }
+    }
+    const double eStart = e0;
+    const int mStart = m;
+    while (m - nb < maxCorr && e0 > (m == nb ? corrThreshold : tracked ? corrThresholdTrack : corrThreshold2))
+    {
+        // on ajoute une section neutre (là où l'écart est le plus grand, ou tout en haut du spectre) et on réajuste tout
+        Corr bestC[maxFreeBase + maxCorrections]; double e1 = 1e300;
+        for (int start = 0; start < corrStarts; ++start)
+        {
+            Corr t[maxFreeBase + maxCorrections];
+            for (int i = 0; i < m; ++i) t[i] = cur[i];
+            t[m] = Corr();
+            t[m].g = t[m].gz = start == 0 ? std::sqrt (std::max (1e-12, p.t2[worst])) : std::tan (0.47 * pi);
+            const double e = fitSections (p, t, wide, m + 1, corrIterations, corrThreshold, ctr, pull, false, &statPasses());
+            if (e < e1) { e1 = e; for (int i = 0; i <= m; ++i) bestC[i] = t[i]; }
+            if (e1 < corrThreshold2) break;
+        }
+        if (! (e1 < e0)) break;
+        ++m;
+        for (int i = 0; i < m; ++i) cur[i] = bestC[i];
+        e0 = e1;
+        // nouveau pire point (pour placer la section suivante)
+        double ew = 0;
+        for (int i = 0; i < p.n; ++i)
+        {
+            double q = 1.0 / p.R[i];
+            for (int j = 0; j < m; ++j) q *= corrMag2 (cur[j], p.t2[i]);
+            const double e = p.wt[i] * ratioErr (q);
+            if (e > ew) { ew = e; worst = i; }
+        }
+    }
+    // (un résidu qui oscille demande parfois deux sections d'un coup : on juge le gain à la fin)
+    if (m > mStart && ! tracked && ! (e0 < 0.8 * eStart)) return;
+    if (m == nb) return;
+    for (int f = 0; f < nb; ++f) { out.replaced[freeIdx[f]] = true; out.base[freeIdx[f]] = cur[f]; out.baseGain[freeIdx[f]] = gain[f]; }
+    out.n = m - nb;
+    for (int i = 0; i < out.n; ++i) out.c[i] = cur[nb + i];
 }
 } // namespace matched
 
 // Conception numérique « matched » (mode zéro latence, affichage, gain auto).
-inline void designMatched (const BandSpec& b, double fs, Design& d)
+// maxCorr : nombre maximal de sections de correction (0 = conception 2.0, pour les mesures « avant »).
+// hint : conception précédente de la même bande (mêmes forme et pente, réglages voisins), ou nul.
+inline void designMatched (const BandSpec& b, double fs, Design& d, int maxCorr = maxCorrections, const Design* hint = nullptr)
 {
+    Section hs[maxSections];
+    const int hintN = hint != nullptr ? hint->n : 0;
+    for (int i = 0; i < hintN; ++i) hs[i] = hint->s[(size_t) i];
     d.n = 0;
     d.outGain = 1.0;
     // bande à 0 dB : traversée exacte (aucune section)
@@ -610,6 +1144,10 @@ inline void designMatched (const BandSpec& b, double fs, Design& d)
     designClassic (proto, fs, ad, true);
     const double A = std::pow (10.0, std::abs (proto.gainDb) / 40.0);
 
+    matched::ASec as[maxSections];
+    matched::Bq bq[maxSections];
+    double feat[4][2];
+    int n = 0, nfeat = 0;
     for (int i = 0; i < ad.n; ++i)
     {
         const auto a = matched::fromSection (ad.s[(size_t) i]);
@@ -621,22 +1159,83 @@ inline void designMatched (const BandSpec& b, double fs, Design& d)
             case Shape::bell:      Qz = std::clamp (b.q, 0.025, 40.0) / A; break;
             case Shape::lowShelf:  Wz = a.W * A; Qz = 1.0 / a.k; break;
             case Shape::highShelf:
-            case Shape::tiltShelf: Wz = a.W / A; Qz = 1.0 / a.k; break;
+            // (la version conçue est toujours l'atténuation : ses zéros sont au-dessus des pôles, en W·A.
+            //  La 2.0 les cherchait en W/A ; on garde ce repère pour maxCorr = 0, qui sert de mesure « avant ».)
+            case Shape::tiltShelf: Wz = maxCorr > 0 ? a.W * A : a.W / A; Qz = 1.0 / a.k; break;
             case Shape::lowCut:    kind = matched::Kind::highpass; break;
             case Shape::highCut:   kind = matched::Kind::lowpassLike; break;
             case Shape::bandPass:  kind = matched::Kind::bandpass; break;
             case Shape::notch:     kind = matched::Kind::notch; break;
         }
-        Section s;
-        if (! matched::section (a, kind, Wz, Qz, fs, invert && a.svf, s))
+        if (! matched::sectionBiquad (a, kind, Wz, Qz, fs, bq[n]))
         {
             // secours (ne devrait pas arriver) : conception bilinéaire de cette bande
             designClassic (b, fs, d, false);
             return;
         }
+        as[n++] = a;
+        // repères pour la correction : résonance la plus marquée et zéros (une seule fréquence de coupure par bande)
+        if (i == ad.n - 1)
+        {
+            feat[nfeat][0] = a.W; feat[nfeat++][1] = a.svf ? 1.0 / a.k : 0.5;
+            if (hasGain (b.shape) && a.svf) { feat[nfeat][0] = Wz; feat[nfeat++][1] = Qz; }
+        }
+    }
+    // sections de correction : ajustées sur la version non inversée, puis inversées avec le reste
+    // (une atténuation reste l'inverse exact de l'accentuation)
+    const int nBase = n;
+    const auto soft = b.shape == Shape::notch ? matched::Soft::notch
+                    : (isCut (b.shape) || b.shape == Shape::bandPass) ? matched::Soft::cut : matched::Soft::none;
+    matched::Corrected cr;
+    matched::correct (as, nBase, feat, nfeat, soft, fs, bq, n, std::min (maxCorr, std::min (maxCorrections, maxSections - nBase)),
+                      hasGain (b.shape) || b.shape == Shape::highCut, invert, hintN > 0 ? hs : nullptr, hintN,
+                      b.shape == Shape::highCut ? 1 : b.shape == Shape::lowCut ? -1 : 0,
+                      isCut (b.shape) ? std::clamp (b.slope / 6, 1, 16) : b.shape == Shape::bandPass ? std::clamp (b.slope / 12, 1, 8) : 0, cr);
+
+    for (int i = 0; i < n; ++i)
+    {
+        Section s;
+        if (cr.replaced[i]) matched::corrToSection (cr.base[i], invert, cr.baseGain[i], s);
+        else if (! matched::toSection (bq[i], invert, s))
+        {
+            designClassic (b, fs, d, false);   // secours (ne devrait pas arriver)
+            return;
+        }
         d.s[(size_t) d.n++] = s;
     }
+    for (int i = 0; i < cr.n; ++i) matched::corrToSection (cr.c[i], invert, 1.0, d.s[(size_t) d.n++]);
     if (b.shape == Shape::tiltShelf) d.outGain = std::pow (10.0, -b.gainDb / 40.0);
+}
+
+// Écart max d'une conception numérique d au prototype analogique de b, de 20 Hz à 20 kHz, sur les
+// points de calcul de la correction (rapport de puissances − 1 : 0,0023 ≈ 0,01 dB). Sert à vérifier
+// qu'une conception interpolée entre deux autres (bandes dynamiques) reste exacte.
+inline double designError (const BandSpec& b, double fs, const Design& d)
+{
+    BandSpec proto = b;
+    proto.freq = std::clamp (b.freq, 5.0, 0.49 * fs);
+    Design ad;
+    designClassic (proto, fs, ad, true);
+    const matched::CGrid& g = matched::cgridFor (fs);
+    const double W = 2.0 * pi * proto.freq / fs, dq = 0.25 / std::max (0.5, b.q);
+    const double extra[3] = { W * std::pow (2.0, -dq), W, W * std::pow (2.0, dq) };
+    double e = 0;
+    for (int i = 0; i < g.n + 3; ++i)
+    {
+        const double w = i < g.n ? g.w[i] : extra[i - g.n];
+        if (! (w <= g.wAudible)) continue;
+        double T = ad.outGain * ad.outGain, D = d.outGain * d.outGain;
+        for (int j = 0; j < ad.n; ++j) T *= matched::mag2 (matched::fromSection (ad.s[(size_t) j]), w);
+        const double tn = std::tan (0.5 * w);
+        for (int j = 0; j < d.n; ++j)
+        {
+            matched::ASec a = matched::fromSection (d.s[(size_t) j]);
+            a.W = d.s[(size_t) j].g;   // (domaine du SVF : s = j·tan(ω/2)/g)
+            D *= matched::mag2 (a, tn);
+        }
+        if (T > 1e-200 && D > 1e-200) e = std::max (e, matched::ratioErr (D / T));
+    }
+    return e;
 }
 
 // Conception d'une bande : analog = prototype analogique (FIR, référence), sinon numérique « matched ».
