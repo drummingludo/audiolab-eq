@@ -1,8 +1,11 @@
 // Test du plugin complet hors DAW : presets, annuler/rétablir, A/B, sauvegarde de l'état,
 // latences (Linear phase Auto / Low…Max, Natural phase), bypass recalé, changement de mode sans clic,
-// projets 1.x, side-chain externe, mono, blocs de tailles variables, charge CPU.
+// projets 1.x, side-chain externe, mono, blocs de tailles variables, charge CPU,
+// coût des modes FIR avec des bandes dynamiques.
 #include "PluginProcessor.h"
 #include <thread>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 
 namespace P = audiolab::params;
@@ -330,6 +333,160 @@ int main()
             const double sec = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0);
             std::printf ("8. Charge %s : %.1f %% d'un cœur (10 s d'audio traités en %.2f s, FIR %d points)\n",
                          mode == 0 ? "zéro latence" : mode == 1 ? "phase linéaire" : "phase naturelle", 100.0 * sec / 10.0, sec, p.activeFirLength());
+        }
+    }
+
+    // coût des modes FIR avec 0, 1 ou 4 bandes dynamiques, en temps réel (3 s par cas) : temps du fil
+    // audio (processBlock) et temps des autres fils du plugin (conception des FIR)
+    {
+        std::printf ("11. Coût des modes FIR, bandes dynamiques en action (%% d'un cœur ; fil audio + fil de conception)\n");
+        auto cpuNow = [] (clockid_t id) { timespec ts; clock_gettime (id, &ts); return (double) ts.tv_sec + 1e-9 * (double) ts.tv_nsec; };
+        for (int mode = 1; mode <= 2; ++mode)
+            for (int res : { P::resMediumIndex, 4 })
+            {
+                if (mode == 2 && res == 4) continue;   // Natural phase : pas de réglage de longueur
+                for (int nd : { 0, 1, 4 })
+                {
+                    AudioLabEqProcessor p;
+                    p.setPlayConfigDetails (2, 2, 48000, 512);
+                    p.clearAllBands();
+                    p.createBand (audiolab::eq::Shape::lowCut, 40.0f, 0.0f, 0.71f, 12);
+                    p.createBand (audiolab::eq::Shape::highShelf, 12000.0f, 3.0f, 0.71f, 12);
+                    const float fr[4] = { 150.0f, 700.0f, 3000.0f, 9000.0f };
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const int b = p.createBand (audiolab::eq::Shape::bell, fr[k], 2.0f, 4.0f, 12);
+                        if (k < nd) { p.setBandValue (b, P::fDyn, 1); p.setBandValue (b, P::fThr, -45); p.setBandValue (b, P::fRange, -12); p.setBandValue (b, P::fAtt, 5); p.setBandValue (b, P::fRel, 80); }
+                    }
+                    p.setValue (p.apvts.getParameter (P::phase), (float) mode);
+                    p.setValue (p.apvts.getParameter (P::linRes), (float) res);
+                    p.prepareToPlay (48000, 512);
+                    juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi; juce::Random rnd (5);
+                    const int blocks = 281;   // 3 s
+                    const int designs0 = p.firDesignCount();
+                    double audio = 0; int64_t t = 0;
+                    const double proc0 = cpuNow (CLOCK_PROCESS_CPUTIME_ID), main0 = cpuNow (CLOCK_THREAD_CPUTIME_ID);
+                    const auto wall0 = std::chrono::steady_clock::now();
+                    for (int k = 0; k < blocks; ++k)
+                    {
+                        for (int i = 0; i < 512; ++i, ++t)
+                        {
+                            const float env = 0.5f + 0.5f * (float) std::sin (2 * juce::MathConstants<double>::pi * 3.0 * (double) t / 48000);
+                            const float v = env * (rnd.nextFloat() * 0.6f - 0.3f);
+                            buf.setSample (0, i, v); buf.setSample (1, i, 0.8f * v);
+                        }
+                        const double a0 = cpuNow (CLOCK_THREAD_CPUTIME_ID);
+                        p.processBlock (buf, midi);
+                        audio += cpuNow (CLOCK_THREAD_CPUTIME_ID) - a0;
+                        std::this_thread::sleep_until (wall0 + std::chrono::microseconds ((int64_t) (k + 1) * 10667));
+                    }
+                    const double others = (cpuNow (CLOCK_PROCESS_CPUTIME_ID) - proc0) - (cpuNow (CLOCK_THREAD_CPUTIME_ID) - main0), dur = blocks * 512 / 48000.0;
+                    std::printf ("   %s, FIR %5d points, %d bande(s) dynamique(s) : fil audio %5.2f %% ; fil de conception %5.2f %% (%d conception(s) pendant la lecture)\n",
+                                 mode == 1 ? "Linear " : "Natural", p.activeFirLength(), nd, 100.0 * audio / dur, 100.0 * others / dur, p.firDesignCount() - designs0);
+                    // 3.0 : le mouvement d'une bande dynamique ne fait plus reconcevoir le FIR
+                    CHECK (p.firDesignCount() - designs0 <= 2, "reconceptions pendant la lecture (%d)", p.firDesignCount() - designs0);
+                }
+            }
+    }
+
+    // bandes dynamiques dans les modes FIR (3.0) : le plugin complet, avec son fil de conception
+    {
+        std::printf ("12. Bandes dynamiques dans les modes FIR (Linear : mélange de FIR ; Natural : moteur zéro latence après le FIR)\n");
+        const double twoPi = 2 * juce::MathConstants<double>::pi;
+        for (int mode = 1; mode <= 2; ++mode)
+        {
+            const char* mn = mode == 1 ? "Linear " : "Natural";
+            AudioLabEqProcessor p;
+            p.setPlayConfigDetails (2, 2, 48000, 512);
+            p.clearAllBands();
+            p.createBand (audiolab::eq::Shape::lowCut, 40.0f, 0.0f, 0.71f, 12);
+            const int b = p.createBand (audiolab::eq::Shape::bell, 1000.0f, 0.0f, 2.0f, 12);
+            p.setBandValue (b, P::fDyn, 1); p.setBandValue (b, P::fThr, -30); p.setBandValue (b, P::fRange, -10);
+            p.setBandValue (b, P::fAtt, 2); p.setBandValue (b, P::fRel, 50);
+            p.setValue (p.apvts.getParameter (P::phase), (float) mode);
+            p.setValue (p.apvts.getParameter (P::linRes), 1.0f);   // Low
+            p.editorOpen = true;
+            p.prepareToPlay (48000, 512);
+            juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi;
+            int64_t t = 0;
+            auto run = [&] (int blocks, float amp, bool pace, float* maxStep = nullptr)
+            {
+                float peak = 0, last = 0; bool have = false;
+                for (int k = 0; k < blocks; ++k)
+                {
+                    for (int i = 0; i < 512; ++i, ++t)
+                    {
+                        const float v = amp * (float) std::sin (twoPi * 1000.0 * (double) t / 48000);
+                        buf.setSample (0, i, v); buf.setSample (1, i, v);
+                    }
+                    p.processBlock (buf, midi);
+                    if (pace) std::this_thread::sleep_for (std::chrono::milliseconds (2));
+                    peak = 0;
+                    for (int i = 0; i < 512; ++i)
+                    {
+                        const float y = buf.getSample (0, i);
+                        peak = std::max (peak, std::abs (y));
+                        if (maxStep != nullptr && have) *maxStep = std::max (*maxStep, std::abs (y - last));
+                        last = y; have = true;
+                    }
+                }
+                return peak;
+            };
+            const float loud = run (150, 0.3f, true);
+            const double gLoud = juce::Decibels::gainToDecibels (loud / 0.3f);
+            const float dynNow = p.getDynOffset (b);
+            audiolab::eq::LinearPhase::DisplayData dd;
+            p.getFirDisplay (dd);
+            int k1 = 0;
+            for (int i = 0; i < audiolab::eq::LinearPhase::displayPoints; ++i) if (std::abs (dd.freq[(size_t) i] - 1000.0f) < std::abs (dd.freq[(size_t) k1] - 1000.0f)) k1 = i;
+            const float quiet = run (150, 0.001f, true);
+            const double gQuiet = juce::Decibels::gainToDecibels (quiet / 0.001f);
+            std::printf ("   %s : latence %d ; sinus 1 kHz fort → gain mesuré %.2f dB (détecteur %.2f dB) ; sinus faible → %.2f dB ;\n"
+                         "             courbe du FIR à 1 kHz %.2f dB, bandes ajoutées par l'écran : moteur %#x, mélange %#x\n",
+                         mn, p.getLatencySamples(), gLoud, dynNow, gQuiet, dd.lr0[(size_t) k1], dd.engineMask, dd.mixMask);
+            CHECK (p.getLatencySamples() == (mode == 1 ? 2304 : 384), "%s : latence %d", mn, p.getLatencySamples());
+            CHECK (std::abs (gLoud + 10.0) < 0.15 && std::abs (dynNow + 10.0f) < 0.05f, "%s : gain dynamique au centre (%.2f dB)", mn, gLoud);
+            CHECK (std::abs (gQuiet) < 0.05, "%s : sous le seuil, gain %.2f dB", mn, gQuiet);
+            CHECK (dd.valid && std::abs (dd.lr0[(size_t) k1]) < 0.1f, "%s : la courbe du FIR ne doit pas contenir le mouvement de la bande dynamique", mn);
+            CHECK (mode == 1 ? (dd.mixMask == (1u << b) && dd.engineMask == 0) : (dd.engineMask == (1u << b) && dd.mixMask == 0), "%s : bandes signalées à l'écran", mn);
+
+            // passage dyn off / on d'une bande à +6 dB sous son seuil, pendant un sinus : pas de saut
+            p.setBandValue (b, P::fGain, 6.0f); p.setBandValue (b, P::fThr, 0.0f);
+            run (120, 0.05f, true);
+            float stepRef = 0, stepSw = 0;
+            run (40, 0.05f, true, &stepRef);
+            p.setBandValue (b, P::fDyn, 0);
+            run (60, 0.05f, true, &stepSw);
+            p.setBandValue (b, P::fDyn, 1);
+            const float pk = run (60, 0.05f, true, &stepSw);
+            std::printf ("             dyn off puis on sur un sinus : saut max entre deux échantillons %.5f (sans bascule %.5f), niveau final %.2f dB\n",
+                         stepSw, stepRef, juce::Decibels::gainToDecibels (pk / 0.05f));
+            CHECK (stepSw <= stepRef * 1.02f, "%s : clic au passage dyn on / off (%.5f contre %.5f)", mn, stepSw, stepRef);
+        }
+        // Linear phase : 6 bandes dynamiques dont 3 cloches larges très proches (bandes en trop : méthode 2.0), sortie valide
+        {
+            AudioLabEqProcessor p;
+            p.setPlayConfigDetails (2, 2, 48000, 512);
+            p.clearAllBands();
+            const float fr[6] = { 1000, 1200, 1440, 60, 12000, 250 };
+            for (int i = 0; i < 6; ++i)
+            {
+                const int b = p.createBand (audiolab::eq::Shape::bell, fr[i], 2.0f, i < 3 ? 1.0f : 8.0f, 12);
+                p.setBandValue (b, P::fDyn, 1); p.setBandValue (b, P::fThr, -50); p.setBandValue (b, P::fRange, i < 3 ? -12.0f : -6.0f);
+            }
+            p.setValue (p.apvts.getParameter (P::phase), 1.0f);
+            p.prepareToPlay (48000, 512);
+            juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi; juce::Random rnd (2);
+            bool bad = false;
+            for (int k = 0; k < 200; ++k)
+            {
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) buf.setSample (ch, i, (rnd.nextFloat() - 0.5f) * (k % 40 < 20 ? 0.5f : 0.02f));
+                p.processBlock (buf, midi);
+                std::this_thread::sleep_for (std::chrono::milliseconds (2));
+                for (int i = 0; i < 512; ++i) if (! std::isfinite (buf.getSample (0, i)) || std::abs (buf.getSample (0, i)) > 10) bad = true;
+            }
+            std::printf ("   Linear, 6 bandes dynamiques dont 2 en méthode 2.0 (%d conceptions en 2 s) : %s\n", p.firDesignCount(), bad ? "PROBLÈME" : "OK");
+            CHECK (! bad, "sortie invalide avec des bandes dynamiques en trop");
         }
     }
 

@@ -199,6 +199,33 @@ void EqDisplay::updateCurves()
                 totalCurve[(size_t) i] = ca[(size_t) k] + (ca[(size_t) k + 1] - ca[(size_t) k]) * t;
                 curveB[(size_t) i] = cb[(size_t) k] + (cb[(size_t) k + 1] - cb[(size_t) k]) * t;
             }
+            // Bandes dynamiques (3.0) : la courbe du FIR ne les contient pas (Natural phase : elles sont
+            // faites par le moteur zéro latence) ou les contient à leur gain de base (Linear phase : le
+            // mélange de FIR ajoute leur mouvement). On ajoute ce qui manque, avec le gain du moment.
+            for (int b = 0; b < maxBands; ++b)
+            {
+                const uint32_t bit = 1u << b;
+                const bool viaEngine = (dd.engineMask & bit) != 0, mixed = (dd.mixMask & bit) != 0;
+                if (! (viaEngine || mixed) || ! proc.isUsed (b)) continue;
+                auto s = proc.getBandSpec (b, true);
+                if (! s.active || ! hasGain (s.shape)) continue;
+                const float off = proc.getDynOffset (b);
+                if (mixed && off == 0.0f) continue;
+                Design base, moved;
+                if (mixed) design (s, fs, base, true);
+                s.gainDb += off;
+                // moteur : conception des bandes dynamiques (matched, sans section de correction)
+                if (viaEngine) designMatched (s, fs, moved, 0); else design (s, fs, moved, true);
+                const bool toA = s.place == Place::stereo || s.place == Place::left || s.place == Place::mid;
+                const bool toB = s.place == Place::stereo || s.place == Place::right || s.place == Place::side;
+                for (int i = 0; i < numCols; ++i)
+                {
+                    const double f = std::min (colFreq[(size_t) i], 0.4999 * fs);
+                    const float v = (float) (magnitudeDb (moved, f, fs, ! viaEngine) - (mixed ? magnitudeDb (base, f, fs, true) : 0.0));
+                    if (toA) totalCurve[(size_t) i] += v;
+                    if (toB) curveB[(size_t) i] += v;
+                }
+            }
         }
     }
 }

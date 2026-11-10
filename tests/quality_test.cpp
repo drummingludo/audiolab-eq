@@ -20,11 +20,21 @@
 // 14. Bande dynamique ET automatisée en même temps ; sortie indépendante de la taille des blocs de l'hôte
 // 15. Coût CPU du moteur (information, sans seuil)
 // 16. Sections de correction : coût (conception, sections par bande, traitement), bande dynamique dans l'aigu
+// Modes FIR avec bandes dynamiques (3.0), sur le code du plugin (LinearPhaseCore.h, FirBank.h, moteur) :
+// 17. Linear phase : résidu temporel d'une bande dynamique par rapport à l'idéal (avant / après)
+// 18. Linear phase : erreur de courbe du mélange de FIR (FIR réels, puis toutes formes et plages)
+// 19. Natural phase : bande dynamique faite par le moteur après le FIR, précision temporelle
+// 20. Bandes fixes inchangées dans les deux modes
+// 21. Linear phase : bandes dynamiques qui se recouvrent (paire, chaîne) ; répartition des bandes
+// 22. Passage dyn on / off d'une bande pendant la lecture : transitoire
+// 23. Coût des modes FIR avec 0, 1, 4 bandes dynamiques (FIR 8192 et 32768)
 #include "EqEngine.h"
 #include "FirDesign.h"
+#include "LinearPhaseCore.h"
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace audiolab::eq;
@@ -238,6 +248,271 @@ static void runSweep (int mode, int hostBlock, double lagSamples, std::vector<fl
         eng.process (l.data() + off, r.data() + off, std::min (blk, tot - off), false);
     }
 }
+
+// ── Outils des sections 17 à 23 : modes FIR avec bandes dynamiques ──────
+// FFT du banc (fir::fft, double) avec les conventions de juce::dsp::FFT : le banc exécute le même
+// code que le plugin (LinearPhaseCore.h), seule la FFT diffère.
+struct TestFft
+{
+    explicit TestFft (int order) : n (1 << order), w ((size_t) n) {}
+    void forward (float* d)
+    {
+        for (int i = 0; i < n; ++i) w[(size_t) i] = d[i];
+        fir::fft (w.data(), n, false);
+        for (int k = 0; k <= n / 2; ++k) { d[2 * k] = (float) w[(size_t) k].real(); d[2 * k + 1] = (float) w[(size_t) k].imag(); }
+    }
+    void inverse (float* d)
+    {
+        for (int k = 0; k <= n / 2; ++k) w[(size_t) k] = fir::cd (d[2 * k], d[2 * k + 1]);
+        for (int k = 1; k < n / 2; ++k) w[(size_t) (n - k)] = std::conj (w[(size_t) k]);
+        fir::fft (w.data(), n, true);
+        for (int i = 0; i < n; ++i) d[i] = (float) (w[(size_t) i].real() / n);
+    }
+    int n; std::vector<fir::cd> w;
+};
+using TestLinear = LinearPhaseT<TestFft>;
+
+// La chaîne des modes FIR, comme dans PluginProcessor::processBlock : retard du détecteur, moteur,
+// convolution. Le fil de conception est remplacé par des appels à redesign().
+struct FirRig
+{
+    TestLinear lp;
+    Engine eng;
+    fir::Mode mode = fir::Mode::linear;
+    double fs = 48000;
+    int N = 4096, lat = 0, w = 0;
+    bool legacy = false;                     // méthode 2.0 : reconception toutes les 25 ms, détecteur en avance de 30 ms
+    long count = 0, lastDesign = 0;
+    double lastKey = 0;
+    double designSec = 0;                    // temps passé dans redesign() (fil de conception du plugin)
+    std::array<BandSpec, maxBands> bands;
+    std::array<DynSettings, maxBands> dyn;
+    std::vector<float> ringL, ringR, scRing, detL, detR, scD, oldL, oldR, fadeT, trace;
+    std::array<const float*, maxBands> tracePtr {};
+    static constexpr int chunk = 1024;
+
+    TestLinear::Snapshot snapshot() const
+    {
+        TestLinear::Snapshot s;
+        s.bands = bands;
+        for (int b = 0; b < maxBands; ++b)
+            if (bands[(size_t) b].active && dyn[(size_t) b].on && canBeDynamic (bands[(size_t) b].shape))
+            { s.dyn.full[(size_t) b] = dyn[(size_t) b].rangeDb; s.dyn.now[(size_t) b] = eng.getDynOffset (b); }
+        return s;
+    }
+    void apply() { for (int b = 0; b < maxBands; ++b) eng.setBand (b, bands[(size_t) b], dyn[(size_t) b], 1.0); }
+    void redesign()
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        lp.collectGarbage();   // (comme le fil de conception du plugin : sans cela, plus aucun jeu n'est installé après 8)
+        lp.design (snapshot(), mode, N, false);
+        designSec += std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+    }
+    void start (double rate, fir::Mode m, int length)
+    {
+        fs = rate; mode = m; N = length;
+        eng.prepare (fs); lp.legacyDynamics = legacy; lp.prepare (fs);
+        lat = lp.latencyFor (mode, N);
+        const size_t ring = (size_t) (fir::maxLength (fs) / 2 + lp.partition() + chunk + 1);
+        ringL.assign (ring, 0.0f); ringR.assign (ring, 0.0f); scRing.assign (ring, 0.0f);
+        for (auto* v : { &detL, &detR, &scD, &oldL, &oldR, &fadeT }) v->assign ((size_t) chunk, 0.0f);
+        trace.assign ((size_t) maxBands * chunk, 0.0f);
+        for (int b = 0; b < maxBands; ++b) tracePtr[(size_t) b] = trace.data() + (size_t) b * chunk;
+        w = 0; count = 0; lastDesign = 0;
+        apply(); redesign(); lp.switchTo (mode, N);
+    }
+    // r nul : mono. sc : side-chain externe (nul : aucun).
+    void run (float* l, float* r, int total, const float* sc = nullptr)
+    {
+        const int ring = (int) ringL.size();
+        for (int off = 0, n = 0; off < total; off += n)
+        {
+            n = std::min (chunk, total - off);
+            // (méthode 2.0 : on s'arrête à l'instant exact de la reconception suivante, toutes les 25 ms)
+            if (legacy) n = std::max (1, std::min (n, (int) (lastDesign + (long) (0.025 * fs) - count)));
+            float* L = l + off; float* R = r != nullptr ? r + off : nullptr;
+            const bool lin = mode == fir::Mode::linear;
+            const int lag = legacy ? std::max (0, lat - (int) std::lround (0.03 * fs)) : lin ? lat - lp.partition() : lat;
+            uint32_t dynMask = 0;
+            for (int b = 0; b < maxBands; ++b) if (dyn[(size_t) b].on && bands[(size_t) b].active) dynMask |= 1u << b;
+            for (int b = 0; b < maxBands; ++b)
+            {
+                const bool tr = lin && ! legacy && ((dynMask >> b) & 1u) != 0;
+                float* row = trace.data() + (size_t) b * chunk;
+                eng.dynTrace[(size_t) b] = tr ? row : nullptr;
+                if (tr) std::fill (row, row + n, 0.0f);
+            }
+            for (int i = 0; i < n; ++i)
+            {
+                ringL[(size_t) w] = L[i]; ringR[(size_t) w] = R != nullptr ? R[i] : L[i];
+                if (sc != nullptr) scRing[(size_t) w] = sc[off + i];
+                const int di = (w - lag + ring) % ring;
+                detL[(size_t) i] = ringL[(size_t) di]; detR[(size_t) i] = ringR[(size_t) di]; scD[(size_t) i] = scRing[(size_t) di];
+                w = (w + 1) % ring;
+            }
+            const float* scp = sc != nullptr ? scD.data() : nullptr;
+            if (lin || legacy)
+            {
+                eng.process (detL.data(), R != nullptr ? detR.data() : nullptr, n, true, scp, nullptr);
+                lp.process (L, R, n, tracePtr.data(), legacy ? 0u : dynMask);
+            }
+            else
+            {
+                for (int o = 0; o < n;)
+                {
+                    const auto st = lp.outState();
+                    const int m = std::min (n - o, lp.untilBoundary());
+                    float* rr = R != nullptr ? R + o : nullptr;
+                    lp.process (L + o, rr, m, nullptr, 0, oldL.data() + o, R != nullptr ? oldR.data() + o : nullptr, fadeT.data() + o);
+                    Engine::FirSplit sp; sp.cur = st.cur; sp.old = st.old;
+                    if (st.split) { sp.oldL = oldL.data() + o; sp.oldR = R != nullptr ? oldR.data() + o : nullptr; sp.t = fadeT.data() + o; }
+                    eng.process (L + o, rr, m, false, scp != nullptr ? scp + o : nullptr, nullptr, &sp);
+                    o += m;
+                }
+            }
+            count += n;
+            // méthode 2.0 : le fil de conception relit le gain dynamique toutes les 25 ms
+            // (seulement si un gain a bougé de 0,1 dB, comme la clé du fil de conception)
+            if (legacy && count - lastDesign >= (long) (0.025 * fs))
+            {
+                lastDesign = count;
+                double key = 0;
+                for (int b = 0; b < maxBands; ++b) key = key * 31.0 + std::round (eng.getDynOffset (b) * 10.0);
+                if (key != lastKey) { lastKey = key; redesign(); }
+            }
+        }
+    }
+};
+
+// Détecteur et courbe de la dynamique, récrits à part (mêmes formules que le moteur) : gain en dB pour
+// chaque échantillon d'un signal mono
+static std::vector<double> detectorGain (const std::vector<float>& x, const BandSpec& b, const DynSettings& d, double fs)
+{
+    SectionRT det; toRT (listenSection (b.shape, b.freq, b.q, fs), det);
+    const double aA = std::exp (-1.0 / (std::max (0.1, d.attackMs) * 0.001 * fs)), aR = std::exp (-1.0 / (std::max (1.0, d.releaseMs) * 0.001 * fs));
+    double st[2] = { 0, 0 }, env = 0;
+    std::vector<double> g (x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        const double v = std::abs (tick (det, st, x[i]));
+        env = v > env ? aA * env + (1 - aA) * v : aR * env + (1 - aR) * v;
+        const double over = 20.0 * std::log10 (std::max (1e-9, env)) - d.thrDb, W = 6.0;
+        const double o = over <= -W / 2 ? 0.0 : over < W / 2 ? (over + W / 2) * (over + W / 2) / (2 * W) : over;
+        g[i] = d.rangeDb < 0 ? -std::min (o, -d.rangeDb) : std::min (o, d.rangeDb);
+    }
+    return g;
+}
+
+static double convAt (const std::vector<double>& h, const std::vector<float>& x, long i)
+{
+    double s = 0;
+    const long kmax = std::min ((long) h.size() - 1, i);
+    for (long k = 0; k <= kmax; ++k) s += h[(size_t) k] * x[(size_t) (i - k)];
+    return s;
+}
+
+// salves de 997 Hz (une toutes les 250 ms, montée 0,5 ms) + bruit faible : le signal du prototype
+static std::vector<float> burstSignal (int n, double fs, double f0 = 997.0, double amp = 0.4)
+{
+    std::vector<float> x ((size_t) n);
+    std::mt19937 rng (4); std::uniform_real_distribution<double> U (-1, 1);
+    for (int i = 0; i < n; ++i)
+    {
+        const double ph = std::fmod (i / fs, 0.25);
+        const double env = ph < 0.08 ? std::min (1.0, ph / 0.0005) : std::exp (-(ph - 0.08) / 0.01);
+        x[(size_t) i] = (float) (amp * env * std::sin (2 * pi * f0 * i / fs) + 0.003 * U (rng));
+    }
+    return x;
+}
+
+struct Res2 { double rms = 0, peak = 0; };
+// résidu de y (décalé de shift) par rapport à ref, à partir de start, un échantillon sur step
+template <class A, class B>
+static Res2 residual2 (const A& y, long shift, const B& ref, long start, long end, long step = 1)
+{
+    double rr = 0, ss = 0, pk = 0, spk = 0;
+    for (long i = start; i < end; i += step)
+    {
+        const double e = (double) y[(size_t) (i + shift)] - (double) ref[(size_t) i];
+        rr += e * e; ss += (double) ref[(size_t) i] * (double) ref[(size_t) i];
+        pk = std::max (pk, std::abs (e)); spk = std::max (spk, std::abs ((double) ref[(size_t) i]));
+    }
+    return { 0.5 * db (rr / std::max (1e-300, ss)), db (pk / std::max (1e-300, spk)) };
+}
+// Erreur de courbe du mélange de FIR, mesurée sur les FIR réels du jeu (référence + écarts) : pour une
+// grille de gains dynamiques, réponse du mélange contre celle du FIR conçu exactement pour ces gains.
+// 10 Hz – 20 kHz, là où la cible est au-dessus de −60 dB. Grille de gains : bandes 1 et 2 indépendantes,
+// les bandes 3 et 4 (s'il y en a) parcourent leur plage en fonction des deux premières.
+static double bankCurveError (const std::array<BandSpec, maxBands>& bands, const fir::DynInfo& dyn, int N, double fs, int steps, int* nDev = nullptr, int* nMix = nullptr)
+{
+    static fir::Work w;
+    const auto plan = fir::makePlan (bands, dyn, fir::Mode::linear, fs, true);
+    if (nDev != nullptr) *nDev = plan.nDev;
+    if (nMix != nullptr) *nMix = plan.nMix;
+    if (plan.nMix < 1) return 99.0;
+    fir::Request rq; rq.bands = bands; rq.N = N; rq.fs = fs; rq.mode = fir::Mode::linear;
+    fir::Result ref, exact; std::vector<fir::Result> dev;
+    fir::designBank (rq, dyn, plan, ref, dev, w);
+    const int L = 4 * N;
+    std::vector<fir::cd> A ((size_t) L), B ((size_t) L);
+    std::vector<double> h ((size_t) N);
+    const int two = plan.nMix >= 2 ? steps : 0;
+    double worst = 0;
+    for (int i1 = 0; i1 <= steps; ++i1)
+        for (int i2 = 0; i2 <= two; ++i2)
+        {
+            double off[fir::maxMix] {}, wt[fir::maxMix][fir::maxSeg + 1] {};
+            for (int k = 0; k < plan.nMix; ++k)
+            {
+                off[k] = plan.mb[k].full * (k == 0 ? i1 : k == 1 ? i2 : k == 2 ? steps - i1 : (i1 + i2) % (steps + 1)) / steps;
+                int seg; double a; fir::locate (plan.mb[k], off[k], seg, a);
+                wt[k][seg] = 1 - a; wt[k][seg + 1] = a;
+            }
+            h = ref.h[0];
+            double c[fir::maxDev];
+            fir::devWeights (plan, wt, c);
+            for (int di = 0; di < plan.nDev; ++di)
+                if (c[di] != 0.0)
+                    for (int n = 0; n < N; ++n) h[(size_t) n] += c[di] * dev[(size_t) di].h[0][(size_t) n];
+            fir::Request re = rq;
+            for (int k = 0; k < plan.nMix; ++k) re.bands[(size_t) plan.mb[k].band].gainDb += off[k];
+            fir::design (re, exact, w);
+            std::fill (A.begin(), A.end(), fir::cd (0, 0)); std::fill (B.begin(), B.end(), fir::cd (0, 0));
+            for (int n = 0; n < N; ++n) { A[(size_t) n] = h[(size_t) n]; B[(size_t) n] = exact.h[0][(size_t) n]; }
+            fir::fft (A.data(), L, false); fir::fft (B.data(), L, false);
+            for (int k = (int) std::ceil (10.0 * L / fs); k <= (int) (20000.0 * L / fs); ++k)
+            {
+                const double t = std::abs (B[(size_t) k]);
+                if (t < 1e-3) continue;
+                worst = std::max (worst, std::abs (db (std::abs (A[(size_t) k]) / t)));
+            }
+        }
+    return worst;
+}
+
+// Erreur d'interpolation seule (cibles analytiques, 10 Hz – 24 kHz) : toutes formes, toutes plages
+static double blendCurveError (BandSpec b, double range, double fs)
+{
+    std::array<BandSpec, maxBands> bands; bands[0] = b;
+    fir::DynInfo d; d.full[0] = range;
+    const auto pl = fir::makePlan (bands, d, fir::Mode::linear, fs, true);
+    const auto& m = pl.mb[0];
+    auto mag = [&] (double g, double f) { BandSpec x = b; x.gainDb += g; Design de; design (x, fs, de, true); return std::abs (response (de, f, fs, true)); };
+    double e = 0;
+    const int steps = std::max (24, (int) std::abs (range) * 4);
+    for (int i = 0; i <= steps; ++i)
+    {
+        const double g = range * i / steps; int s; double a; fir::locate (m, g, s, a);
+        for (int k = 0; k < 200; ++k)
+        {
+            const double f = 10.0 * std::pow (2400.0, k / 199.0);
+            e = std::max (e, std::abs (db (((1 - a) * mag (m.offsetOf (s), f) + a * mag (m.offsetOf (s + 1), f)) / mag (g, f))));
+        }
+    }
+    return e;
+}
+
+static std::string fmt2 (double v) { char s[32]; std::snprintf (s, sizeof s, "%.2f", v); return s; }
 
 int main()
 {
@@ -1058,6 +1333,477 @@ int main()
         std::printf ("   bande dynamique dans l'aigu (5 bandes × 4 niveaux de gain dynamique fixe, side-chain externe) : écart max à l'analogique %.3f dB\n"
                      "      (bande %d, gain dynamique %+.2f dB) [seuil %.2f : les bandes dynamiques gardent la conception 2.0, sans section de correction]\n", worst, wi + 1, wX, tolDynHf);
         CHECK (worst <= tolDynHf, "bande dynamique dans l'aigu : %.3f dB", worst);
+    }
+
+    // Bandes du prototype (tests/proto_dynfir.cpp, partie D) : coupe-bas 40 Hz, high shelf 8 kHz +4 dB,
+    // cloche 1 kHz Q 2 dynamique (seuil −30 dB, retour 100 ms)
+    auto protoBands = [] (FirRig& r, double att, double range, double base)
+    {
+        auto& b = r.bands;
+        b[0].active = true; b[0].shape = Shape::lowCut; b[0].freq = 40; b[0].slope = 12; b[0].q = 0.71;
+        b[1].active = true; b[1].shape = Shape::highShelf; b[1].freq = 8000; b[1].gainDb = 4; b[1].q = 0.71;
+        b[2].active = true; b[2].shape = Shape::bell; b[2].freq = 1000; b[2].q = 2; b[2].gainDb = base;
+        r.dyn[2].on = true; r.dyn[2].thrDb = -30; r.dyn[2].rangeDb = range; r.dyn[2].attackMs = att; r.dyn[2].releaseMs = 100;
+    };
+
+    // ── 17. Linear phase : bande dynamique, précision temporelle ────────
+    std::printf ("\n17. Linear phase, bande dynamique : résidu par rapport à l'idéal (à chaque échantillon, le FIR exact du gain du détecteur)\n"
+                 "    bandes et signal du prototype (FIR 4096 points, cloche 1 kHz Q 2, plage −12 dB, salves de 997 Hz) [seuil : −60 dB efficace]\n");
+    {
+        const double fs = 48000; const int N = 4096, n = 60000, lat0 = N / 2;
+        const auto x = burstSignal (n, fs);
+        fir::Work w;
+        for (double att : { 0.5, 10.0 })
+        {
+            FirRig ref; protoBands (ref, att, -12, 0);
+            // idéal : détecteur récrit à part, banque de FIR exacts tous les 0,05 dB
+            const auto g = detectorGain (x, ref.bands[2], ref.dyn[2], fs);
+            const int nb = 241; std::vector<std::vector<double>> bank ((size_t) nb);
+            for (int i = 0; i < nb; ++i)
+            {
+                fir::Request rq; rq.bands = ref.bands; rq.bands[2].gainDb = -0.05 * i; rq.N = N; rq.fs = fs; rq.mode = fir::Mode::linear;
+                fir::Result r; fir::design (rq, r, w); bank[(size_t) i] = r.h[0];
+            }
+            std::vector<double> ideal ((size_t) n, 0.0), h ((size_t) N);
+            for (int i = lat0; i < n; ++i)
+            {
+                const double p = std::clamp (-g[(size_t) (i - lat0)] / 0.05, 0.0, nb - 1.0);
+                const int i0 = std::min ((int) p, nb - 2); const double t = p - i0;
+                for (int k = 0; k < N; ++k) h[(size_t) k] = bank[(size_t) i0][(size_t) k] * (1 - t) + bank[(size_t) i0 + 1][(size_t) k] * t;
+                ideal[(size_t) i] = convAt (h, x, i);
+            }
+            Res2 res[2];
+            for (int legacy = 1; legacy >= 0; --legacy)
+            {
+                FirRig rig; rig.legacy = legacy != 0; protoBands (rig, att, -12, 0);
+                rig.start (fs, fir::Mode::linear, N);
+                std::vector<float> y = x; y.resize ((size_t) n + 4096, 0.0f);
+                rig.run (y.data(), nullptr, (int) y.size());
+                res[legacy] = residual2 (y, rig.lp.partition(), ideal, lat0 + 4096, n);
+            }
+            std::printf ("   attaque %4.1f ms : 2.0 (reconception toutes les 25 ms + fondu) efficace %.1f dB, crête %.1f dB → 3.0 (mélange de FIR) efficace %.1f dB, crête %.1f dB\n",
+                         att, res[1].rms, res[1].peak, res[0].rms, res[0].peak);
+            CHECK (res[0].rms <= -60.0, "Linear phase, attaque %.1f ms : résidu %.1f dB", att, res[0].rms);
+        }
+    }
+
+    // ── 18. Linear phase : erreur de courbe du mélange ──────────────────
+    std::printf ("\n18. Linear phase : erreur de courbe du mélange de FIR pour tous les gains dynamiques intermédiaires\n"
+                 "   (a) sur les FIR réels du jeu, contre le FIR conçu exactement pour ce gain (10 Hz – 20 kHz) [seuil 0,1 dB]\n");
+    {
+        const double fs = 48000;
+        struct C { const char* n; Shape s; int slope; double f, q, base, range; int N; };
+        const C cs[] = { { "cloche 1 kHz Q 2, plage −12", Shape::bell, 12, 1000, 2, 0, -12, 4096 }, { "cloche 1 kHz Q 2, plage +12", Shape::bell, 12, 1000, 2, 0, 12, 4096 },
+                         { "cloche 1 kHz Q 2, plage −18", Shape::bell, 12, 1000, 2, 0, -18, 4096 }, { "cloche 1 kHz Q 2, plage +18", Shape::bell, 12, 1000, 2, 0, 18, 4096 },
+                         { "cloche 3 kHz Q 8 à +6 dB, plage −12", Shape::bell, 12, 3000, 8, 6, -12, 4096 }, { "cloche 100 Hz Q 4, plage −12", Shape::bell, 12, 100, 4, 0, -12, 16384 },
+                         { "low shelf 200 Hz 12 dB/oct Q 0.71, plage +12", Shape::lowShelf, 12, 200, 0.71, 0, 12, 8192 }, { "high shelf 5 kHz 6 dB/oct, plage −12", Shape::highShelf, 6, 5000, 0.71, 0, -12, 4096 },
+                         { "high shelf 5 kHz 12 dB/oct Q 0.71, plage +18", Shape::highShelf, 12, 5000, 0.71, 0, 18, 4096 },
+                         { "high shelf 5 kHz Q 2 (résonant), plage +12", Shape::highShelf, 12, 5000, 2, 0, 12, 4096 }, { "low shelf 200 Hz Q 2 (résonant), plage −18", Shape::lowShelf, 12, 200, 2, 0, -18, 8192 },
+                         { "tilt 1 kHz 6 dB/oct, plage +12", Shape::tiltShelf, 6, 1000, 0.71, 0, 12, 4096 } };
+        for (const auto& c : cs)
+        {
+            std::array<BandSpec, maxBands> bands;
+            bands[0].active = true; bands[0].shape = Shape::lowCut; bands[0].freq = 40; bands[0].slope = 12; bands[0].q = 0.71;
+            bands[1].active = true; bands[1].shape = Shape::bell; bands[1].freq = 9000; bands[1].gainDb = -3; bands[1].q = 1;
+            auto& b = bands[2]; b.active = true; b.shape = c.s; b.slope = c.slope; b.freq = c.f; b.q = c.q; b.gainDb = c.base;
+            fir::DynInfo d; d.full[2] = c.range; int nd = 0;
+            const double e = bankCurveError (bands, d, c.N, fs, 24, &nd);
+            std::printf ("      %-46s : %2d FIR d'écart, erreur max %.3f dB\n", c.n, nd, e);
+            CHECK (e <= 0.1, "courbe du mélange, %s : %.3f dB", c.n, e);
+        }
+        std::printf ("   (b) interpolation seule (cibles analytiques, 10 Hz – 24 kHz), gain de base 0 et +6 dB, plages ±3 à ±30 dB : pire cas par famille\n");
+        struct F { const char* n; Shape s; int slope; std::vector<double> q; double f, tol; bool block; };
+        const F fams[] = { { "cloche, Q 0.5 à 8", Shape::bell, 12, { 0.5, 1, 2, 4, 8 }, 1000, 0.1, true },
+                           { "étagères 6 dB/oct", Shape::lowShelf, 6, { 0.71 }, 200, 0.1, true },
+                           { "étagères 12 dB/oct, Q 0.5 à 0.8", Shape::highShelf, 12, { 0.5, 0.71, 0.8 }, 5000, 0.1, true },
+                           { "étagères 12 dB/oct, Q 1 à 2 (résonantes)", Shape::highShelf, 12, { 1, 1.5, 2 }, 5000, 0.1, true },
+                           { "étagères 12 dB/oct, Q 4 (résonantes)", Shape::lowShelf, 12, { 4 }, 200, 0.3, true },
+                           { "tilt 6 et 12 dB/oct, Q 0.71", Shape::tiltShelf, 12, { 0.71 }, 1000, 0.1, true } };
+        for (const auto& f : fams)
+        {
+            double w12 = 0, w18 = 0, w30 = 0;
+            for (double q : f.q) for (double base : { 0.0, 6.0 }) for (double r : { -30.0, -18.0, -12.0, -6.0, -3.0, 3.0, 6.0, 12.0, 18.0, 30.0 })
+                for (int sl : { f.slope, f.s == Shape::tiltShelf ? 6 : f.slope })
+                {
+                    BandSpec b; b.active = true; b.shape = f.s; b.slope = sl; b.freq = f.f; b.q = q; b.gainDb = base;
+                    const double e = blendCurveError (b, r, fs);
+                    if (std::abs (r) <= 12) w12 = std::max (w12, e);
+                    if (std::abs (r) <= 18) w18 = std::max (w18, e);
+                    w30 = std::max (w30, e);
+                }
+            std::printf ("      %-42s : jusqu'à ±12 dB %.3f ; jusqu'à ±18 dB %.3f ; jusqu'à ±30 dB %.3f [seuil %.2f jusqu'à ±18 dB]\n", f.n, w12, w18, w30, f.tol);
+            CHECK (w18 <= f.tol, "interpolation, %s : %.3f dB", f.n, w18);
+        }
+    }
+
+    // ── 19. Natural phase : précision temporelle ────────────────────────
+    std::printf ("\n19. Natural phase, bande dynamique faite par le moteur zéro latence après le FIR des bandes fixes\n"
+                 "    résidu par rapport à « FIR fixe puis moteur exact » (conception exacte à chaque échantillon) [seuil : −110 dB efficace],\n"
+                 "    écart à « FIR fixe puis moteur zéro latence » [seuil : 0, bit à bit]\n");
+    {
+        const double fs = 48000; const int N = 4096, n = 60000;
+        const auto x = burstSignal (n, fs);
+        const char* names[3] = { "cloche +3 dB sur le Mid, plage −12, stéréo", "side-chain externe (retardé de la latence), plage −10", "mono, plage −12" };
+        for (int cas = 0; cas < 3; ++cas)
+        {
+            FirRig rig; protoBands (rig, 0.5, cas == 1 ? -10 : -12, cas == 0 ? 3 : 0);
+            rig.dyn[2].external = cas == 1;
+            if (cas == 0) rig.bands[2].place = Place::mid;
+            rig.start (fs, fir::Mode::natural, N);
+            std::vector<float> l = x, r ((size_t) n), sc ((size_t) n);
+            for (int i = 0; i < n; ++i) { r[(size_t) i] = 0.6f * x[(size_t) i]; sc[(size_t) i] = x[(size_t) ((i + 5000) % n)]; }
+            if (cas == 1) for (int i = 0; i < n; ++i) { l[(size_t) i] = (float) (0.2 * std::sin (2 * pi * 1000.0 * i / fs)); r[(size_t) i] = l[(size_t) i]; }
+            const auto l0 = l, r0 = r;
+            rig.run (l.data(), cas == 2 ? nullptr : r.data(), n, cas == 1 ? sc.data() : nullptr);
+            Res2 res[2]; double mx[2] {};
+            for (int exact = 1; exact >= 0; --exact)
+            {
+                TestLinear lp; lp.prepare (fs);
+                TestLinear::Snapshot s; s.bands = rig.bands; s.bands[2].active = false;
+                lp.design (s, fir::Mode::natural, N, false); lp.switchTo (fir::Mode::natural, N);
+                auto a = l0, b = r0;
+                lp.process (a.data(), cas == 2 ? nullptr : b.data(), n);
+                Engine e; e.referenceExact = exact != 0; e.prepare (fs);
+                for (int k = 0; k < maxBands; ++k) e.setBand (k, BandSpec(), DynSettings(), 1.0);
+                e.setBand (2, rig.bands[2], rig.dyn[2], 1.0);
+                std::vector<float> scd ((size_t) n, 0.0f);
+                for (int i = rig.lat; i < n; ++i) scd[(size_t) i] = sc[(size_t) (i - rig.lat)];
+                e.process (a.data(), cas == 2 ? nullptr : b.data(), n, false, cas == 1 ? scd.data() : nullptr, nullptr);
+                // (après la mise en route : le fondu d'entrée de la bande n'avance pas au même pas dans la référence exacte)
+                res[exact] = residual2 (l, 0, a, 8192, n);
+                for (int i = 8192; i < n; ++i) mx[exact] = std::max ({ mx[exact], (double) std::abs (l[(size_t) i] - a[(size_t) i]), cas == 2 ? 0.0 : (double) std::abs (r[(size_t) i] - b[(size_t) i]) });
+            }
+            std::printf ("   %-54s : latence %d ; contre le moteur exact %.1f dB efficace, %.1f dB crête ; contre le moteur zéro latence : écart max %.1e\n",
+                         names[cas], rig.lat, res[1].rms, res[1].peak, mx[0]);
+            CHECK (res[1].rms <= -110.0, "Natural phase, %s : résidu %.1f dB", names[cas], res[1].rms);
+            CHECK (mx[0] == 0.0, "Natural phase, %s : la bande dynamique n'est pas celle du moteur zéro latence (%.1e)", names[cas], mx[0]);
+            CHECK (std::abs (rig.eng.getDynOffset (2)) > 3.0, "Natural phase, %s : la dynamique n'a pas agi", names[cas]);
+        }
+    }
+
+    // ── 20. Bandes fixes inchangées ─────────────────────────────────────
+    std::printf ("\n20. Bandes fixes inchangées dans les modes FIR\n");
+    {
+        const double fs = 48000; const int N = 4096, n = 30000;
+        std::mt19937 rng (7); std::uniform_real_distribution<float> U (-0.5f, 0.5f);
+        std::vector<float> xl ((size_t) n), xr ((size_t) n);
+        for (int i = 0; i < n; ++i) { xl[(size_t) i] = U (rng); xr[(size_t) i] = U (rng); }
+        auto fixed = [] (FirRig& r)
+        {
+            auto& b = r.bands;
+            b[0].active = true; b[0].shape = Shape::lowCut; b[0].freq = 60; b[0].slope = 24; b[0].q = 0.71;
+            b[1].active = true; b[1].shape = Shape::bell; b[1].freq = 900; b[1].gainDb = 7; b[1].q = 3; b[1].place = Place::mid;
+            b[2].active = true; b[2].shape = Shape::highShelf; b[2].freq = 7000; b[2].gainDb = -5; b[2].q = 0.71;
+            b[3].active = true; b[3].shape = Shape::notch; b[3].freq = 3000; b[3].q = 8; b[3].place = Place::right;
+        };
+        for (auto mode : { fir::Mode::linear, fir::Mode::natural })
+        {
+            const char* mn = mode == fir::Mode::linear ? "Linear " : "Natural";
+            // (a) contre la convolution directe (double précision) par les FIR conçus : c'est le comportement de la 2.0
+            FirRig a; fixed (a); a.start (fs, mode, N);
+            auto al = xl, ar = xr;
+            a.run (al.data(), ar.data(), n);
+            fir::Request rq; rq.bands = a.bands; rq.N = N; rq.fs = fs; rq.mode = mode; rq.delay = fir::naturalDelay (fs);
+            fir::Result r; fir::Work w; fir::design (rq, r, w);
+            const int P = a.lp.partition(), n0 = 6000;
+            std::vector<double> refL ((size_t) n0, 0.0), refR ((size_t) n0, 0.0);
+            for (int i = N; i < n0; ++i)
+            {
+                refL[(size_t) i] = convAt (r.h[0], xl, i) + convAt (r.h[1], xr, i);
+                refR[(size_t) i] = convAt (r.h[2], xl, i) + convAt (r.h[3], xr, i);
+            }
+            const double eL = residual2 (al, P, refL, N, n0).rms, eR = residual2 (ar, P, refR, N, n0).rms;
+            // (b) une bande de plus, dynamique mais sous son seuil (gain de base 0 dB) : sortie identique bit à bit
+            FirRig bq; fixed (bq);
+            bq.bands[4].active = true; bq.bands[4].freq = 1500; bq.bands[4].q = 2;
+            bq.dyn[4].on = true; bq.dyn[4].thrDb = 0; bq.dyn[4].rangeDb = -12;
+            bq.start (fs, mode, N);
+            auto bl = xl, br = xr;
+            bq.run (bl.data(), br.data(), n);
+            double mx = 0;
+            for (int i = 0; i < n; ++i) mx = std::max ({ mx, (double) std::abs (al[(size_t) i] - bl[(size_t) i]), (double) std::abs (ar[(size_t) i] - br[(size_t) i]) });
+            const auto plan = bq.lp.planFor (bq.snapshot(), mode, N);
+            std::printf ("   %s : sortie contre la convolution directe par le FIR des bandes fixes %.1f dB (G), %.1f dB (D) [seuil −120 dB] ;\n"
+                         "             avec en plus une bande dynamique sous son seuil (%s) : écart max %.1e [seuil 0]\n",
+                         mn, eL, eR, mode == fir::Mode::linear ? "mélange de FIR" : "moteur", mx);
+            CHECK (eL <= -120.0 && eR <= -120.0, "%s : bandes fixes modifiées (%.1f / %.1f dB)", mn, eL, eR);
+            CHECK (mx == 0.0, "%s : une bande dynamique au repos change la sortie (%.1e)", mn, mx);
+            CHECK ((mode == fir::Mode::linear ? plan.mixMask : plan.engineMask) == (1u << 4), "%s : répartition de la bande dynamique", mn);
+        }
+        std::printf ("   (ancien LinearPhase.h contre le nouveau cœur, mêmes FIR, même FFT : comparaison bit à bit faite hors dépôt, voir le rapport)\n");
+    }
+
+    // ── 21. Deux bandes dynamiques qui se recouvrent ────────────────────
+    std::printf ("\n21. Linear phase : bandes dynamiques qui se recouvrent (FIR croisés sur la grille des ancres de chaque paire couplée)\n");
+    {
+        const double fs = 48000;
+        struct C { const char* n; double ratio, q, r1, r2, tol; };
+        const C cs[] = { { "cloches Q 1 à ½ octave, plages −12 / −12", std::sqrt (2.0), 1, -12, -12, 0.1 }, { "cloches Q 1 à ½ octave, plages +12 / +12", std::sqrt (2.0), 1, 12, 12, 0.1 },
+                         { "cloches Q 1 à 1 octave, plages −12 / +9", 2, 1, -12, 9, 0.1 }, { "cloches Q 1 à 2 octaves, plages −6 / −6", 4, 1, -6, -6, 0.1 },
+                         { "cloches Q 4 à ½ octave, plages −18 / −18", std::sqrt (2.0), 4, -18, -18, 0.1 } };
+        std::printf ("   (a) erreur de courbe sur les FIR réels, grille 10 × 10 de gains [seuil 0,1 dB]\n");
+        for (const auto& c : cs)
+        {
+            std::array<BandSpec, maxBands> bands;
+            bands[0].active = true; bands[0].shape = Shape::lowCut; bands[0].freq = 40; bands[0].slope = 12; bands[0].q = 0.71;
+            bands[3].active = true; bands[3].freq = 1000; bands[3].q = c.q;
+            bands[5].active = true; bands[5].freq = 1000 * c.ratio; bands[5].q = c.q;
+            fir::DynInfo d; d.full[3] = c.r1; d.full[5] = c.r2;
+            int nd = 0;
+            const double e = bankCurveError (bands, d, 4096, fs, 9, &nd);
+            const auto pl = fir::makePlan (bands, d, fir::Mode::linear, fs, true);
+            const double cp = fir::coupling (bands[3], c.r1, bands[5], c.r2, fs, true);
+            std::printf ("      %-42s : erreur du mélange additif %s dB → %2d FIR d'écart, erreur max %.3f dB\n", c.n,
+                         cp > 90 ? "> 90 (signe inversé)" : fmt2 (cp).c_str(), nd, e);
+            CHECK (pl.nEdges == 1 && pl.nMix == 2, "%s : les deux bandes devraient être traitées en paire", c.n);
+            CHECK (e <= c.tol, "%s : %.3f dB", c.n, e);
+        }
+        // (b) résidu temporel : cloches 1 kHz et 1,41 kHz Q 1, plages −12 dB, détecteurs différents
+        const int N = 4096, n = 40000, lat0 = N / 2;
+        std::vector<float> x ((size_t) n);
+        {
+            const auto a = burstSignal (n, fs, 997.0, 0.3);
+            for (int i = 0; i < n; ++i)
+            {
+                const double ph = std::fmod (i / fs, 0.17);
+                x[(size_t) i] = a[(size_t) i] + (float) (0.25 * (ph < 0.05 ? std::min (1.0, ph / 0.002) : std::exp (-(ph - 0.05) / 0.02)) * std::sin (2 * pi * 1493.0 * i / fs));
+            }
+        }
+        auto setup = [] (FirRig& r)
+        {
+            auto& b = r.bands;
+            b[0].active = true; b[0].shape = Shape::lowCut; b[0].freq = 40; b[0].slope = 12; b[0].q = 0.71;
+            b[1].active = true; b[1].freq = 1000; b[1].q = 1;
+            b[2].active = true; b[2].freq = 1414; b[2].q = 1;
+            r.dyn[1].on = true; r.dyn[1].thrDb = -30; r.dyn[1].rangeDb = -12; r.dyn[1].attackMs = 0.5; r.dyn[1].releaseMs = 100;
+            r.dyn[2].on = true; r.dyn[2].thrDb = -26; r.dyn[2].rangeDb = -12; r.dyn[2].attackMs = 5; r.dyn[2].releaseMs = 60;
+        };
+        FirRig ref; setup (ref);
+        const auto g1 = detectorGain (x, ref.bands[1], ref.dyn[1], fs), g2 = detectorGain (x, ref.bands[2], ref.dyn[2], fs);
+        // idéal : FIR conçu exactement pour les deux gains du moment, un échantillon sur 13
+        const long step = 13;
+        std::vector<double> ideal ((size_t) n, 0.0);
+        fir::Work w; fir::Result r; double gmin1 = 0, gmin2 = 0;
+        for (long i = lat0 + 4096; i < n; i += step)
+        {
+            fir::Request rq; rq.bands = ref.bands; rq.N = N; rq.fs = fs; rq.mode = fir::Mode::linear;
+            rq.bands[1].gainDb += g1[(size_t) (i - lat0)]; rq.bands[2].gainDb += g2[(size_t) (i - lat0)];
+            gmin1 = std::min (gmin1, g1[(size_t) (i - lat0)]); gmin2 = std::min (gmin2, g2[(size_t) (i - lat0)]);
+            fir::design (rq, r, w);
+            ideal[(size_t) i] = convAt (r.h[0], x, i);
+        }
+        Res2 res[2];
+        for (int legacy = 1; legacy >= 0; --legacy)
+        {
+            FirRig rig; rig.legacy = legacy != 0; setup (rig); rig.start (fs, fir::Mode::linear, N);
+            std::vector<float> y = x; y.resize ((size_t) n + 4096, 0.0f);
+            rig.run (y.data(), nullptr, (int) y.size());
+            res[legacy] = residual2 (y, rig.lp.partition(), ideal, lat0 + 4096, n, step);
+        }
+        std::printf ("   (b) résidu par rapport à l'idéal, cloches 1 kHz et 1,41 kHz Q 1, gains dynamiques jusqu'à %.1f et %.1f dB :\n"
+                     "       2.0 efficace %.1f dB, crête %.1f dB → 3.0 efficace %.1f dB, crête %.1f dB [seuil : −60 dB efficace]\n",
+                     gmin1, gmin2, res[1].rms, res[1].peak, res[0].rms, res[0].peak);
+        CHECK (res[0].rms <= -60.0, "deux bandes dynamiques qui se recouvrent : résidu %.1f dB", res[0].rms);
+
+        // (c) chaîne de bandes couplées deux à deux (cas courant : 4 cloches dynamiques réparties sur le spectre)
+        {
+            std::array<BandSpec, maxBands> bands; fir::DynInfo d;
+            bands[0].active = true; bands[0].shape = Shape::lowCut; bands[0].freq = 40; bands[0].slope = 12; bands[0].q = 0.71;
+            const double fr[4] = { 150, 700, 3000, 9000 };
+            for (int i = 0; i < 4; ++i) { auto& b = bands[(size_t) (2 + i)]; b.active = true; b.freq = fr[i]; b.q = 4; b.gainDb = 2; d.full[(size_t) (2 + i)] = -12; }
+            int nd = 0, nm = 0;
+            const double e = bankCurveError (bands, d, 4096, fs, 6, &nd, &nm);
+            const auto pl = fir::makePlan (bands, d, fir::Mode::linear, fs, true);
+            std::printf ("   (c) chaîne : 4 cloches Q 4 à 150 / 700 / 3000 / 9000 Hz, plages −12 dB : %d bandes mélangées, %d paires, %d FIR d'écart,\n"
+                         "       erreur de couplage restante prévue %.3f dB ; erreur de courbe mesurée sur les FIR réels (49 combinaisons de gains) %.3f dB [seuil 0,1 dB]\n",
+                         nm, pl.nEdges, nd, pl.coupleErr, e);
+            CHECK (nm == 4 && pl.fallbackMask == 0, "chaîne de 4 bandes : toutes devraient être mélangées");
+            CHECK (e <= 0.1, "chaîne de 4 bandes : %.3f dB", e);
+        }
+        // (d) répartition : 4 bandes mélangées au plus ; une bande dont l'ajout laisserait plus de 0,2 dB d'erreur
+        // de couplage (ici la 3e de trois cloches larges très proches) reste en méthode 2.0
+        {
+            std::array<BandSpec, maxBands> bands; fir::DynInfo d;
+            const double fr[6] = { 1000, 1200, 1440, 60, 12000, 250 };
+            for (int i = 0; i < 6; ++i) { bands[(size_t) i].active = true; bands[(size_t) i].freq = fr[i]; bands[(size_t) i].q = i < 3 ? 1.0 : 8.0; d.full[(size_t) i] = i < 3 ? -12.0 : -6.0; d.now[(size_t) i] = -4; }
+            const auto p = fir::makePlan (bands, d, fir::Mode::linear, fs, true);
+            const auto pn = fir::makePlan (bands, d, fir::Mode::natural, fs, true);
+            std::printf ("   (d) 6 bandes dynamiques (1 / 1,2 / 1,44 kHz Q 1 à −12 dB, puis 60 Hz, 12 kHz, 250 Hz Q 8 à −6 dB) : mélangées %#x, méthode 2.0 %#x, %d paire(s), %d FIR d'écart, couplage restant %.3f dB ;\n"
+                         "       Natural phase : toutes au moteur (%#x)\n", p.mixMask, p.fallbackMask, p.nEdges, p.nDev, p.coupleErr, pn.engineMask);
+            CHECK (p.mixMask == 0x1bu && p.fallbackMask == 0x24u && p.coupleErr <= fir::mixTol && pn.engineMask == 0x3fu && pn.mixMask == 0, "répartition des bandes dynamiques");
+            // les bandes en trop : sortie finie, et le FIR de référence suit leur gain du moment
+            FirRig rig;
+            rig.bands = bands;
+            for (int i = 0; i < 6; ++i) { rig.dyn[(size_t) i].on = true; rig.dyn[(size_t) i].thrDb = -40; rig.dyn[(size_t) i].rangeDb = d.full[(size_t) i]; }
+            rig.start (fs, fir::Mode::linear, N);
+            std::vector<float> y = x; bool bad = false;
+            for (int o = 0; o + 1200 <= n; o += 1200) { rig.run (y.data() + o, nullptr, 1200); rig.redesign(); }
+            for (float v : y) bad = bad || ! std::isfinite (v) || std::abs (v) > 10.0f;
+            CHECK (! bad, "sortie invalide avec des bandes dynamiques en trop");
+        }
+    }
+
+    // (e) plus de 4 bandes dynamiques sans recouvrement : les bandes en trop (méthode 2.0) ne font reconcevoir
+    // que le FIR de référence ; les FIR d'écart des 4 autres sont gardés. Erreur de courbe ajoutée et temps gagné.
+    {
+        const double fs = 48000; const int N = 8192;
+        FirRig rig;
+        const double fr[6] = { 60, 250, 1000, 4000, 12000, 500 };
+        for (int i = 0; i < 6; ++i)
+        {
+            auto& b = rig.bands[(size_t) i]; b.active = true; b.freq = fr[i]; b.q = 8; b.gainDb = 1;
+            auto& d = rig.dyn[(size_t) i]; d.on = true; d.thrDb = -40; d.rangeDb = -6;
+        }
+        rig.start (fs, fir::Mode::linear, N);
+        const auto snap = rig.snapshot();
+        const auto plan = rig.lp.planFor (snap, fir::Mode::linear, N);
+        // jeu conçu avec les bandes en trop au repos, puis FIR de référence seul reconçu avec ces bandes à pleine plage
+        fir::Request rq; rq.bands = rig.bands; rq.N = N; rq.fs = fs; rq.mode = fir::Mode::linear;
+        fir::DynInfo d0 = snap.dyn, d1 = snap.dyn;
+        for (int i = 0; i < maxBands; ++i) { d0.now[(size_t) i] = 0; d1.now[(size_t) i] = (plan.fallbackMask >> i) & 1u ? -6.0 : 0.0; }
+        fir::Work w; fir::Result ref0, ref1, exact; std::vector<fir::Result> dev;
+        fir::designBank (rq, d0, plan, ref0, dev, w);
+        fir::designBank (rq, d1, plan, ref1, dev, w, true);
+        double wt[fir::maxMix][fir::maxSeg + 1] {}, c[fir::maxDev];
+        fir::Request re = rq;
+        for (int i = 0; i < maxBands; ++i) if ((plan.fallbackMask >> i) & 1u) re.bands[(size_t) i].gainDb += -6.0;
+        for (int k = 0; k < plan.nMix; ++k)
+        {
+            const double off = plan.mb[k].full * (k % 2 == 0 ? 1.0 : 0.5);
+            int seg; double a; fir::locate (plan.mb[k], off, seg, a);
+            wt[k][seg] = 1 - a; wt[k][seg + 1] = a;
+            re.bands[(size_t) plan.mb[k].band].gainDb += off;
+        }
+        fir::devWeights (plan, wt, c);
+        std::vector<double> h = ref1.h[0];
+        for (int di = 0; di < plan.nDev; ++di) for (int n = 0; n < N; ++n) h[(size_t) n] += c[di] * dev[(size_t) di].h[0][(size_t) n];
+        fir::design (re, exact, w);
+        double err = 0;
+        for (int i = 0; i < 400; ++i)
+        {
+            const double f = 20.0 * std::pow (1000.0, i / 399.0);
+            err = std::max (err, std::abs (db (std::abs (fir::responseAt (h, N / 2, fs, f)) / std::abs (fir::responseAt (exact.h[0], N / 2, fs, f)))));
+        }
+        // temps d'une reconception : jeu complet, puis FIR de référence seul (gain du moment des bandes en trop changé)
+        rig.designSec = 0; rig.redesign(); const double tFull0 = rig.designSec;   // (rien n'a changé : FIR d'écart gardés)
+        std::vector<float> x = burstSignal (24000, fs, 497.0, 0.4);
+        rig.run (x.data(), nullptr, (int) x.size());
+        rig.designSec = 0; rig.redesign(); const double tRef = rig.designSec;
+        TestLinear fresh; fresh.prepare (fs);
+        const auto t0 = std::chrono::steady_clock::now();
+        fresh.design (snap, fir::Mode::linear, N, false);
+        const double tFull = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+        (void) tFull0;
+        std::printf ("   (e) 6 cloches dynamiques Q 8 sans recouvrement (FIR %d points) : mélangées %#x, méthode 2.0 %#x (recouvrent une bande mélangée : %s), %d FIR d'écart ;\n"
+                     "       bandes en trop passées de 0 à −6 dB avec les FIR d'écart gardés : erreur de courbe max %.3f dB [seuil 0,15 dB : niveau atteint] ;\n"
+                     "       reconception : jeu complet %.1f ms, FIR de référence seul %.1f ms\n",
+                     N, plan.mixMask, plan.fallbackMask, plan.fallbackCoupled ? "oui" : "non", plan.nDev, err, 1000.0 * tFull, 1000.0 * tRef);
+        CHECK (plan.mixMask == 0x0fu && plan.fallbackMask == 0x30u && ! plan.fallbackCoupled, "répartition de 6 bandes sans recouvrement");
+        CHECK (err <= 0.15, "FIR d'écart gardés : %.3f dB", err);
+        CHECK (tRef < 0.6 * tFull, "la reconception du FIR de référence seul devrait être plus courte (%.1f ms contre %.1f ms)", 1000.0 * tRef, 1000.0 * tFull);
+    }
+
+    // ── 22. Bande qui devient dynamique, ou qui cesse de l'être ─────────
+    std::printf ("\n22. Passage dyn on / off d'une bande pendant la lecture (cloche 1 kHz +6 dB Q 2, signal sous le seuil : la sortie idéale ne change pas)\n"
+                 "    écart de crête à la sortie sans bascule, par rapport à la crête du signal ; le FIR est reconçu 25 ms après la bascule\n");
+    {
+        const double fs = 48000; const int N = 4096, n = 72000;
+        for (auto mode : { fir::Mode::natural, fir::Mode::linear })
+            for (int sig = 0; sig < 2; ++sig)
+            {
+                std::vector<float> x ((size_t) n);
+                std::mt19937 rng (9); std::uniform_real_distribution<double> U (-1, 1);
+                for (int i = 0; i < n; ++i) x[(size_t) i] = sig == 0 ? (float) (0.05 * std::sin (2 * pi * 997.0 * i / fs)) : (float) (0.03 * U (rng));
+                std::vector<float> out[2];
+                for (int toggled = 0; toggled < 2; ++toggled)
+                {
+                    FirRig rig;
+                    auto& b = rig.bands;
+                    b[0].active = true; b[0].shape = Shape::lowCut; b[0].freq = 40; b[0].slope = 12; b[0].q = 0.71;
+                    b[1].active = true; b[1].freq = 1000; b[1].q = 2; b[1].gainDb = 6;
+                    rig.dyn[1].thrDb = -6; rig.dyn[1].rangeDb = -12;
+                    rig.start (fs, mode, N);
+                    auto& y = out[toggled]; y = x;
+                    int done = 0;
+                    auto go = [&] (int until) { rig.run (y.data() + done, nullptr, until - done); done = until; };
+                    go (24000);
+                    if (toggled) { rig.dyn[1].on = true; rig.apply(); }
+                    go (25200); if (toggled) rig.redesign();
+                    go (48000);
+                    if (toggled) { rig.dyn[1].on = false; rig.apply(); }
+                    go (49200); if (toggled) rig.redesign();
+                    go (n);
+                }
+                auto pk = [&] (int a, int b2)
+                {
+                    double e = 0, s = 0;
+                    for (int i = a; i < b2; ++i) { e = std::max (e, (double) std::abs (out[1][(size_t) i] - out[0][(size_t) i])); s = std::max (s, (double) std::abs (out[0][(size_t) i])); }
+                    return std::max (-200.0, db (e / s));
+                };
+                const double on = pk (24000, 30000), steady = pk (36000, 48000), offT = pk (48000, 54000), after = pk (60000, n);
+                const bool nat = mode == fir::Mode::natural;
+                const double tol = nat ? -38.0 : -120.0;
+                std::printf ("   %s, %s : passage en dynamique %.1f dB ; régime établi en dynamique %.1f dB ; retour en fixe %.1f dB ; ensuite %.1f dB [seuil %.0f dB]\n",
+                             nat ? "Natural" : "Linear ", sig == 0 ? "sinus 997 Hz" : "bruit blanc ", on, steady, offT, after, tol);
+                CHECK (on <= tol && offT <= tol && after <= -120.0, "%s : transitoire au passage dyn on / off (%.1f / %.1f dB)", nat ? "Natural" : "Linear", on, offT);
+            }
+        std::printf ("   (Natural phase : en régime établi, l'écart est la différence entre la bande faite par le FIR et la même bande faite par le moteur ;\n"
+                     "    le seuil de −38 dB est le niveau atteint, pas une cible fixée d'avance)\n");
+    }
+
+    // ── 23. Coût des modes FIR avec des bandes dynamiques ───────────────
+    std::printf ("\n23. Coût des modes FIR, stéréo 48 kHz, 3 s de bruit modulé (banc : FFT lente en double ; le plugin est mesuré par ALEQProcessorTest)\n"
+                 "    2.0 : fil audio + fil de conception (une reconception toutes les 25 ms) ; 3.0 : fil audio seul, le jeu de FIR n'est conçu qu'une fois\n");
+    {
+        const double fs = 48000; const int n = 144000;
+        std::vector<float> xl ((size_t) n), xr ((size_t) n);
+        std::mt19937 rng (5); std::uniform_real_distribution<double> U (-0.3, 0.3);
+        for (int i = 0; i < n; ++i) { const double v = (0.5 + 0.5 * std::sin (2 * pi * 3.0 * i / fs)) * U (rng); xl[(size_t) i] = (float) v; xr[(size_t) i] = (float) (0.8 * v); }
+        for (auto mode : { fir::Mode::linear, fir::Mode::natural })
+            for (int N : { 8192, 32768 })
+            {
+                if (mode == fir::Mode::natural && N != 8192) continue;
+                double base = 0;
+                for (int nd : { 0, 1, 4 })
+                {
+                    double audio[2] {}, des[2] {}, firs = 0; int nDev = 0, nGroups = 0, nFall = 0; double once = 0;
+                    for (int legacy = 1; legacy >= 0; --legacy)
+                    {
+                        FirRig rig; rig.legacy = legacy != 0;
+                        auto& b = rig.bands;
+                        b[0].active = true; b[0].shape = Shape::lowCut; b[0].freq = 40; b[0].slope = 12; b[0].q = 0.71;
+                        b[1].active = true; b[1].shape = Shape::highShelf; b[1].freq = 12000; b[1].gainDb = 3; b[1].q = 0.71;
+                        const double fr[4] = { 150, 700, 3000, 9000 };
+                        for (int k = 0; k < 4; ++k)
+                        {
+                            b[(size_t) (2 + k)].active = true; b[(size_t) (2 + k)].freq = fr[k]; b[(size_t) (2 + k)].q = 4; b[(size_t) (2 + k)].gainDb = 2;
+                            auto& d = rig.dyn[(size_t) (2 + k)];
+                            if (k < nd) { d.on = true; d.thrDb = -45; d.rangeDb = -12; d.attackMs = 5; d.releaseMs = 80; }
+                        }
+                        rig.start (fs, mode, N);
+                        once = rig.designSec; rig.designSec = 0;
+                        auto l = xl, r = xr;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        rig.run (l.data(), r.data(), n);
+                        const double sec = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+                        des[legacy] = 100.0 * rig.designSec / (n / fs);
+                        audio[legacy] = 100.0 * (sec - rig.designSec) / (n / fs);
+                        if (! legacy)
+                        {
+                            firs = (double) rig.lp.totalFirCount() / (2.0 * (double) rig.lp.blockCount());
+                            const auto pl = rig.lp.planFor (rig.snapshot(), mode, N); nDev = pl.nDev; nGroups = pl.nEdges; nFall = pl.fallbackMask != 0 ? 1 : 0;
+                        }
+                    }
+                    if (nd == 0) base = audio[0];
+                    std::printf ("   %s %5d points, %d bande(s) dynamique(s) : 2.0 audio %5.2f %% + conception %6.2f %% → 3.0 audio %5.2f %% (%.2f FIR par bloc en moyenne ; jeu : %d paire(s), %d FIR d'écart, conçu en %.0f ms)\n",
+                                 mode == fir::Mode::linear ? "Linear " : "Natural", N, nd, audio[1], des[1], audio[0], firs, nGroups, nDev, 1000.0 * once);
+                    // seuil : pas plus de FIR par bloc que la structure ne le prévoit (référence + 2 par bande seule ou 4 par paire, marge pour les blocs où un gain change de tronçon)
+                    CHECK (nFall == 0, "aucune bande ne devrait rester en méthode 2.0 dans ce cas");
+                    if (mode == fir::Mode::linear) CHECK (firs <= 1.0 + 3.0 * nd, "nombre de FIR par bloc (%.2f)", firs);
+                    else CHECK (firs <= 1.0001, "Natural phase : un seul FIR par bloc (%.2f)", firs);
+                }
+                (void) base;
+            }
     }
 
 

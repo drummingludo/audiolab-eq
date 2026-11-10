@@ -64,6 +64,7 @@ public:
     // Courbe réelle du FIR (modes Linear / Natural phase), pour l'écran
     void getFirDisplay (audiolab::eq::LinearPhase::DisplayData& d) const { linear.getDisplay (d); }
     int firDisplayVersion() const { return linear.displayVersion(); }
+    int firDesignCount() const { return linear.designsDone(); }   // nombre de jeux de FIR conçus (tests)
     std::atomic<bool> editorOpen { false };
 
     // Modifications venant de l'interface (fil des messages)
@@ -151,6 +152,10 @@ private:
     std::vector<float> dryRingL, dryRingR, scRingL, scRingR;
     int dryW = 0;
     std::vector<float> dlyL, dlyR, detL, detR, scDL, scDR, mono;
+    // Natural phase : sortie du FIR sortant et position du fondu quand le partage FIR / moteur change ;
+    // Linear phase : gain dynamique de chaque bande à chaque échantillon (mélange de FIR)
+    std::vector<float> oldL, oldR, fadeT, traceBuf;
+    std::array<const float*, audiolab::eq::maxBands> tracePtr {};
     juce::SmoothedValue<float> outSm, bypassSm;
 
     std::array<audiolab::eq::BandSpec, audiolab::eq::maxBands> lastSpecs {};

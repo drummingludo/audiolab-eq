@@ -151,6 +151,11 @@ struct Work
     std::vector<double> basis[maxCorr];
     std::vector<double> win;
     int winN = -1, winMode = -1, winDelay = -1;
+    // réponse de chaque bande sur la grille de conception, gardée d'une conception à la suivante :
+    // un jeu de FIR d'écart (FirBank.h) ne change qu'une ou deux bandes à la fois
+    std::vector<cd> bandH[maxBands];
+    BandSpec bandKey[maxBands];
+    double bandFs[maxBands] {};
 };
 
 // Fenêtre « plate à bords Blackman-Harris »
@@ -224,20 +229,42 @@ inline void design (const Request& rq, Result& out, Work& w)
     const int N = rq.N, M = 2 * N;   // échantillonnage dense : 2N points
     const double fs = rq.fs;
     Design des[maxBands];
-    bool anyMS = false;
+    bool anyMS = false, allStereo = rq.stereo;   // allStereo : toutes les bandes sur les deux voies (D = A)
     for (int i = 0; i < maxBands; ++i)
     {
         const auto& b = rq.bands[(size_t) i];
         if (! b.active) continue;
         eq::design (b, fs, des[i], true);
         anyMS = anyMS || (rq.stereo && (b.place == Place::mid || b.place == Place::side));
+        allStereo = allStereo && b.place == Place::stereo;
     }
     for (auto& v : w.M) v.resize ((size_t) M / 2 + 1);
     const double w1 = std::min (2.0 * pi * 20000.0 / fs, 0.85 * pi);
+    for (int i = 0; i < maxBands; ++i)
+    {
+        const auto& b = rq.bands[(size_t) i];
+        if (! b.active) continue;
+        const auto& key = w.bandKey[i];
+        auto& H = w.bandH[i];
+        if ((int) H.size() == M / 2 + 1 && w.bandFs[i] == fs && key.shape == b.shape && key.slope == b.slope
+            && key.freq == b.freq && key.gainDb == b.gainDb && key.q == b.q) continue;
+        H.resize ((size_t) M / 2 + 1);
+        for (int k = 0; k <= M / 2; ++k) H[(size_t) k] = response (des[i], std::max (k * fs / M, 0.01), fs, true);
+        w.bandKey[i] = b; w.bandFs[i] = fs;
+    }
     for (int k = 0; k <= M / 2; ++k)
     {
         const double f = k * fs / M;
-        M2 t = targetAt (rq, des, f);
+        // (même calcul que targetAt, avec les réponses gardées)
+        M2 t { 1.0, 0.0, 0.0, 1.0 };
+        for (int i = 0; i < maxBands; ++i)
+        {
+            const auto& b = rq.bands[(size_t) i];
+            if (! b.active) continue;
+            cd h = w.bandH[i][(size_t) k];
+            if (rq.mode == Mode::linear) h = cd (std::abs (h), 0.0);
+            t = mul (bandMatrix (b.place, h, rq.stereo), t);
+        }
         if (rq.mode == Mode::natural)
         {
             // phase ramenée doucement vers 0 entre 20 kHz et Nyquist, puis retard D
@@ -266,6 +293,8 @@ inline void design (const Request& rq, Result& out, Work& w)
     {
         auto& h = out.h[e];
         if (! anyMS && (e == 1 || e == 2)) { h.assign ((size_t) N, 0.0); continue; }
+        // toutes les bandes en stéréo : le FIR de droite est celui de gauche (même calcul, fait une fois)
+        if (allStereo && e == 3) { h = out.h[0]; continue; }
         // spectre hermitien → réponse réelle
         for (int k = 0; k <= M / 2; ++k) w.buf[(size_t) k] = w.M[e][(size_t) k];
         for (int k = 1; k < M / 2; ++k) w.buf[(size_t) (M - k)] = std::conj (w.M[e][(size_t) k]);

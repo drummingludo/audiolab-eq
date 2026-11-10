@@ -28,9 +28,14 @@
 //    conception 2.0). Le cache interpolé en gain demande une conception régulière en fonction du gain
 //    et de structure constante, ce que l'ajustement des corrections ne garantit pas encore.
 //    Limite connue : une bande dynamique dans l'aigu garde la précision de la 2.0.
+// 3.0, modes FIR :
+//  - Natural phase : les bandes dynamiques sont filtrées ici, après le FIR (FirSplit dit lesquelles) ;
+//  - Linear phase : le moteur ne fait que la détection et rend le gain dynamique de chaque échantillon
+//    (dynTrace), que le mélange de FIR applique (LinearPhaseCore.h).
 #pragma once
 #include "EqMath.h"
 #include <atomic>
+#include <cstdint>
 #include <vector>
 
 namespace audiolab::eq
@@ -428,6 +433,18 @@ public:
     // (0 = conceptions de la 2.0, pour les mesures « avant » du banc de test).
     int corrections = maxCorrections;
 
+    // Natural phase : partage du travail entre le FIR et cette chaîne.
+    //  cur : bandes filtrées ici, après le FIR en place ; old : après le FIR sortant, pendant un fondu
+    //  où ce partage change. oldL / oldR portent alors la sortie du FIR sortant et t la position du
+    //  fondu (0 → 1) : les bandes qui arrivent traitent la nouvelle sortie, celles qui partent
+    //  l'ancienne, puis le fondu est fait ici, puis les bandes communes traitent le résultat.
+    //  Les autres bandes ne font que leur détection ; une bande dynamique pas encore dans le partage
+    //  fait déjà tourner ses filtres, sans effet sur le son (états prêts quand le FIR la lâche).
+    struct FirSplit { uint32_t cur = 0, old = 0; float* oldL = nullptr; float* oldR = nullptr; const float* t = nullptr; };
+    // Linear phase : décalage dynamique (dB) de chaque échantillon, écrit pour les bandes dynamiques
+    // dont le pointeur n'est pas nul (même indice d'échantillon que le signal passé à process()).
+    std::array<float*, maxBands> dynTrace {};
+
     void prepare (double sampleRate)
     {
         fs = sampleRate;
@@ -458,7 +475,7 @@ public:
     // Retour au mode zéro latence : les états des filtres (figés pendant les modes FIR) repartent de zéro
     void clearFilterStates()
     {
-        for (auto& b : bands) { for (auto& c : b.st) for (auto& x : c) x[0] = x[1] = 0.0; }
+        for (auto& b : bands) { for (auto& c : b.st) for (auto& x : c) x[0] = x[1] = 0.0; b.firRun = false; }
         soloSt[0][0] = soloSt[0][1] = soloSt[1][0] = soloSt[1][1] = 0;
     }
 
@@ -469,7 +486,9 @@ public:
     // Traitement en place. R peut être nul (mono). bypassIIR : n'applique pas la chaîne IIR
     // (modes FIR) mais fait tourner les détecteurs ; l'écoute solo se fait alors à part (solo()).
     // scL / scR : side-chain externe (nuls s'il n'est pas branché ; scR nul si mono).
-    void process (float* L, float* R, int n, bool bypassIIR, const float* scL = nullptr, const float* scR = nullptr)
+    // split : Natural phase (voir FirSplit) ; l'écoute solo se fait alors à part, comme avec bypassIIR.
+    void process (float* L, float* R, int n, bool bypassIIR, const float* scL = nullptr, const float* scR = nullptr,
+                  const FirSplit* split = nullptr)
     {
         // Sous-blocs réguliers : la phase est gardée d'un appel à l'autre, pour que la trajectoire des
         // réglages ne dépende pas de la taille des blocs de l'hôte.
@@ -488,12 +507,47 @@ public:
             // Copie d'entrée pour l'écoute solo (signal avant égalisation)
             for (int i = 0; i < len; ++i) { inL[i] = l[i]; inR[i] = r != nullptr ? r[i] : l[i]; }
 
-            for (auto& b : bands)
+            traceOff = off;
+            if (split == nullptr || bypassIIR)
             {
-                if (b.wet <= 0.0 && b.wetTarget <= 0.0 && ! b.detecting) continue;
-                processBand (b, l, r, len, phase, B, bypassIIR, sl, sr);
+                for (auto& b : bands)
+                {
+                    if (b.wet <= 0.0 && b.wetTarget <= 0.0 && ! b.detecting) continue;
+                    processBand (b, l, r, len, phase, B, bypassIIR ? 1 : 0, sl, sr);
+                }
+                if (! bypassIIR) solo (inL, inR, l, r, len);
             }
-            if (! bypassIIR) solo (inL, inR, l, r, len);
+            else
+            {
+                float* ol = split->oldL != nullptr ? split->oldL + off : nullptr;
+                float* orr = ol != nullptr && r != nullptr && split->oldR != nullptr ? split->oldR + off : nullptr;
+                for (int pass = 0; pass < 2; ++pass)
+                {
+                    for (int bi = 0; bi < maxBands; ++bi)
+                    {
+                        auto& b = bands[(size_t) bi];
+                        const bool inCur = ((split->cur >> bi) & 1u) != 0;
+                        const bool inOld = ol != nullptr ? ((split->old >> bi) & 1u) != 0 : inCur;
+                        if ((pass == 1) != (inCur && inOld)) continue;
+                        if (b.wet <= 0.0 && b.wetTarget <= 0.0 && ! b.detecting) { b.firRun = false; continue; }
+                        // 0 : filtre ; 1 : détection seule ; 2 : filtres qui tournent sans effet (bande bientôt confiée)
+                        const int how = inCur || inOld ? 0 : (b.detecting && b.dynFull != 0.0 ? 2 : 1);
+                        if (how != 1 && ! b.firRun) for (auto& c : b.st) for (auto& x : c) x[0] = x[1] = 0.0;
+                        b.firRun = how != 1;
+                        if (inOld && ! inCur) processBand (b, ol, orr, len, phase, B, how, sl, sr);
+                        else processBand (b, l, r, len, phase, B, how, sl, sr);
+                    }
+                    if (pass == 0 && ol != nullptr)
+                    {
+                        const float* t = split->t + off;
+                        for (int i = 0; i < len; ++i)
+                        {
+                            l[i] = ol[i] * (1.0f - t[i]) + l[i] * t[i];
+                            if (r != nullptr && orr != nullptr) r[i] = orr[i] * (1.0f - t[i]) + r[i] * t[i];
+                        }
+                    }
+                }
+            }
             phase = (phase + len) % B;
             off += len;
         }
@@ -580,6 +634,7 @@ private:
 
         // dynamique
         bool detecting = false, detValid = false;
+        bool firRun = false;          // Natural phase : les filtres tournaient au sous-bloc précédent
         SectionRT det;
         double detSt[2][2] {};
         double env = 0, dynOffset = 0;
@@ -594,6 +649,7 @@ private:
         {
             coefAtk = coefRel = -1;
             init = false; structure = false; wet = 0; wetTarget = 0; wetStart = 0; nsec = 0; detValid = false;
+            firRun = false;
             env = 0; dynOffset = 0; dynOut.store (0.0f);
             fresh = true; smooth = false; histValid = false; settle = 0; playDyn = false; rtOk = false;
             lastDesignOk = false;
@@ -894,12 +950,13 @@ private:
     }
 
     // len échantillons d'un sous-bloc de B échantillons, à partir de la position ph
-    void processBand (Band& b, float* l, float* r, int len, int ph, int B, bool bypassIIR, const float* scl, const float* scr)
+    // how : 0 = filtre ; 1 = détection seule (modes FIR) ; 2 = les filtres tournent, sans effet sur le son
+    void processBand (Band& b, float* l, float* r, int len, int ph, int B, int how, const float* scl, const float* scr)
     {
         const bool stereo = r != nullptr;
         const bool det = b.detecting;
-        const double dw = (b.wet - b.wetStart) / B, w0 = b.wetStart + dw * ph;
-        const bool filt = ! bypassIIR && (b.wetStart > 0.0 || b.wet > 0.0);
+        const double dw = how == 2 ? 0.0 : (b.wet - b.wetStart) / B, w0 = how == 2 ? 0.0 : b.wetStart + dw * ph;
+        const bool filt = how != 1 && (b.wetStart > 0.0 || b.wet > 0.0);
 
         if (det && ! legacyStepping) { processDynamic (b, l, r, len, w0, dw, filt, scl, scr); return; }
 
@@ -951,12 +1008,15 @@ private:
         // 1) détecteur sur tout le tronçon (entrée de la bande, ou side-chain externe) : gain total par échantillon
         double tot[subBlock];
         double dynLast = b.dynOffset;
+        float* trace = dynTrace[(size_t) (&b - bands.data())];
+        if (trace != nullptr) trace += traceOff;
         for (int i = 0; i < len; ++i)
         {
             if (ext) detect (b, scl[i], scStereo ? scr[i] : scl[i], scStereo || stereo);
             else detect (b, l[i], stereo ? r[i] : l[i], stereo);
             dynLast = b.dynGain (b.env);
             tot[i] = b.gDb + dynLast;
+            if (trace != nullptr) trace[i] = (float) dynLast;
         }
         b.dynOffset = dynLast;
         b.dynOut.store ((float) dynLast, std::memory_order_relaxed);
@@ -1137,5 +1197,6 @@ private:
     double soloSt[2][2] {};
     float inL[subBlock] {}, inR[subBlock] {};
     int phase = 0;     // position dans le sous-bloc en cours
+    int traceOff = 0;  // position du tronçon en cours dans le bloc passé à process() (dynTrace)
 };
 } // namespace audiolab::eq
