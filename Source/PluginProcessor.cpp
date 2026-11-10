@@ -18,9 +18,10 @@ public:
         {
             wait (25);
             proc.linear.collectGarbage();
-            const int mode = proc.activeMode.load();
+            // (réglage à préparer : celui en place, ou celui qui arrive pendant un changement de mode)
+            const int mode = proc.designMode.load();
             if (mode == P::phaseZero) { last.clear(); continue; }
-            const int N = proc.activeN.load();
+            const int N = proc.designN.load();
             const auto snap = proc.makeSnapshot (proc.stereoLayout.load());
             const auto fm = mode == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear;
             // Bandes dynamiques (3.0) : celles que le moteur traite (Natural) ne demandent aucune
@@ -51,6 +52,8 @@ public:
                 displayDone = display;
                 proc.linear.design (snap, fm, N, display);
             }
+            // résolution Auto : longueur vérifiée par la mesure (une fois par réglage)
+            if (mode == P::phaseLinear && proc.linResIndex() == 0 && ! threadShouldExit()) proc.verifyAutoLength (snap);
         }
     }
 
@@ -158,7 +161,7 @@ LinearPhase::Snapshot AudioLabEqProcessor::makeSnapshot (bool stereo) const
         if (sp.active && d.on && canBeDynamic (sp.shape))
         {
             s.dyn.full[(size_t) b] = d.rangeDb * gainScale();
-            s.dyn.now[(size_t) b] = engine.getDynOffset (b);
+            s.dyn.now[(size_t) b] = eng().getDynOffset (b);
         }
     }
     return s;
@@ -189,8 +192,48 @@ int AudioLabEqProcessor::desiredFirLength (int mode, bool playing) const
     for (int b = 0; b < maxBands; ++b) need = std::max (need, fir::requiredLength (bands[(size_t) b], fs, fir::Mode::linear, span[(size_t) b]));
     int n = fir::minLength (fs);
     while (n < fir::maxLength (fs) && n < need) n *= 2;
+    // 3.0 : la longueur de la règle est vérifiée par la mesure (fil de conception) et allongée tant que
+    // l'écart à la cible dépasse 0,1 dB. Tant que la vérification de ces réglages n'est pas arrivée,
+    // on ne raccourcit pas (sinon la latence ferait un aller-retour à chaque retouche).
+    const uint64_t key = autoKey (bands, span, stereoLayout.load(), fs), ver = autoVerified.load();
+    if (ver != 0 && (ver & ~uint64_t (3)) == (key & ~uint64_t (3))) n = std::max (n, fir::minLength (fs) << (int) (ver & 3));
+    else if (cur > n) n = cur;
     if (cur > 0 && n < cur && need > 0.4 * cur) n = cur;   // hystérésis : on ne raccourcit que nettement
     return n;
+}
+
+// Clé des réglages dont dépend la longueur Auto (bandes actives, plage dynamique, voies, fréquence d'échantillonnage)
+uint64_t AudioLabEqProcessor::autoKey (const std::array<BandSpec, maxBands>& bands, const std::array<double, maxBands>& span, bool stereo, double fs)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h] (double v)
+    {
+        uint64_t u; std::memcpy (&u, &v, sizeof u);
+        for (int i = 0; i < 8; ++i) { h ^= (u >> (8 * i)) & 0xffu; h *= 1099511628211ull; }
+    };
+    mix (fs); mix (stereo ? 1.0 : 0.0);
+    for (int b = 0; b < maxBands; ++b)
+    {
+        const auto& s = bands[(size_t) b];
+        if (! s.active) { mix (-1.0); continue; }
+        mix ((double) (int) s.shape); mix ((double) s.slope); mix ((double) (int) s.place); mix (s.freq); mix (s.gainDb); mix (s.q);
+        mix (s.slopeFree); mix (s.brick ? 1.0 : 0.0); mix (fir::isDynamicSpan (s, span[(size_t) b]) ? span[(size_t) b] : 0.0);
+    }
+    return h;
+}
+
+// Fil de conception (ou prepareToPlay) : longueur Auto vérifiée pour ces réglages, publiée pour le fil audio
+void AudioLabEqProcessor::verifyAutoLength (const LinearPhase::Snapshot& snap)
+{
+    const std::lock_guard<std::mutex> lock (verifyMutex);
+    const double fs = getSampleRateSafe();
+    const uint64_t key = autoKey (snap.bands, snap.dyn.full, snap.stereo, fs);
+    if (key == lastVerifyKey && autoVerified.load() != 0) return;
+    const int n = fir::verifiedAutoLength (snap.bands, snap.dyn.full, snap.stereo, fs, verifyWork, verifyTmp, verifyScratch);
+    int idx = 0;
+    for (int len = fir::minLength (fs); len < n && idx < 3; len *= 2) ++idx;
+    autoVerified.store ((key & ~uint64_t (3)) | (uint64_t) idx);
+    lastVerifyKey = key;
 }
 
 int AudioLabEqProcessor::latencyForMode (int mode) const
@@ -200,17 +243,18 @@ int AudioLabEqProcessor::latencyForMode (int mode) const
     return linear.latencyFor (mode == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear, N);
 }
 
-// Bascule effective (pendant le silence) : latence annoncée, retards, FIR neutre en attendant la conception
+// Réglage de départ (prepareToPlay) : latence annoncée, retards, FIR neutre en attendant la conception
 void AudioLabEqProcessor::applySwitch (int mode, int N)
 {
     activeMode = mode;
     activeN = N;
+    designMode = mode; designN = N;
+    curMode = mode; curN = N;
     currentLatency = mode == P::phaseZero ? 0 : linear.latencyFor (mode == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear, N);
     setLatencySamples (currentLatency);
     latencyNow = currentLatency;
     // (le signal sec et l'historique du FIR sont tenus à jour en continu : rien à vider)
     if (mode != P::phaseZero) linear.switchTo (mode == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear, N);
-    else engine.clearFilterStates();
     if (designer != nullptr) designer->poke();
 }
 
@@ -218,25 +262,41 @@ void AudioLabEqProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     juce::ignoreUnused (samplesPerBlock);
     stereoLayout = getMainBusNumInputChannels() > 1;
-    engine.prepare (sampleRate);
+    for (auto& e : engines) { e.prepare (sampleRate); e.setSolo (soloBand); }
+    engIdx = 0;
     linear.prepare (sampleRate);
+    autoG.prepare (sampleRate);
     const int maxLat = fir::maxLength (sampleRate) / 2 + fir::partitionSize (sampleRate);
     for (auto* v : { &dryRingL, &dryRingR, &scRingL, &scRingR }) v->assign ((size_t) (maxLat + chunk + 1), 0.0f);
     dryW = 0;
-    for (auto* v : { &dlyL, &dlyR, &detL, &detR, &scDL, &scDR, &mono, &oldL, &oldR, &fadeT }) v->assign ((size_t) chunk, 0.0f);
+    for (auto* v : { &dlyL, &dlyR, &detL, &detR, &scDL, &scDR, &mono, &oldL, &oldR, &fadeT,
+                     &nwL, &nwR, &dl2L, &dl2R, &det2L, &det2R, &sc2L, &sc2R }) v->assign ((size_t) chunk, 0.0f);
     traceBuf.assign ((size_t) maxBands * (size_t) chunk, 0.0f);
-    for (int b = 0; b < maxBands; ++b) { tracePtr[(size_t) b] = traceBuf.data() + (size_t) b * (size_t) chunk; engine.dynTrace[(size_t) b] = nullptr; }
+    trace2.assign ((size_t) maxBands * (size_t) chunk, 0.0f);
+    for (int b = 0; b < maxBands; ++b)
+    {
+        tracePtr[(size_t) b] = traceBuf.data() + (size_t) b * (size_t) chunk;
+        tracePtr2[(size_t) b] = trace2.data() + (size_t) b * (size_t) chunk;
+        for (auto& e : engines) e.dynTrace[(size_t) b] = nullptr;
+    }
     outSm.reset (sampleRate, 0.03);
     bypassSm.reset (sampleRate, 0.02);
     bypassSm.setCurrentAndTargetValue (getParam (P::bypass) > 0.5f ? 1.0f : 0.0f);
-    specsValid = false;
-    computeAutoGain();
-    const float g = juce::Decibels::decibelsToGain (getParam (P::outGain) + (getParam (P::autoGain) > 0.5f ? autoGainDb.load() : 0.0f));
+    {
+        // Auto gain : part de la prévision d'après la courbe (la mesure de sonie prend le relais dès qu'il y a du signal)
+        std::array<BandSpec, maxBands> specs;
+        for (int b = 0; b < maxBands; ++b) specs[(size_t) b] = getBandSpec (b, true);
+        autoG.setCurve (specs, stereoLayout.load(), phaseMode() == P::phaseLinear);
+        autoG.setRunning (getParam (P::autoGain) > 0.5f);
+    }
+    const float g = juce::Decibels::decibelsToGain (getParam (P::outGain) + (getParam (P::autoGain) > 0.5f ? autoG.gainDb() : 0.0f));
     outSm.setCurrentAndTargetValue (g);
 
     // réglage de départ, sans fondu ; en mode FIR, le FIR est conçu tout de suite (hors temps réel)
     activeMode = P::phaseZero; activeN = 0;
     const int mode = phaseMode();
+    // (résolution Auto : longueur vérifiée par la mesure dès le départ)
+    if (mode == P::phaseLinear && linResIndex() == 0) verifyAutoLength (makeSnapshot (stereoLayout.load()));
     const int N = desiredFirLength (mode, false);
     applySwitch (mode, N);
     if (mode != P::phaseZero)
@@ -245,55 +305,169 @@ void AudioLabEqProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         linear.design (makeSnapshot (stereoLayout.load()), m, N, false);
         linear.switchTo (m, N);
     }
-    sw = Sw::idle; swGain = 1.0f; swStep = 0.0f;
+    sw = Sw::idle; switching = false;
 }
 
 void AudioLabEqProcessor::updateEngineTargets (bool)
 {
     const double sc = gainScale();
-    for (int b = 0; b < maxBands; ++b) engine.setBand (b, getBandSpec (b, false), getDyn (b), sc);
-}
-
-static bool sameSpec (const BandSpec& a, const BandSpec& b)
-{
-    if (a.active != b.active) return false;
-    if (! a.active) return true;
-    return a.shape == b.shape && a.slope == b.slope && a.place == b.place
-        && a.freq == b.freq && a.gainDb == b.gainDb && a.q == b.q
-        && a.slopeFree == b.slopeFree && a.brick == b.brick;
-}
-
-void AudioLabEqProcessor::computeAutoGain()
-{
-    // Compensation = moyenne de la courbe statique (en dB) entre 40 Hz et 16 kHz, pondérée en log.
-    // Recalculée seulement quand une bande change (aucune allocation : fil audio).
-    std::array<BandSpec, maxBands> specs;
-    bool same = specsValid;
     for (int b = 0; b < maxBands; ++b)
     {
-        specs[(size_t) b] = getBandSpec (b, true);
-        if (same && ! sameSpec (specs[(size_t) b], lastSpecs[(size_t) b])) same = false;
+        const auto spec = getBandSpec (b, false);
+        const auto dyn = getDyn (b);
+        for (auto& e : engines) e.setBand (b, spec, dyn, sc);
     }
-    if (same) return;
-    lastSpecs = specs;
-    specsValid = true;
-    const double fs = getSampleRateSafe();
-    constexpr int np = 48;
-    double sum = 0;
-    Design d;
-    for (const auto& s : specs)
+}
+
+// ── Pré-écho du FIR en place (mesuré par le fil de conception) ─────────
+AudioLabEqProcessor::PreEcho AudioLabEqProcessor::getPreEcho() const
+{
+    const int m = activeMode.load();
+    if (m == P::phaseZero) return {};
+    return linear.getPreEcho (m == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear, activeN.load());
+}
+
+juce::String AudioLabEqProcessor::getPreEchoText() const
+{
+    if (activeMode.load() == P::phaseZero) return {};
+    return juce::String::fromUTF8 (fir::preEchoText (getPreEcho()).c_str());
+}
+
+// ── Changement de mode de phase ou de longueur : les deux chemins en parallèle ──
+// A = chemin en place (curMode, currentLatency, chaîne eng()), B = chemin qui arrive (pendMode, pendLat,
+// l'autre chaîne). En entrée, l / r portent le signal sec du tronçon ; dlyL / dlyR, detL / detR,
+// scDL / scDR sont déjà prêts pour A. En sortie, l / r et dlyL / dlyR portent le mélange des deux chemins.
+void AudioLabEqProcessor::renderDual (float* l, float* r, int n, const float* scL, const float* scR, bool stereo, uint32_t dynMask)
+{
+    auto& eA = eng();
+    auto& eB = engines[(size_t) (1 - engIdx.load (std::memory_order_relaxed))];
+    const int mA = curMode, mB = pendMode;
+    const bool firA = mA != P::phaseZero, firB = mB != P::phaseZero;
+    const bool linA = mA == P::phaseLinear, linB = mB == P::phaseLinear;
+    const bool natA = mA == P::phaseNatural, natB = mB == P::phaseNatural;
+    const int ringLen = (int) dryRingL.size();
+    const int w0 = (dryW - n + ringLen) % ringLen;
+    const int lagB = ! firB ? 0 : linB ? std::max (0, pendLat - linear.partition()) : pendLat;
+
+    // signal sec retardé de la latence de B, entrée et side-chain de son détecteur, copie de l'entrée pour B
+    for (int i = 0; i < n; ++i)
     {
-        if (! s.active) continue;
-        design (s, fs, d, false);
-        // Mid, Side, G, D : la bande ne touche qu'une partie du signal stéréo
-        const double w = s.place == Place::stereo ? 1.0 : 0.5;
-        for (int i = 0; i < np; ++i)
+        const int w = (w0 + i) % ringLen;
+        const int ri = (w - pendLat + ringLen) % ringLen;
+        dl2L[(size_t) i] = dryRingL[(size_t) ri]; dl2R[(size_t) i] = dryRingR[(size_t) ri];
+        if (firB)
         {
-            const double f = 40.0 * std::pow (16000.0 / 40.0, (i + 0.5) / np);
-            sum += w * 20.0 * std::log10 (std::max (1e-6, std::abs (response (d, f, fs, false))));
+            const int di = (w - lagB + ringLen) % ringLen;
+            det2L[(size_t) i] = dryRingL[(size_t) di]; det2R[(size_t) i] = dryRingR[(size_t) di];
+            sc2L[(size_t) i] = scRingL[(size_t) di]; sc2R[(size_t) i] = scRingR[(size_t) di];
+        }
+        nwL[(size_t) i] = l[i]; nwR[(size_t) i] = r != nullptr ? r[i] : l[i];
+    }
+    float* bl = nwL.data();
+    float* br = stereo ? nwR.data() : nullptr;
+    for (int b = 0; b < maxBands; ++b)
+    {
+        const bool tr = linB && ((dynMask >> b) & 1u) != 0;
+        float* row = trace2.data() + (size_t) b * (size_t) chunk;
+        eB.dynTrace[(size_t) b] = tr ? row : nullptr;
+        if (tr) std::fill (row, row + n, 0.0f);
+    }
+    const float* aScL = scL != nullptr ? scDL.data() : nullptr;
+    const float* aScR = scR != nullptr ? scDR.data() : nullptr;
+    const float* bScL = scL != nullptr ? sc2L.data() : nullptr;
+    const float* bScR = scR != nullptr ? sc2R.data() : nullptr;
+
+    // Linear phase : détecteurs seuls, sur l'entrée retardée de chaque chemin
+    if (linA) eA.process (detL.data(), stereo ? detR.data() : nullptr, n, true, aScL, aScR);
+    if (linB) eB.process (det2L.data(), stereo ? det2R.data() : nullptr, n, true, bScL, bScR);
+    // zéro latence : la chaîne IIR
+    if (! firA) eA.process (l, r, n, false, scL, scR);
+    if (! firB) eB.process (bl, br, n, false, scL, scR);
+
+    // FIR : par tronçons qui s'arrêtent aux blocs de partition (le partage FIR / moteur y est constant)
+    if (firA || firB)
+    {
+        std::array<const float*, maxBands> trA {}, trB {};
+        for (int o = 0; o < n;)
+        {
+            const auto st = linear.outState();
+            const int m = std::min (n - o, linear.untilBoundary());
+            for (int b = 0; b < maxBands; ++b) { trA[(size_t) b] = tracePtr[(size_t) b] + o; trB[(size_t) b] = tracePtr2[(size_t) b] + o; }
+            float* ar = r != nullptr ? r + o : nullptr;
+            float* brr = br != nullptr ? br + o : nullptr;
+            Engine::FirSplit sp;
+            if (firA && firB)
+            {
+                // le nouveau jeu sur place dans B, l'ancien rendu à part dans A (l / r)
+                linear.process (bl + o, brr, m, linB ? trB.data() : nullptr, linB ? dynMask : 0u, l + o, ar, fadeT.data() + o,
+                                linA ? trA.data() : nullptr, linA ? dynMask : 0u);
+                if (natA) { sp.cur = st.old; sp.old = st.old; eA.process (l + o, ar, m, false, aScL != nullptr ? aScL + o : nullptr, aScR != nullptr ? aScR + o : nullptr, &sp); }
+                if (natB) { sp.cur = st.cur; sp.old = st.cur; eB.process (bl + o, brr, m, false, bScL != nullptr ? bScL + o : nullptr, bScR != nullptr ? bScR + o : nullptr, &sp); }
+            }
+            else if (firB)
+            {
+                // zéro latence → FIR : seul le nouveau jeu existe
+                linear.process (bl + o, brr, m, linB ? trB.data() : nullptr, linB ? dynMask : 0u);
+                if (natB) { sp.cur = st.cur; sp.old = st.cur; eB.process (bl + o, brr, m, false, bScL != nullptr ? bScL + o : nullptr, bScR != nullptr ? bScR + o : nullptr, &sp); }
+            }
+            else
+            {
+                // FIR → zéro latence : le jeu en place continue comme en régime établi
+                if (linA) linear.process (l + o, ar, m, trA.data(), dynMask);
+                else
+                {
+                    linear.process (l + o, ar, m, nullptr, 0, oldL.data() + o, stereo ? oldR.data() + o : nullptr, fadeT.data() + o);
+                    sp.cur = st.cur; sp.old = st.old;
+                    if (st.split) { sp.oldL = oldL.data() + o; sp.oldR = stereo ? oldR.data() + o : nullptr; sp.t = fadeT.data() + o; }
+                    eA.process (l + o, ar, m, false, aScL != nullptr ? aScL + o : nullptr, aScR != nullptr ? aScR + o : nullptr, &sp);
+                }
+            }
+            o += m;
         }
     }
-    autoGainDb.store ((float) juce::jlimit (-24.0, 24.0, -sum / np));
+    if (firA) eA.solo (dlyL.data(), stereo ? dlyR.data() : nullptr, l, r, n);
+    if (firB) eB.solo (dl2L.data(), stereo ? dl2R.data() : nullptr, bl, br, n);
+
+    if (sw == Sw::preRoll)
+    {
+        // le nouveau chemin tourne sans être entendu ; corrélation des deux sorties sur les 40 dernières
+        // millisecondes de la mise en route, en deux fenêtres de 20 ms
+        for (int i = std::max (0, swLen - 2 * corrLen - swCount); i < n; ++i)
+        {
+            auto& c = corr[swCount + i < swLen - corrLen ? 0 : 1];
+            const double a = l[i], b = bl[i];
+            c.xx += a * a; c.yy += b * b; c.xy += a * b;
+            if (r != nullptr && br != nullptr) { const double e = r[i], d = br[i]; c.xx += e * e; c.yy += d * d; c.xy += e * d; }
+        }
+        return;
+    }
+    // Fondu enchaîné à puissance constante pour la corrélation mesurée ρ (bornée à 0…1) :
+    // sortie = a·ancien + b·nouveau, avec a² + b² + 2ab·ρ = 1 (ρ = 1 : fondu linéaire ; ρ = 0 : sinus / cosinus)
+    const double rho = swRho, halfPi = 0.5 * juce::MathConstants<double>::pi;
+    for (int i = 0; i < n; ++i)
+    {
+        const double u = (double) (swCount + i + 1) / (double) swLen, h = u * u * (3.0 - 2.0 * u);
+        const double b = std::sin (halfPi * h);
+        const double a = std::max (0.0, -b * rho + std::sqrt (std::max (0.0, 1.0 - b * b * (1.0 - rho * rho))));
+        const float fa = (float) a, fb = (float) b;
+        l[i] = fa * l[i] + fb * bl[i];
+        dlyL[(size_t) i] = fa * dlyL[(size_t) i] + fb * dl2L[(size_t) i];
+        if (r != nullptr)
+        {
+            r[i] = fa * r[i] + fb * nwR[(size_t) i];
+            dlyR[(size_t) i] = fa * dlyR[(size_t) i] + fb * dl2R[(size_t) i];
+        }
+    }
+}
+
+// Fin du fondu : le nouveau chemin devient le chemin en place
+void AudioLabEqProcessor::finishSwitch()
+{
+    if (curMode != P::phaseZero && pendMode != P::phaseZero) linear.endSwitch();
+    for (auto& e : engines) for (auto& t : e.dynTrace) t = nullptr;
+    engIdx = 1 - engIdx.load();
+    curMode = pendMode; curN = pendN; currentLatency = pendLat;
+    sw = Sw::idle; switching = false;
 }
 
 void AudioLabEqProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -327,55 +501,97 @@ void AudioLabEqProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     else if (auto* ph = getPlayHead())
         if (auto pos = ph->getPosition()) playing = pos->getIsPlaying();
 
-    // Mode de phase / longueur du FIR : un changement de latence passe par un fondu (≈ 5 ms)
+    // Mode de phase / longueur du FIR. Un changement de latence se fait sans silence (3.0) : le chemin en
+    // place continue pendant que le fil de conception prépare le FIR ; puis le nouveau chemin tourne en
+    // parallèle (mise en route), et un fondu enchaîné de 20 ms passe de l'un à l'autre.
+    const double fs = getSampleRateSafe();
     const int mode = phaseMode();
     const int wantN = desiredFirLength (mode, playing);
+    auto request = [this] (int m, int N)
+    {
+        pendMode = m; pendN = N; swCount = 0;
+        swDesigns = linear.designsDone();
+        designMode = m; designN = N;
+        if (designer != nullptr) designer->poke();
+    };
     if (sw == Sw::idle)
     {
         const bool latencyChange = mode != activeMode.load() || (mode == P::phaseLinear && wantN != activeN.load());
-        if (latencyChange)
-        {
-            pendMode = mode; pendN = wantN;
-            sw = Sw::fadeOut; swStep = -1.0f / (float) (0.005 * getSampleRateSafe());
-        }
+        if (latencyChange) { sw = Sw::waitDesign; switching = true; request (mode, wantN); }
         else if (mode == P::phaseNatural && wantN != activeN.load())
-            activeN = wantN;   // Natural phase : la longueur change sans toucher à la latence (fondu entre FIR)
+        { activeN = wantN; designN = wantN; curN = wantN; }   // Natural phase : la longueur change sans toucher à la latence (fondu entre FIR)
     }
-    else if (sw == Sw::wait)
+    else if (sw == Sw::waitDesign)
     {
-        // silence jusqu'à ce que le FIR soit conçu (au plus 0,5 s) ; son historique d'entrée est déjà complet
-        swCount += total;
-        if (linear.ready() || swCount > juce::roundToInt (0.5 * getSampleRateSafe()))
-        { sw = Sw::fadeIn; swStep = 1.0f / (float) (0.005 * getSampleRateSafe()); }
+        if (mode == curMode && (mode != P::phaseLinear || wantN == curN))
+        {
+            // demande annulée avant le fondu : on reste sur le chemin en place
+            sw = Sw::idle; switching = false;
+            designMode = curMode; designN = curN;
+            if (designer != nullptr) designer->poke();
+        }
+        else if (mode != pendMode || (mode != P::phaseZero && wantN != pendN)) request (mode, wantN);
+    }
+    if (sw == Sw::waitDesign)
+    {
+        const bool toZero = pendMode == P::phaseZero;
+        const auto fm = pendMode == P::phaseNatural ? fir::Mode::natural : fir::Mode::linear;
+        // FIR prêt : un jeu conçu depuis la demande, pour le réglage demandé (au plus 0,5 s d'attente,
+        // après quoi on part avec un FIR neutre, remplacé par fondu dès que le vrai arrive)
+        const bool ready = toZero || (linear.designsDone() != swDesigns && linear.designReady (fm, pendN));
+        if ((ready && ! linear.fading()) || swCount > juce::roundToInt (0.5 * fs))
+        {
+            auto& nb = engines[(size_t) (1 - engIdx.load())];
+            nb.prepare (fs);
+            nb.seedDetectors (eng());
+            nb.setSolo (soloBand);
+            pendLat = toZero ? 0 : linear.latencyFor (fm, pendN);
+            if (! toZero) linear.beginSwitch (fm, pendN, curMode != P::phaseZero);
+            sw = Sw::preRoll; swCount = 0;
+            // mise en route : un bloc de partition (première sortie du nouveau FIR), 20 ms pour que les
+            // filtres du nouveau chemin se posent, puis 40 ms de mesure de la corrélation des deux sorties
+            swLen = linear.partition() + juce::roundToInt (0.06 * fs);
+            corrLen = juce::roundToInt (0.02 * fs);
+            corr[0] = corr[1] = Corr(); swRho = 0.0;
+        }
+        else swCount += total;
     }
 
     updateEngineTargets (stereo);
-    computeAutoGain();
-    const float og = getParam (P::outGain) + (getParam (P::autoGain) > 0.5f ? autoGainDb.load() : 0.0f);
-    outSm.setTargetValue (juce::Decibels::decibelsToGain (og));
+    // Auto gain à sonie égale : courbe en place (décalage immédiat du gain quand une bande bouge), mesure plus bas
+    const bool agOn = getParam (P::autoGain) > 0.5f;
+    {
+        std::array<BandSpec, maxBands> specs;
+        for (int b = 0; b < maxBands; ++b) specs[(size_t) b] = getBandSpec (b, true);
+        // (modes FIR : le nouveau FIR n'est entendu qu'après sa conception, la mesure attend)
+        if (autoG.setCurve (specs, stereo, curMode == P::phaseLinear) && curMode != P::phaseZero) autoG.hold (0.5);
+        autoG.setRunning (agOn);
+    }
     bypassSm.setTargetValue (getParam (P::bypass) > 0.5f ? 1.0f : 0.0f);
 
     float* L = buffer.getWritePointer (0);
     float* R = stereo ? buffer.getWritePointer (1) : nullptr;
     const int ringLen = (int) dryRingL.size();
     float pkL = 0, pkR = 0;
-    const double fs = getSampleRateSafe();
     // bandes dont la dynamique est en service (Linear phase : leur gain est suivi à chaque échantillon)
     uint32_t dynMask = 0;
     for (int b = 0; b < maxBands; ++b)
         if (bandValue (b, P::fDyn) > 0.5f && bandValue (b, P::fUsed) > 0.5f && bandValue (b, P::fOn) > 0.5f) dynMask |= 1u << b;
 
-    for (int off = 0; off < total; off += chunk)
+    for (int off = 0; off < total;)
     {
-        const int n = std::min (chunk, total - off);
+        const bool dual = sw == Sw::preRoll || sw == Sw::fade;
+        int n = std::min (chunk, total - off);
+        if (dual) n = std::min (n, swLen - swCount);   // (les étapes du changement de mode tombent sur un tronçon)
+        auto& engine = eng();
         float* l = L + off;
         float* r = R != nullptr ? R + off : nullptr;
-        const int am = activeMode.load();
-        const bool fir = am != P::phaseZero, linPhase = am == P::phaseLinear;
+        const int am = curMode;
+        const bool isFir = am != P::phaseZero, linPhase = am == P::phaseLinear;
         // Linear phase : le détecteur lit l'entrée retardée de la latence moins un bloc de partition,
         // son gain est appliqué par le mélange de FIR un bloc plus tard, sur le bon échantillon.
         // Natural phase : le moteur traite la sortie du FIR ; seul le side-chain externe est retardé, de la latence.
-        const int detLag = ! fir ? 0 : linPhase ? std::max (0, currentLatency - linear.partition()) : currentLatency;
+        const int detLag = ! isFir ? 0 : linPhase ? std::max (0, currentLatency - linear.partition()) : currentLatency;
         for (int b = 0; b < maxBands; ++b)
         {
             const bool tr = linPhase && ((dynMask >> b) & 1u) != 0;
@@ -397,7 +613,7 @@ void AudioLabEqProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             }
             const int ri = (dryW - currentLatency + ringLen) % ringLen;
             dlyL[(size_t) i] = dryRingL[(size_t) ri]; dlyR[(size_t) i] = dryRingR[(size_t) ri];
-            if (fir)
+            if (isFir)
             {
                 const int di = (dryW - detLag + ringLen) % ringLen;
                 detL[(size_t) i] = dryRingL[(size_t) di]; detR[(size_t) i] = dryRingR[(size_t) di];
@@ -407,7 +623,9 @@ void AudioLabEqProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
         tapPre.push (mono.data(), n);
 
-        if (! fir)
+        if (dual)
+            renderDual (l, r, n, scInL != nullptr ? scInL + off : nullptr, scInR != nullptr ? scInR + off : nullptr, stereo, dynMask);
+        else if (! isFir)
         {
             linear.feed (l, r, n);   // historique du FIR à jour : passage en phase linéaire sans attente
             engine.process (l, r, n, false, scInL != nullptr ? scInL + off : nullptr, scInR != nullptr ? scInR + off : nullptr);
@@ -440,42 +658,56 @@ void AudioLabEqProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             engine.solo (dlyL.data(), stereo ? dlyR.data() : nullptr, l, r, n);
         }
 
-        bool doSwitch = false;
+        // Auto gain : sonie de l'entrée (recalée sur la sortie) et de la sortie avant gain ; la mesure est
+        // suspendue pendant un changement de mode et pendant l'écoute solo
+        if (agOn)
+        {
+            if (dual || engine.soloActive()) autoG.hold (0.2);
+            autoG.process (dlyL.data(), stereo ? dlyR.data() : nullptr, l, r, n);
+        }
+        const float og = getParam (P::outGain) + (agOn ? autoG.gainDb() : 0.0f);
+        outSm.setTargetValue (juce::Decibels::decibelsToGain (og));
+
         for (int i = 0; i < n; ++i)
         {
             const float g = outSm.getNextValue(), b = bypassSm.getNextValue();
-            if (sw == Sw::fadeOut)
-            {
-                swGain += swStep;
-                if (swGain <= 0.0f) { swGain = 0.0f; doSwitch = true; sw = Sw::wait; }
-            }
-            else if (sw == Sw::fadeIn)
-            {
-                swGain += swStep;
-                if (swGain >= 1.0f) { swGain = 1.0f; sw = Sw::idle; }
-            }
-            else if (sw == Sw::wait) swGain = 0.0f;
             float ol = l[i] * g, orr = r != nullptr ? r[i] * g : 0.0f;
-            ol = (ol * (1.0f - b) + dlyL[(size_t) i] * b) * swGain;
+            ol = ol * (1.0f - b) + dlyL[(size_t) i] * b;
             l[i] = ol;
             pkL = std::max (pkL, std::abs (ol));
             if (r != nullptr)
             {
-                orr = (orr * (1.0f - b) + dlyR[(size_t) i] * b) * swGain;
+                orr = orr * (1.0f - b) + dlyR[(size_t) i] * b;
                 r[i] = orr;
                 pkR = std::max (pkR, std::abs (orr));
             }
             mono[(size_t) i] = r != nullptr ? 0.5f * (ol + orr) : ol;
         }
         tapPost.push (mono.data(), n);
-        if (doSwitch)
+        if (dual)
         {
-            // silence atteint : bascule, puis attente du premier FIR conçu (au plus 300 ms)
-            applySwitch (pendMode, pendN);
-            swCount = 0;
-            if (pendMode == P::phaseZero) { sw = Sw::fadeIn; swStep = 1.0f / (float) (0.005 * fs); }
-            else sw = Sw::wait;
+            swCount += n;
+            if (swCount >= swLen)
+            {
+                if (sw == Sw::preRoll)
+                {
+                    // début du fondu : c'est maintenant que la nouvelle latence est annoncée à l'hôte
+                    // Corrélation retenue : la plus petite des deux fenêtres, bornée à 0…1. Un son tenu (note
+                    // de basse, sinus) donne deux fois la même valeur : le fondu est alors réglé pour lui.
+                    // Un bruit donne deux valeurs au hasard : on revient vers le fondu à puissance constante.
+                    auto rhoOf = [] (const Corr& c) { return c.xx > 1.0e-12 && c.yy > 1.0e-12 ? c.xy / std::sqrt (c.xx * c.yy) : 0.0; };
+                    const int law = testFadeLaw.load();
+                    swRho = law == 1 ? 0.0 : law == 2 ? 1.0 : law == 3 ? juce::jlimit (0.0, 1.0, rhoOf (corr[1]))
+                                                                       : juce::jlimit (0.0, 1.0, std::min (rhoOf (corr[0]), rhoOf (corr[1])));
+                    sw = Sw::fade; swCount = 0; swLen = juce::roundToInt (0.02 * fs);
+                    activeMode = pendMode; activeN = pendN;
+                    setLatencySamples (pendLat);
+                    latencyNow = pendLat;
+                }
+                else finishSwitch();
+            }
         }
+        off += n;
     }
     if (R == nullptr) pkR = pkL;
     peakL.store (std::max (peakL.load(), pkL));

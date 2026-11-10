@@ -14,6 +14,9 @@
 //  - Natural phase : le jeu dit quelles bandes sont confiées au moteur zéro latence (engineMask).
 //    Quand ce partage change, le fondu entre l'ancien et le nouveau FIR n'est pas fait ici : les deux
 //    sorties sont rendues séparément, le moteur traite chacune avec ses bandes puis fait le fondu.
+// 3.0, changement de mode de phase ou de longueur sans silence (beginSwitch / endSwitch) : l'ancien
+// jeu et le nouveau, de latences différentes, sont rendus en parallèle à partir du même historique
+// d'entrée ; le fondu enchaîné entre les deux sorties est fait par l'appelant (PluginProcessor).
 // Aucune allocation dans le fil audio : tout est réservé dans prepare() ; les jeux de FIR sont créés
 // sur le fil de conception et transmis sans verrou (pointeurs atomiques).
 //
@@ -91,11 +94,14 @@ public:
             for (auto& c : *v) c.assign ((size_t) P, 0.0f);
         work.assign ((size_t) 4 * P, 0.0f);
         acc.assign ((size_t) bins, 0.0f);
-        for (auto& g : gIn) g.assign ((size_t) P, 0.0f);
+        for (auto& bank : gIn) for (auto& g : bank) g.assign ((size_t) P, 0.0f);
         wts.assign ((size_t) fir::maxMix * (size_t) (fir::maxSeg + 1) * (size_t) P, 0.0f);
         devOut.assign ((size_t) P, 0.0f);
         wProd.assign ((size_t) P, 0.0f);
-        gHave = 0; gSeen = 0;
+        gHave[0] = gHave[1] = 0; gSeen[0] = gSeen[1] = 0;
+        swHold = false;
+        pendingStamp.store (0);
+        { const std::lock_guard<std::mutex> dl (displayMutex); preEcho = {}; preEchoMode = -1; preEchoN = 0; }
 
         // FIR neutres (retard pur) de toutes les longueurs, prêts d'avance
         int N = fir::minLength (fs);
@@ -122,8 +128,8 @@ public:
     {
         mode = m; activeN = N;
         if (old != nullptr) { release (old); old = nullptr; xfade = 0; }
-        rdSplit = false;
-        for (auto& g : gIn) std::fill (g.begin(), g.end(), 0.0f);
+        rdSplit = false; swHold = false;
+        for (auto& bank : gIn) for (auto& g : bank) std::fill (g.begin(), g.end(), 0.0f);
         if (auto* p = pending.exchange (nullptr))
         {
             if (matches (*p)) { setCurrent (p); rdCur = cur->plan.engineMask; return; }
@@ -135,6 +141,61 @@ public:
 
     // Vrai quand le FIR en place correspond au réglage actif (conçu, pas neutre)
     bool ready() const { return cur != nullptr && ! cur->neutral && matches (*cur); }
+
+    // ── Changement de mode / de longueur sans silence (3.0) ────────────────
+    // Fil audio : vrai quand le dernier jeu déposé par le fil de conception est pour ce réglage
+    // (lecture d'une étiquette atomique : le jeu lui-même n'est pas touché).
+    bool designReady (fir::Mode m, int N) const { return pendingStamp.load() == stampOf (m, N); }
+    // Fil audio : un fondu entre deux FIR du même réglage est en cours (attendre avant beginSwitch)
+    bool fading() const { return old != nullptr; }
+
+    // Fil audio : passe au réglage (m, N). keepOld : le jeu en place continue d'être rendu en parallèle
+    // (sortie par oldL / oldR de process(), avec ses propres gains dynamiques : oldTrace) jusqu'à
+    // endSwitch() ; sinon (on vient du mode zéro latence) seul le nouveau jeu est rendu. La sortie du
+    // nouveau jeu n'existe qu'à partir du bloc de partition suivant : d'ici là, c'est celle de l'ancien
+    // (ou du silence) ; l'appelant ne commence son fondu qu'après ce délai.
+    void beginSwitch (fir::Mode m, int N, bool keepOld)
+    {
+        if (old != nullptr) { release (old); old = nullptr; xfade = 0; }
+        Set* prev = cur;
+        mode = m; activeN = N;
+        Set* next = nullptr;
+        if (auto* p = pending.exchange (nullptr))
+        {
+            if (matches (*p)) next = p;
+            else if (! toTrash (p)) delete p;   // (ne devrait pas arriver : 8 places)
+        }
+        if (next == nullptr) next = m == fir::Mode::linear ? neutralLin[(size_t) indexOfLength (N)] : neutralNat;
+        if (keepOld && prev != nullptr && prev != next)
+        {
+            old = prev; cur = next; swHold = true;
+            for (size_t c = 0; c < 2; ++c) std::copy (outBuf[c].begin() + pos, outBuf[c].end(), outOld[c].begin() + pos);
+            for (size_t b = 0; b < (size_t) maxBands; ++b)
+            {
+                std::copy (gIn[0][b].begin(), gIn[0][b].end(), gIn[1][b].begin());
+                std::fill (gIn[0][b].begin(), gIn[0][b].end(), 0.0f);
+            }
+            gHave[1] = gHave[0]; gSeen[1] = gSeen[0]; gHave[0] = 0; gSeen[0] = 0;
+            rdSplit = true; rdDone = 0; rdOld = rdCur;
+        }
+        else
+        {
+            setCurrent (next); swHold = false; rdSplit = false;
+            for (auto& c : outBuf) std::fill (c.begin() + pos, c.end(), 0.0f);
+            for (auto& g : gIn[0]) std::fill (g.begin(), g.end(), 0.0f);
+            gHave[0] = 0; gSeen[0] = 0;
+        }
+        rdCur = cur->plan.engineMask;
+    }
+
+    // Fil audio : fin du fondu de l'appelant, l'ancien jeu n'est plus rendu
+    void endSwitch()
+    {
+        if (! swHold) return;
+        if (old != nullptr) { release (old); old = nullptr; }
+        swHold = false; rdSplit = false; xfade = 0;
+    }
+    bool switching() const { return swHold; }
 
     // Répartition des bandes dynamiques qu'aurait un jeu conçu pour ce réglage (fil de conception)
     fir::Plan planFor (const Snapshot& snap, fir::Mode m, int N) const
@@ -190,8 +251,23 @@ public:
         }
         set->dev = lastDevs;
         if (auto* replaced = pending.exchange (set)) delete replaced;
+        pendingStamp.store (stampOf (m, N));
         designCount.fetch_add (1);
+        {
+            // pré-écho du FIR de référence (jamais calculé dans le fil audio)
+            const auto pe = fir::measurePreEcho (result, fs);
+            const std::lock_guard<std::mutex> dl (displayMutex);
+            preEcho = pe; preEchoMode = (int) m; preEchoN = N;
+        }
         if (wantDisplay) makeDisplay (m, N, plan);
+    }
+
+    // Pré-écho du dernier FIR conçu pour ce réglage (tous les fils) ; valeurs nulles s'il n'y en a pas encore
+    fir::PreEcho getPreEcho (fir::Mode m, int N) const
+    {
+        const std::lock_guard<std::mutex> dl (displayMutex);
+        if (preEchoMode != (int) m || (m == fir::Mode::linear && preEchoN != N)) return {};
+        return preEcho;
     }
 
     // Fil de conception : libère les jeux déjà remplacés
@@ -227,27 +303,39 @@ public:
     //   de la latence moins un bloc) ; les autres bandes sont à 0.
     // oldL / oldR / tOut : quand outState().split est vrai, sortie du FIR sortant et position du fondu
     //   (0 → 1) pour chaque échantillon ; s'ils sont nuls, le fondu est fait ici.
+    // oldTrace / oldTraceMask : pendant un changement de mode (beginSwitch), gains dynamiques du jeu sortant.
     void process (float* L, float* R, int n, const float* const* trace = nullptr, uint32_t traceMask = 0,
-                  float* oldL = nullptr, float* oldR = nullptr, float* tOut = nullptr)
+                  float* oldL = nullptr, float* oldR = nullptr, float* tOut = nullptr,
+                  const float* const* oldTrace = nullptr, uint32_t oldTraceMask = 0)
     {
         if (cur == nullptr) return;
-        if (old == nullptr && freeTrashSlots() >= 2)
-            if (auto* p = pending.load())
-                if (matches (*p)) install (pending.exchange (nullptr));
+        // (l'étiquette dit si le jeu déposé est pour le réglage en place : le jeu n'est lu qu'une fois retiré)
+        if (old == nullptr && freeTrashSlots() >= 2 && pendingStamp.load() == stampOf (mode, activeN))
+            if (auto* p = pending.exchange (nullptr))
+            {
+                if (matches (*p)) install (p);
+                else if (! toTrash (p)) lost = p;
+            }
         float* ch[2] = { L, R };
         float* och[2] = { oldL, oldR };
         const int nch = R != nullptr ? 2 : 1;
         if (trace == nullptr) traceMask = 0;
+        if (oldTrace == nullptr || ! swHold) oldTraceMask = 0;
+        const float* const* trs[2] = { trace, oldTrace };
+        const uint32_t masks[2] = { traceMask, oldTraceMask };
         for (int i = 0; i < n;)
         {
             const int m = std::min (n - i, P - pos);
-            gSeen |= traceMask;
-            for (uint32_t rest = traceMask | gHave; rest != 0; rest &= rest - 1)
+            for (int k = 0; k < (swHold ? 2 : 1); ++k)
             {
-                int b = 0; while (((rest >> b) & 1u) == 0) ++b;
-                float* g = gIn[(size_t) b].data() + pos;
-                if ((traceMask >> b) & 1u) std::copy (trace[b] + i, trace[b] + i + m, g);
-                else std::fill (g, g + m, 0.0f);
+                gSeen[k] |= masks[k];
+                for (uint32_t rest = masks[k] | gHave[k]; rest != 0; rest &= rest - 1)
+                {
+                    int b = 0; while (((rest >> b) & 1u) == 0) ++b;
+                    float* g = gIn[(size_t) k][(size_t) b].data() + pos;
+                    if ((masks[k] >> b) & 1u) std::copy (trs[k][b] + i, trs[k][b] + i + m, g);
+                    else std::fill (g, g + m, 0.0f);
+                }
             }
             for (int c = 0; c < nch; ++c)
             {
@@ -270,7 +358,7 @@ public:
                 pos = 0;
                 processBlock (nch);
                 // (bande sortie du masque : son gain est remis à 0 pendant un bloc entier, puis oublié)
-                gHave = gSeen; gSeen = 0;
+                for (int k = 0; k < 2; ++k) { gHave[k] = gSeen[k]; gSeen[k] = 0; }
             }
         }
     }
@@ -320,10 +408,10 @@ private:
         for (auto& f : fdl) std::fill (f.begin(), f.end(), 0.0f);
         for (auto* v : { &lastIn, &inBuf, &outBuf, &outOld })
             for (auto& c : *v) std::fill (c.begin(), c.end(), 0.0f);
-        for (auto& g : gIn) std::fill (g.begin(), g.end(), 0.0f);
+        for (auto& bank : gIn) for (auto& g : bank) std::fill (g.begin(), g.end(), 0.0f);
         head = 0; pos = 0;
         if (old != nullptr) { release (old); old = nullptr; }
-        xfade = 0; rdSplit = false; gHave = 0; gSeen = 0;
+        xfade = 0; rdSplit = false; swHold = false; gHave[0] = gHave[1] = 0; gSeen[0] = gSeen[1] = 0;
     }
 
     // remplace le FIR courant sans fondu
@@ -436,10 +524,16 @@ private:
     {
         inputSpectra (nch);
         firCount = 0;
-        renderSet (*cur, nch, outBuf);
-        if (old != nullptr)
+        renderSet (*cur, nch, outBuf, 0);
+        if (old != nullptr && swHold)
         {
-            renderSet (*old, nch, outOld);
+            // changement de mode : l'ancien jeu est rendu à part, avec ses gains ; le fondu est fait par l'appelant
+            renderSet (*old, nch, outOld, 1);
+            rdSplit = true; rdDone = 0; rdOld = old->plan.engineMask;
+        }
+        else if (old != nullptr)
+        {
+            renderSet (*old, nch, outOld, 0);
             const int done = xfadeBlocks - xfade;
             // partage FIR / moteur différent : les deux sorties sont rendues telles quelles
             const bool split = cur->plan.engineMask != old->plan.engineMask;
@@ -462,7 +556,7 @@ private:
     }
 
     // Sortie d'un jeu pour le bloc : référence, puis FIR d'écart mélangés à chaque échantillon
-    void renderSet (const Set& s, int nch, std::array<std::vector<float>, 2>& dst)
+    void renderSet (const Set& s, int nch, std::array<std::vector<float>, 2>& dst, int bank)
     {
         for (int o = 0; o < nch; ++o) outputBlock (s.H, s, o, nch, dst[(size_t) o].data());
         firCount += nch;
@@ -477,7 +571,7 @@ private:
             const auto& m = pl.mb[k];
             float* w = wts.data() + (size_t) k * perBand;
             std::fill (w, w + (size_t) (m.nSeg + 1) * stride, 0.0f);
-            const float* g = gIn[(size_t) m.band].data();
+            const float* g = gIn[(size_t) bank][(size_t) m.band].data();
             for (int j = 0; j < P; ++j)
             {
                 if (g[j] == 0.0f) { w[j] = 1.0f; used[k][0] = true; continue; }
@@ -609,8 +703,10 @@ private:
     int xfade = 0;
 
     // bandes dynamiques : gain du détecteur pour le bloc à venir, poids des ancres, sortie d'un FIR d'écart
-    std::array<std::vector<float>, maxBands> gIn;
-    uint32_t gHave = 0, gSeen = 0;
+    // (deux jeux de gains : 0 = jeu en place, 1 = jeu sortant pendant un changement de mode)
+    std::array<std::array<std::vector<float>, maxBands>, 2> gIn;
+    uint32_t gHave[2] {}, gSeen[2] {};
+    bool swHold = false;
     std::vector<float> wts, devOut, wProd;
     int firCount = 0;
     long firTotal = 0, blockTotal = 0;
@@ -627,6 +723,9 @@ private:
     std::array<Set*, 4> neutralLin {};
     Set* neutralNat = nullptr;
     std::atomic<Set*> pending { nullptr };
+    // réglage du dernier jeu déposé dans pending (0 : aucun) ; Natural phase : la longueur ne compte pas
+    static int stampOf (fir::Mode m, int N) { return m == fir::Mode::linear ? (N << 1) | 1 : 2; }
+    std::atomic<int> pendingStamp { 0 };
     std::array<std::atomic<Set*>, 8> trash {};
     std::atomic<bool> prepared { false };
     std::mutex designMutex;
@@ -641,6 +740,8 @@ private:
     std::vector<double> hm, hs;
     mutable std::mutex displayMutex;
     DisplayData display;
+    fir::PreEcho preEcho;
+    int preEchoMode = -1, preEchoN = 0;
     std::atomic<int> displayVer { 0 };
     std::atomic<int> designCount { 0 };
 };
