@@ -28,14 +28,17 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include "FracSlopeTable.h"
 
 namespace audiolab::eq
 {
 constexpr int maxBands = 24;
 constexpr double pi = 3.14159265358979323846;
 
-enum class Shape { bell = 0, lowShelf, lowCut, highShelf, highCut, notch, bandPass, tiltShelf };
-constexpr int numShapes = 8;
+// (3.0 : flatTilt et allPass ajoutés À LA FIN ; les index 0 à 7 gardent leur sens)
+enum class Shape { bell = 0, lowShelf, lowCut, highShelf, highCut, notch, bandPass, tiltShelf, flatTilt, allPass };
+constexpr int numShapes = 10;
+constexpr int numLegacyShapes = 8;   // formes des versions 1.x et 2.0
 enum class Place { stereo = 0, left, right, mid, side };
 constexpr int numPlaces = 5;
 
@@ -43,26 +46,59 @@ constexpr int slopeValues[] = { 6, 12, 18, 24, 30, 36, 48, 72, 96 };
 constexpr int numSlopes = 9;
 
 inline bool isCut (Shape s)        { return s == Shape::lowCut || s == Shape::highCut; }
-inline bool hasGain (Shape s)      { return s == Shape::bell || s == Shape::lowShelf || s == Shape::highShelf || s == Shape::tiltShelf; }
+inline bool hasGain (Shape s)      { return s == Shape::bell || s == Shape::lowShelf || s == Shape::highShelf || s == Shape::tiltShelf
+                                         || s == Shape::flatTilt; }
+// (All pass : la pente choisit l'ordre, 6 dB/oct = ordre 1, sinon ordre 2)
 inline bool usesSlope (Shape s)    { return s == Shape::lowCut || s == Shape::highCut || s == Shape::bandPass
-                                         || s == Shape::lowShelf || s == Shape::highShelf || s == Shape::tiltShelf; }
+                                         || s == Shape::lowShelf || s == Shape::highShelf || s == Shape::tiltShelf || s == Shape::allPass; }
 inline bool usesQ (Shape s, int slope)
 {
+    if (s == Shape::flatTilt) return false;
+    if (s == Shape::allPass) return slope > 6;
     if (s == Shape::tiltShelf) return slope > 6;
     if (s == Shape::lowShelf || s == Shape::highShelf) return slope > 6;
     if (isCut (s)) return slope > 6;
     return true;
 }
-inline bool canBeDynamic (Shape s) { return hasGain (s); }
+// Flat tilt : 9 sections, conception trop coûteuse pour suivre un gain à chaque échantillon : pas de dynamique
+inline bool canBeDynamic (Shape s) { return hasGain (s) && s != Shape::flatTilt; }
+
+// Pente libre des coupes (paramètre slope_free) : 0 = « pente de la liste », sinon 6 à 96 dB/oct par pas de 0,1
+constexpr double slopeFreeMax = 96.0;
 
 struct BandSpec
 {
     bool active = false;           // bande utilisée et activée
     Shape shape = Shape::bell;
     double freq = 1000.0, gainDb = 0.0, q = 1.0;
-    int slope = 12;                // dB/octave
+    int slope = 12;                // dB/octave (liste)
     Place place = Place::stereo;
+    // 3.0 (coupes seulement ; valeurs neutres = comportement 2.0)
+    double slopeFree = 0.0;        // dB/octave ; 0 = utiliser « slope »
+    bool brick = false;            // Brickwall
 };
+
+// Pente d'une coupe en dixièmes de dB/octave (pente libre arrondie à 0,1 dB/oct et ramenée entre 6 et 96, sinon pente de la liste)
+inline int cutSlopeTenths (const BandSpec& b)
+{
+    if (isCut (b.shape) && b.slopeFree > 0.0) return std::clamp ((int) std::lround (b.slopeFree * 10.0), 60, 960);
+    return b.slope * 10;
+}
+inline double cutSlope (const BandSpec& b) { return 0.1 * cutSlopeTenths (b); }
+inline bool isBrick (const BandSpec& b) { return b.brick && isCut (b.shape); }
+// Variantes par bande (tiennent compte de la pente libre et du Brickwall)
+inline bool usesQ (const BandSpec& b)
+{
+    if (isBrick (b)) return false;
+    if (isCut (b.shape)) return cutSlopeTenths (b) > 60;
+    return usesQ (b.shape, b.slope);
+}
+// Ordre entier équivalent d'une coupe (longueur des FIR, repères de la correction)
+inline int cutOrder (const BandSpec& b)
+{
+    if (isBrick (b)) return 16;
+    return std::clamp ((cutSlopeTenths (b) + 59) / 60, 1, 16);
+}
 
 // Section élémentaire : SVF du 2e ordre ou filtre du 1er ordre (TPT).
 struct Section
@@ -78,13 +114,17 @@ struct Section
 // Nombre maximal de sections d'une bande : 8 SVF + 1er ordre éventuel (coupes), plus les sections
 // de correction du mode zéro latence (voir matched::correct).
 constexpr int maxCorrections = 3;
-constexpr int maxSections = 9 + maxCorrections;
+constexpr int maxSections = 16;   // (3.0 : 12 → 16 pour les pentes libres, le Flat tilt et le Brickwall)
 
 struct Design
 {
     std::array<Section, maxSections> s {};
     int n = 0;
     double outGain = 1.0;
+    // Mur (Brickwall en Linear phase, cible des FIR seulement) : +1 coupe-haut, −1 coupe-bas, à wallFreq (Hz),
+    // adouci par une gaussienne d'écart-type wallSigma (Hz)
+    int wall = 0;
+    double wallFreq = 0.0, wallSigma = 0.0;
 };
 
 // Coefficients de Butterworth pour un filtre d'ordre N (sections du 2e ordre).
@@ -114,11 +154,181 @@ inline double clampFreq (double f, double fs, bool analog)
     return std::clamp (f, 5.0, analog ? 0.5 * fs * 1.5 : 0.4985 * fs);
 }
 
+// ── 3.0 : pentes libres des coupes ──────────────────────────────────────
+// Cible : module d'un Butterworth d'ordre fractionnaire n = pente / 6, |H|² = 1/(1 + (f/fc)^(2n)).
+// Aucune cascade finie ne le réalise exactement : on l'approche par un prototype normalisé (coupure 1)
+// fait de M pôles libres (sections d'ordre 2, plus un pôle réel si M est impair) et, sous 45 dB/oct, de
+// J paires pôle / zéro du premier ordre qui tiennent la pente fractionnaire jusque vers −60 dB.
+// Les prototypes ont été ajustés hors ligne (moindres carrés sur l'écart en dB) pour une liste de pentes
+// (FracSlopeTable.h) ; entre deux pentes voisines de même structure, les paramètres sont interpolés.
+// Une pente multiple de 6 dB/oct donne exactement le Butterworth classique.
+namespace frac
+{
+struct Proto
+{
+    int M = 0, J = 0;
+    double w1 = 1.0;               // pôle réel (M impair)
+    double w[8] {}, k[8] {};       // sections d'ordre 2 : pulsation, 1/Q
+    double p[3] {}, z[3] {};       // paires : pôle, zéro
+};
+
+// tenths : pente en dixièmes de dB/oct (61 … 959, pas multiple de 60). Faux si hors table.
+inline bool lookup (int tenths, Proto& out)
+{
+    for (int i = 0; i + 1 < numNodes; ++i)
+    {
+        const Node& a = nodes[i]; const Node& b = nodes[i + 1];
+        if (a.M != b.M || a.J != b.J || tenths < a.t || tenths > b.t) continue;
+        const double u = (double) (tenths - a.t) / (double) (b.t - a.t);
+        const float* da = data + a.off; const float* db = data + b.off;
+        int j = 0;
+        auto next = [&] { const double v = (double) da[j] + ((double) db[j] - (double) da[j]) * u; ++j; return std::exp (v); };
+        out.M = a.M; out.J = a.J;
+        if (a.M % 2) out.w1 = next();
+        for (int q = 0; q < a.M / 2; ++q) { out.w[q] = next(); out.k[q] = next(); }
+        for (int q = 0; q < a.J; ++q) { out.p[q] = next(); out.z[q] = next(); }
+        return true;
+    }
+    return false;
+}
+} // namespace frac
+
+// ── 3.0 : Brickwall ─────────────────────────────────────────────────────
+// Filtre elliptique d'ordre 12 (6 sections d'ordre 2), ondulation 0,03 dB dans la bande passante,
+// −110 dB dans la bande coupée, atteints 0,29 octave après la coupure (−3 dB à la fréquence de la bande).
+// Prototype passe-bas normalisé (−3 dB en 1) : pulsation des pôles, 1/Q, pulsation des zéros.
+namespace brick
+{
+constexpr int numSec = 6;
+constexpr double rippleDb = 0.03, stopDb = 110.0;
+constexpr double wp[numSec] = { 0.37683742900529699, 0.56631903983626131, 0.75405168386811949, 0.88499460017864429, 0.96156135636631923, 0.99593799417509032 };
+constexpr double kk[numSec] = { 1.7643968497167928, 0.9702896207213989, 0.51264924773290621, 0.26900963649046394, 0.12948619404060735, 0.038418628927113806 };
+constexpr double wz[numSec] = { 7.4245143871333337, 2.6216834802449327, 1.7447902068189298, 1.4239065018556376, 1.2855497877506916, 1.2315564764424418 };
+constexpr double gain = 0.99655208013476837;   // (ordre pair : le gain en continu est −0,03 dB)
+constexpr double stopEdge = 1.2254;   // début de la bande coupée (−110 dB), rapporté à la coupure
+} // namespace brick
+
+// ── 3.0 : Flat tilt ─────────────────────────────────────────────────────
+// Inclinaison à pente constante en dB/octave sur tout le spectre : |H| = (f / f0)^α, 0 dB à la fréquence
+// de la bande. Convention : le gain de la bande est l'écart entre 20 kHz et 20 Hz (+ = plus d'aigu),
+// soit α = gain / 60 et une pente de gain / 9,97 dB par octave.
+// Réalisation : N sections du premier ordre (un pôle, un zéro) de centres fixes c_i, zéro en c_i·e^(−a_i)
+// et pôle en c_i·e^(+a_i). Pour un petit α, le module en dB est linéaire en a_i : un système linéaire
+// (moindres carrés sur 64 fréquences de 20 Hz à 20 kHz) donne les a_i, puis deux retouches avec la même
+// matrice rattrapent la non-linéarité. Tout se passe dans le domaine du filtre numérique (tan (π f / fs)) :
+// la droite est suivie jusqu'à 20 kHz, sans écrasement près de Nyquist. Les a_i ne dépendent que de α et
+// de la fréquence d'échantillonnage : la fréquence de la bande ne change que le gain de sortie.
+// Une atténuation est l'inverse exact de l'accentuation (pôles et zéros échangés).
+namespace tilt
+{
+constexpr int maxN = 12, numDigital = 9, numAnalog = 12, npts = 64, refine = 2;
+constexpr double refHz = 1000.0, maxAlpha = 1.0;
+
+struct Basis
+{
+    double fs = 0; int N = 0;
+    double c[maxN] {}, P[npts] {}, L[npts] {};
+    double phi[npts][maxN + 1] {};
+    double ch[maxN + 1][maxN + 1] {};   // facteur de Cholesky des équations normales
+
+    void init (double rate, bool analog)
+    {
+        fs = rate; N = analog ? numAnalog : numDigital;
+        // numérique : points de 20 Hz à 20 kHz, centres de 8 Hz à 0,498 fs ;
+        // analogique (cible des FIR) : points de 10 Hz à la demi-fréquence d'échantillonnage, centres de 2 Hz à 4 fois plus haut
+        const double fLo = analog ? 10.0 : 20.0, fHi = analog ? std::max (20000.0, 0.5 * fs) : std::min (20000.0, 0.46 * fs);
+        const double cLo = analog ? 2.0 : 8.0, cHi = analog ? 4.0 * fHi : std::min (80000.0, 0.498 * fs);
+        auto dom = [&] (double f) { const double x = pi * f / fs; return analog ? x : std::tan (x); };
+        for (int i = 0; i < N; ++i) c[i] = dom (cLo * std::pow (cHi / cLo, (i + 0.5) / N));
+        for (int j = 0; j < npts; ++j)
+        {
+            const double f = fLo * std::pow (fHi / fLo, j / (npts - 1.0)), x = dom (f);
+            P[j] = x * x; L[j] = std::log (f / refHz);
+            for (int i = 0; i < N; ++i) phi[j][i] = 2.0 * P[j] / (c[i] * c[i] + P[j]);
+            phi[j][N] = 1.0;
+        }
+        const int n = N + 1;
+        double tr = 0;
+        for (int a = 0; a < n; ++a)
+            for (int b2 = 0; b2 <= a; ++b2)
+            {
+                double v = 0;
+                for (int j = 0; j < npts; ++j) v += phi[j][a] * phi[j][b2];
+                ch[a][b2] = v;
+                if (a == b2) tr += v;
+            }
+        for (int a = 0; a < n; ++a) ch[a][a] += 1e-10 * tr / n;
+        for (int j = 0; j < n; ++j)
+        {
+            double dd = ch[j][j];
+            for (int q = 0; q < j; ++q) dd -= ch[j][q] * ch[j][q];
+            dd = std::sqrt (std::max (1e-300, dd));
+            ch[j][j] = dd;
+            for (int i = j + 1; i < n; ++i)
+            {
+                double v = ch[i][j];
+                for (int q = 0; q < j; ++q) v -= ch[i][q] * ch[j][q];
+                ch[i][j] = v / dd;
+            }
+        }
+    }
+
+    // x = (ΦᵀΦ)⁻¹ Φᵀ r
+    void solve (const double* r, double* x) const
+    {
+        const int n = N + 1;
+        for (int a = 0; a < n; ++a) { double v = 0; for (int j = 0; j < npts; ++j) v += phi[j][a] * r[j]; x[a] = v; }
+        for (int i = 0; i < n; ++i) { double v = x[i]; for (int q = 0; q < i; ++q) v -= ch[i][q] * x[q]; x[i] = v / ch[i][i]; }
+        for (int i = n - 1; i >= 0; --i) { double v = x[i]; for (int q = i + 1; q < n; ++q) v -= ch[q][i] * x[q]; x[i] = v / ch[i][i]; }
+    }
+};
+
+struct Sol { double fs = 0, alpha = 0; int N = 0; double c[maxN] {}, a[maxN] {}, k = 0; };
+
+// Solution pour α > 0 (gardée d'un appel à l'autre : seule la fréquence de la bande bouge le plus souvent)
+inline const Sol& solve (double alpha, double fs, bool analog)
+{
+    static thread_local Basis basis[2];
+    static thread_local Sol last[2];
+    Sol& s = last[analog ? 1 : 0];
+    if (s.fs == fs && s.alpha == alpha) return s;
+    Basis& B = basis[analog ? 1 : 0];
+    if (B.fs != fs) B.init (fs, analog);
+    const int N = B.N;
+    double x[maxN + 1], r[npts], a[maxN], k;
+    B.solve (B.L, x);
+    for (int i = 0; i < N; ++i) a[i] = alpha * x[i];
+    k = alpha * x[N];
+    for (int it = 0; it < refine; ++it)
+    {
+        double ez[maxN], ep[maxN];
+        for (int i = 0; i < N; ++i) { const double e = std::exp (2.0 * a[i]) / (B.c[i] * B.c[i]); ez[i] = e; ep[i] = 1.0 / (B.c[i] * B.c[i] * B.c[i] * B.c[i] * e); }
+        for (int j = 0; j < npts; ++j)
+        {
+            // produit des rapports (1 + P/z²)/(1 + P/p²) : un seul logarithme par point
+            double num = 1.0, den = 1.0;
+            for (int i = 0; i < N; ++i) { num *= 1.0 + B.P[j] * ez[i]; den *= 1.0 + B.P[j] * ep[i]; }
+            r[j] = 0.5 * std::log (num / den) + k - alpha * B.L[j];
+        }
+        B.solve (r, x);
+        for (int i = 0; i < N; ++i) a[i] -= x[i];
+        k -= x[N];
+    }
+    s.fs = fs; s.alpha = alpha; s.N = N; s.k = k;
+    for (int i = 0; i < N; ++i) { s.c[i] = B.c[i]; s.a[i] = a[i]; }
+    return s;
+}
+} // namespace tilt
+
+inline double refFreqRatio (double f) { return tilt::refHz / std::clamp (f, 5.0, 96000.0); }
+
 // Prototype analogique (analog = true) ou conception bilinéaire (analog = false), comme en 1.x.
+// 3.0 : le Flat tilt, le Brickwall et le passe-tout sont conçus directement dans le domaine demandé.
 inline void designClassic (const BandSpec& b, double fs, Design& d, bool analog)
 {
     d.n = 0;
     d.outGain = 1.0;
+    d.wall = 0; d.wallFreq = 0.0; d.wallSigma = 0.0;
     const double f = clampFreq (b.freq, fs, analog);
     const double g0 = warp (f, fs, analog);
     const double q = std::clamp (b.q, 0.025, 40.0);
@@ -171,7 +381,48 @@ inline void designClassic (const BandSpec& b, double fs, Design& d, bool analog)
         case Shape::highCut:
         {
             const bool hp = b.shape == Shape::lowCut;
-            const int order = std::clamp (b.slope / 6, 1, 16);
+            if (isBrick (b))
+            {
+                // elliptique : le prototype est mis à l'échelle dans le domaine du filtre (en numérique,
+                // la forme reste exactement elliptique et le −3 dB tombe sur la fréquence de la bande)
+                for (int i = 0; i < brick::numSec; ++i)
+                {
+                    const double m = (brick::wp[i] / brick::wz[i]) * (brick::wp[i] / brick::wz[i]), k = brick::kk[i];
+                    if (hp) addSvf (g0 / brick::wp[i], k, 1.0, -k, m - 1.0);
+                    else addSvf (g0 * brick::wp[i], k, m, -m * k, 1.0 - m);
+                }
+                d.outGain = brick::gain;
+                break;
+            }
+            const int tenths = cutSlopeTenths (b);
+            frac::Proto fp;
+            if (tenths % 60 != 0 && frac::lookup (tenths, fp))
+            {
+                // pente libre : prototype d'ordre fractionnaire ; coupe-bas = miroir (s → 1/s)
+                auto at = [&] (double w) { return hp ? g0 / w : g0 * w; };
+                if (fp.M % 2) addOne (at (fp.w1), hp ? 0.0 : 1.0, hp ? 1.0 : 0.0);
+                for (int i = 0; i < fp.J; ++i)
+                {
+                    const double r = fp.p[i] / fp.z[i];
+                    if (hp) addOne (at (fp.p[i]), r, 1.0); else addOne (at (fp.p[i]), 1.0, r);
+                }
+                // la section la plus résonante en dernier ; elle suit le Q choisi (Q 0,71 = cible exacte)
+                const int nb = fp.M / 2;
+                int res = 0;
+                for (int i = 1; i < nb; ++i) if (fp.k[i] < fp.k[res]) res = i;
+                for (int pass = 0; pass < 2; ++pass)
+                    for (int i = 0; i < nb; ++i)
+                    {
+                        if ((i == res) != (pass == 1)) continue;
+                        double qi = 1.0 / fp.k[i];
+                        if (i == res) qi *= q / 0.7071067811865476;
+                        const double k = 1.0 / std::clamp (qi, 0.025, 60.0);
+                        if (hp) addSvf (at (fp.w[i]), k, 1.0, -k, -1.0);
+                        else addSvf (at (fp.w[i]), k, 0.0, 0.0, 1.0);
+                    }
+                break;
+            }
+            const int order = std::clamp (tenths / 60, 1, 16);
             double qs[8]; bool first = false;
             const int nb = butterworthQs (order, qs, first);
             if (first) addOne (g0, hp ? 0.0 : 1.0, hp ? 1.0 : 0.0);
@@ -197,6 +448,31 @@ inline void designClassic (const BandSpec& b, double fs, Design& d, bool analog)
             const int n = std::clamp (b.slope / 12, 1, 8);
             const double k = 1.0 / q;
             for (int i = 0; i < n; ++i) addSvf (g0, k, 0.0, k, 0.0);
+            break;
+        }
+        case Shape::flatTilt:
+        {
+            const double alpha = std::clamp (gain / 60.0, -tilt::maxAlpha, tilt::maxAlpha);
+            if (std::abs (alpha) < 1e-12) break;
+            const bool inv = alpha < 0;
+            const tilt::Sol& ts = tilt::solve (std::abs (alpha), fs, analog);
+            for (int i = 0; i < ts.N; ++i)
+            {
+                // (1 + s/z)/(1 + s/p), zéro en c·e^(−a), pôle en c·e^(+a) ; inverse : pôle et zéro échangés
+                const double e = std::exp (ts.a[i]);
+                if (inv) addOne (ts.c[i] / e, 1.0, 1.0 / (e * e));
+                else addOne (ts.c[i] * e, 1.0, e * e);
+            }
+            // 0 dB à la fréquence de la bande
+            d.outGain = std::exp (inv ? -ts.k : ts.k) * std::pow (refFreqRatio (b.freq), alpha);
+            break;
+        }
+        case Shape::allPass:
+        {
+            // module 1 partout ; ordre 1 (6 dB/oct) : −90° à la fréquence de la bande, −180° au-delà ;
+            // ordre 2 : −180° à la fréquence de la bande, −360° au-delà, transition réglée par Q
+            if (b.slope <= 6) addOne (g0, 1.0, -1.0);
+            else { const double k = 1.0 / q; addSvf (g0, k, 1.0, -2.0 * k, 0.0); }
             break;
         }
     }
@@ -1124,8 +1400,18 @@ inline void designMatched (const BandSpec& b, double fs, Design& d, int maxCorr 
     for (int i = 0; i < hintN; ++i) hs[i] = hint->s[(size_t) i];
     d.n = 0;
     d.outGain = 1.0;
+    d.wall = 0; d.wallFreq = 0.0; d.wallSigma = 0.0;
     // bande à 0 dB : traversée exacte (aucune section)
     if (hasGain (b.shape) && std::abs (b.gainDb) < 1e-9) return;
+    // 3.0 : formes conçues directement dans le domaine numérique (pas de prototype analogique à suivre).
+    //  - Flat tilt : la cible est la droite idéale, ajustée jusqu'à 20 kHz (tilt::solve) ;
+    //  - passe-tout : module exactement 1, rotation de 180° (ordre 2) ou 90° (ordre 1) exactement à la fréquence de la bande ;
+    //  - Brickwall : elliptique exact, −3 dB exactement à la fréquence de la bande.
+    if (b.shape == Shape::flatTilt || b.shape == Shape::allPass || isBrick (b))
+    {
+        designClassic (b, fs, d, false);
+        return;
+    }
 
     const double f = std::clamp (b.freq, 5.0, 0.49 * fs);
     BandSpec proto = b;
@@ -1166,6 +1452,8 @@ inline void designMatched (const BandSpec& b, double fs, Design& d, int maxCorr 
             case Shape::highCut:   kind = matched::Kind::lowpassLike; break;
             case Shape::bandPass:  kind = matched::Kind::bandpass; break;
             case Shape::notch:     kind = matched::Kind::notch; break;
+            case Shape::flatTilt:
+            case Shape::allPass:   break;   // (conçus plus haut)
         }
         if (! matched::sectionBiquad (a, kind, Wz, Qz, fs, bq[n]))
         {
@@ -1190,7 +1478,7 @@ inline void designMatched (const BandSpec& b, double fs, Design& d, int maxCorr 
     matched::correct (as, nBase, feat, nfeat, soft, fs, bq, n, std::min (maxCorr, std::min (maxCorrections, maxSections - nBase)),
                       hasGain (b.shape) || b.shape == Shape::highCut, invert, hintN > 0 ? hs : nullptr, hintN,
                       b.shape == Shape::highCut ? 1 : b.shape == Shape::lowCut ? -1 : 0,
-                      isCut (b.shape) ? std::clamp (b.slope / 6, 1, 16) : b.shape == Shape::bandPass ? std::clamp (b.slope / 12, 1, 8) : 0, cr);
+                      isCut (b.shape) ? cutOrder (b) : b.shape == Shape::bandPass ? std::clamp (b.slope / 12, 1, 8) : 0, cr);
 
     for (int i = 0; i < n; ++i)
     {
@@ -1245,6 +1533,26 @@ inline void design (const BandSpec& b, double fs, Design& d, bool analog = false
     else designMatched (b, fs, d);
 }
 
+// Cible des FIR (modes Linear phase et Natural phase) : prototype analogique. En Linear phase, le
+// Brickwall devient un vrai mur (tout ou rien), dont la transition est fixée par la longueur du FIR :
+// le mur est adouci par une gaussienne d'écart-type 2,3 fs / N, ce qui revient à multiplier la réponse
+// impulsionnelle du mur idéal par une gaussienne tombée à −110 dB au bord de la partie plate de la
+// fenêtre du FIR (70 % de sa longueur). La troncature ne laisse alors rien d'audible : la bande coupée
+// descend sous −96 dB, au prix d'une transition d'environ 15 fs / N (−0,1 dB → −96 dB).
+// (Un passe-tout y est neutre de lui-même : la phase linéaire ne garde que le module, qui vaut 1.)
+constexpr double wallSigmaFactor = 2.3;
+inline void designFir (const BandSpec& b, double fs, Design& d, bool linearPhase, int firLength)
+{
+    designClassic (b, fs, d, true);
+    if (linearPhase && isBrick (b))
+    {
+        d.n = 0; d.outGain = 1.0;
+        d.wall = b.shape == Shape::highCut ? 1 : -1;
+        d.wallFreq = b.freq;
+        d.wallSigma = wallSigmaFactor * fs / std::max (16, firLength);
+    }
+}
+
 // Ancienne conception (bilinéaire), pour les mesures « avant / après »
 inline void designBilinear (const BandSpec& b, double fs, Design& d) { designClassic (b, fs, d, false); }
 
@@ -1267,6 +1575,13 @@ inline std::complex<double> response (const Design& d, double f, double fs, bool
             const auto den = sj + 1.0;
             h *= (s.cLp + s.cHp * sj) / den;
         }
+    }
+    if (d.wall != 0)
+    {
+        // mur (cible des FIR en Linear phase) : 1 dans la bande passante, 0 au-delà ; −3 dB à la fréquence de la bande
+        const double side = d.wall > 0 ? f - d.wallFreq : d.wallFreq - f;   // > 0 : côté coupé
+        if (d.wallSigma > 0) h *= 0.5 * std::erfc (side / (d.wallSigma * 1.4142135623730951) - 0.38590);
+        else h *= side < 0 ? 1.0 : side > 0 ? 0.0 : 0.7071067811865476;
     }
     return h;
 }

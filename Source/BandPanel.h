@@ -77,6 +77,12 @@ public:
 
         for (int i = 0; i < eq::numShapes; ++i) shapeBox.addItem (P::shapeNames()[i], i + 1);
         for (int i = 0; i < eq::numSlopes; ++i) slopeBox.addItem (P::slopeNames()[i], i + 1);
+        // 3.0, interface minimale : Brickwall (paramètre bN_brick) et pente libre (bN_slopefree) pour les coupes.
+        // TODO interface 3.0 : remplacer ces deux entrées et la fenêtre de saisie par les contrôles définitifs
+        // (voir setCutSlope() plus bas : tout passe par fSlope, fSlopeFree et fBrick).
+        slopeBox.addSeparator();
+        slopeBox.addItem (fr ("Brickwall"), idBrick);
+        slopeBox.addItem (fr ("Custom…"), idCustom);
         for (int i = 0; i < eq::numPlaces; ++i) placeBox.addItem (P::placeNames()[i], i + 1);
         shapeBox.setTitle (fr ("Shape")); slopeBox.setTitle (fr ("Slope")); placeBox.setTitle (fr ("Stereo placement"));
         shapeBox.setTooltip (fr ("Filter shape"));
@@ -120,7 +126,13 @@ public:
             sync();
         };
         shapeBox.onChange = [this] { applyChoice (shapeBox, params::fShape); };
-        slopeBox.onChange = [this] { applyChoice (slopeBox, params::fSlope); };
+        slopeBox.onChange = [this]
+        {
+            const int id = slopeBox.getSelectedId();
+            if (id == idCustom) askCustomSlope();
+            else if (id == idBrick) setCutSlope (-1, 0.0f, true);
+            else if (id >= 1 && id <= eq::numSlopes) setCutSlope (id - 1, 0.0f, false);
+        };
         placeBox.onChange = [this] { applyChoice (placeBox, params::fPlace); };
 
         for (juce::Component* c : { (juce::Component*) &onBtn, (juce::Component*) &soloBtn, (juce::Component*) &delBtn,
@@ -173,6 +185,9 @@ public:
                 k->onGestureStart = [this] { proc.pushUndo(); };
                 addAndMakeVisible (k);
             }
+            // 3.0, interface minimale : clic droit sur Threshold = menu « Auto threshold » (paramètre bN_thrauto).
+            // TODO interface 3.0 : petit bouton « Auto » à côté du potentiomètre.
+            kThr->addMouseListener (this, false);
             title = fr ("Band ") + juce::String (b + 1);
         }
         else if (any) title = juce::String (count) + fr (" bands selected");
@@ -199,16 +214,38 @@ public:
         const bool dyn = proc.bandValue (b, P::fDyn) > 0.5f;
         setOn (dynBtn, dyn);
         shapeBox.setSelectedId ((int) shape + 1, juce::dontSendNotification);
-        slopeBox.setSelectedId (slopeIdx + 1, juce::dontSendNotification);
+        // 3.0 : Brickwall et pente libre des coupes (la bande telle que le moteur la voit)
+        const auto spec = proc.getBandSpec (b, false);
+        const bool cut = eq::isCut (shape);
+        slopeBox.setItemEnabled (idBrick, cut);
+        slopeBox.setItemEnabled (idCustom, cut);
+        if (eq::isBrick (spec)) slopeBox.setSelectedId (idBrick, juce::dontSendNotification);
+        else if (cut && spec.slopeFree > 0.0) slopeBox.setText (juce::String (eq::cutSlope (spec), 1) + " dB/oct", juce::dontSendNotification);
+        else slopeBox.setSelectedId (slopeIdx + 1, juce::dontSendNotification);
         placeBox.setSelectedId (juce::roundToInt (proc.bandValue (b, P::fPlace)) + 1, juce::dontSendNotification);
-        const int slope = eq::slopeValues[juce::jlimit (0, eq::numSlopes - 1, slopeIdx)];
         dim (&slopeBox, eq::usesSlope (shape), 0.4f);
         dim (&dynBtn, eq::canBeDynamic (shape), 0.4f);
         dim (kGain.get(), eq::hasGain (shape));
-        dim (kQ.get(), eq::usesQ (shape, slope));
+        dim (kQ.get(), eq::usesQ (spec));
+        // un passe-tout ne change que la phase : il n'a aucun effet en Linear phase
+        const auto shapeTip = shape == eq::Shape::allPass && proc.phaseMode() == P::phaseLinear
+                                  ? fr ("All pass only rotates the phase: it has no effect in Linear phase mode")
+                            : shape == eq::Shape::allPass ? fr ("All pass: flat level, phase rotation only (slope 6 dB/oct = 1st order, otherwise 2nd order with Q)")
+                            : shape == eq::Shape::flatTilt ? fr ("Flat tilt: constant slope across the whole spectrum; Gain = level difference between 20 kHz and 20 Hz")
+                                                           : fr ("Filter shape");
+        if (shapeBox.getTooltip() != shapeTip) shapeBox.setTooltip (shapeTip);
         const bool dynOn = dyn && eq::canBeDynamic (shape);
         for (juce::Component* c : { (juce::Component*) kThr.get(), (juce::Component*) kRange.get(), (juce::Component*) kAtt.get(), (juce::Component*) kRel.get() })
             dim (c, dynOn);
+        // seuil automatique : le potentiomètre Threshold n'agit plus (grisé), le seuil suit le niveau moyen de la bande
+        const bool thrAuto = proc.bandValue (b, P::fThrAuto) > 0.5f;
+        if (kThr != nullptr)
+        {
+            if (dynOn && thrAuto) kThr->setAlpha (0.35f);
+            const auto thrTip = thrAuto ? fr ("Auto threshold is on: the threshold follows the average level of the band (right-click to turn it off)")
+                                        : fr ("Level above which the dynamic band acts (right-click: Auto threshold)");
+            if (kThr->getTooltip() != thrTip) kThr->setTooltip (thrTip);
+        }
         const bool ext = proc.bandValue (b, P::fSc) > 0.5f;
         scBox.setSelectedId (ext ? 2 : 1, juce::dontSendNotification);
         dim (&scBox, dynOn, 0.4f);
@@ -245,7 +282,62 @@ public:
         }
     }
 
+    // 3.0, interface minimale : clic droit sur le potentiomètre Threshold
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (kThr == nullptr || band < 0 || ! e.mods.isPopupMenu()) return;
+        if (e.eventComponent != kThr.get() && ! kThr->isParentOf (e.eventComponent)) return;
+        const bool on = proc.bandValue (band, params::fThrAuto) > 0.5f;
+        juce::PopupMenu m;
+        m.addItem (fr ("Auto threshold"), true, on, [safe = juce::Component::SafePointer<BandPanel> (this), on]
+        {
+            if (safe == nullptr || safe->band < 0) return;
+            safe->proc.pushUndo();
+            safe->proc.setBandValue (safe->band, params::fThrAuto, on ? 0.0f : 1.0f);
+            safe->display.refresh(); safe->sync();
+        });
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (kThr.get()));
+    }
+
 private:
+    static constexpr int idBrick = 101, idCustom = 102;
+
+    // Pente d'une coupe pour la sélection : entrée de la liste (index ≥ 0), pente libre en dB/oct (> 0) ou Brickwall
+    void setCutSlope (int listIndex, float freeDbPerOct, bool brickwall)
+    {
+        if (band < 0) return;
+        namespace P = params;
+        proc.pushUndo();
+        for (int b : display.getSelection())
+        {
+            if (listIndex >= 0) proc.setBandValue (b, P::fSlope, (float) listIndex);
+            proc.setBandValue (b, P::fSlopeFree, freeDbPerOct);
+            proc.setBandValue (b, P::fBrick, brickwall ? 1.0f : 0.0f);
+        }
+        display.refresh(); sync();
+    }
+
+    // Saisie de la pente libre (6 à 96 dB/oct)
+    void askCustomSlope()
+    {
+        if (band < 0) return;
+        const auto spec = proc.getBandSpec (band, false);
+        auto* w = new juce::AlertWindow (fr ("Custom slope"), fr ("Slope of the cut, from 6 to 96 dB/oct"), juce::MessageBoxIconType::NoIcon, this);
+        w->addTextEditor ("slope", juce::String (eq::cutSlope (spec), 1));
+        w->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        w->addButton (fr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        w->enterModalState (true, juce::ModalCallbackFunction::create ([safe = juce::Component::SafePointer<BandPanel> (this), w] (int result)
+        {
+            if (safe == nullptr) return;
+            if (result == 1)
+            {
+                const float v = w->getTextEditorContents ("slope").replaceCharacter (',', '.').getFloatValue();
+                if (v > 0.0f) safe->setCutSlope (-1, juce::jlimit (6.0f, 96.0f, v), false);
+            }
+            safe->sync();
+        }), true);
+    }
+
     void layout()
     {
         // grille 3.0 : marge intérieure 16, deux rangées de 32 (y = 16 et 56), écarts de 8 ;

@@ -412,7 +412,7 @@ void EqDisplay::paint (juce::Graphics& g)
         if (! bandShown[(size_t) b]) continue;
         const auto s = proc.getBandSpec (b, true);
         const auto pos = nodePos (b);
-        if (proc.bandValue (b, P::fDyn) > 0.5f && hasGain (s.shape))
+        if (proc.bandValue (b, P::fDyn) > 0.5f && canBeDynamic (s.shape))
         {
             const float yr = yOf (s.gainDb + proc.bandValue (b, P::fRange) * proc.gainScale());
             const float yd = yOf (s.gainDb + proc.getDynOffset (b));
@@ -680,8 +680,11 @@ void EqDisplay::paintReadout (juce::Graphics& g, int b)
     if (! s.active) l1 << U (" · off");
     String l2 = P::fmtHz ((float) s.freq);
     if (hasGain (s.shape)) l2 << U ("  ") << P::fmtDb ((float) s.gainDb) << " dB";
-    if (usesQ (s.shape, s.slope)) l2 << "  Q " << P::fmtQ ((float) s.q);
-    if (usesSlope (s.shape) && ! hasGain (s.shape)) l2 << U ("  ") << String (s.slope) << " dB/oct";
+    if (usesQ (s)) l2 << "  Q " << P::fmtQ ((float) s.q);
+    // (3.0 : Brickwall et pente libre des coupes)
+    if (isBrick (s)) l2 << U ("  Brickwall");
+    else if (isCut (s.shape) && s.slopeFree > 0.0) l2 << U ("  ") << String (cutSlope (s), 1) << " dB/oct";
+    else if (usesSlope (s.shape) && ! hasGain (s.shape)) l2 << U ("  ") << String (s.slope) << " dB/oct";
     l2 << U ("  ·  ") << noteName (midi) << String (noteOctave (midi)) << " " << (cents >= 0 ? "+" : "") << String (juce::roundToInt (cents)) << " ct";
     juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (10, 600), l1, 0, 0);
     juce::GlyphArrangement gb; gb.addLineOfText (theme.ui (10), l2, 0, 0);
@@ -1026,6 +1029,9 @@ void EqDisplay::showBandMenu (int b, juce::Point<float>)
     m.addItem (on ? U ("Turn off") : U ("Turn on"), [apply, on] { apply (P::fOn, on ? 0.0f : 1.0f); });
     const bool dyn = proc.bandValue (b, P::fDyn) > 0.5f;
     m.addItem (U ("Dynamic EQ"), canBeDynamic (shape), dyn, [apply, dyn] { apply (P::fDyn, dyn ? 0.0f : 1.0f); });
+    // 3.0 : seuil automatique (le seuil suit le niveau moyen de la bande)
+    const bool thrAuto = proc.bandValue (b, P::fThrAuto) > 0.5f;
+    m.addItem (U ("Auto threshold"), canBeDynamic (shape) && dyn, thrAuto, [apply, thrAuto] { apply (P::fThrAuto, thrAuto ? 0.0f : 1.0f); });
     m.addItem (U ("Listen to this band"), true, proc.getSolo() == b, [safe, b]
     {
         if (safe != nullptr) { safe->proc.setSolo (safe->proc.getSolo() == b ? -1 : b); safe->refresh(); if (safe->onSelectionChanged) safe->onSelectionChanged(); }

@@ -52,6 +52,8 @@ public:
     bool isLinearPhase() const { return phaseMode() != audiolab::params::phaseZero; }   // un mode FIR (linéaire ou naturel)
     int linResIndex() const { return juce::jlimit (0, 4, juce::roundToInt (getParam (audiolab::params::linRes))); }
     float getDynOffset (int band) const { return engine.getDynOffset (band); }
+    // 3.0 : seuil automatique actuel d'une bande (dBFS), quand bN_thrauto est On (pour l'afficher)
+    float getAutoThresholdDb (int band) const { return engine.getAutoThreshold (band); }
     double getSampleRateSafe() const { const double s = getSampleRate(); return s > 0 ? s : 48000.0; }
     float getAutoGainDb() const { return autoGainDb.load(); }
 
