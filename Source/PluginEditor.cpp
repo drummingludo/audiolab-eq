@@ -160,12 +160,15 @@ juce::String AudioLabEqEditor::latencyText() const
     const int lat = proc.reportedLatency();
     const double ms = 1000.0 * lat / proc.getSampleRateSafe();
     if (mode == P::phaseZero) return U ("Latency: 0 ms (Zero latency mode)");
-    return U ("Latency: ") + String (ms, 1) + " ms (" + String (lat) + U (" smp) · filter ") + String (proc.activeFirLength()) + U (" points");
+    // 3.0 : le pré-écho mesuré du filtre courant remplace la longueur du filtre (place limitée)
+    const auto pre = proc.getPreEchoText();
+    const auto base = U ("Latency: ") + String (ms, 1) + " ms (" + String (lat) + U (" smp)");
+    return pre.isNotEmpty() ? base + U (" · ") + pre : base + U (" · filter ") + String (proc.activeFirLength()) + U (" points");
 }
 
 juce::String AudioLabEqEditor::sideChainText() const
 {
-    return proc.sideChainConnected() ? U ("Side-chain input: connected") : U ("Side-chain input: not connected");
+    return proc.sideChainConnected() ? U ("Side-chain: connected") : U ("Side-chain: not connected");
 }
 
 // ── Bandeau de la bande ────────────────────────────────────────────────────
@@ -238,7 +241,7 @@ void AudioLabEqEditor::Content::resized()
     e.analyzerBox.setBounds (360, y, 176, h);
     e.advBtn.setBounds (552, y, juce::roundToInt (e.advBtn.idealWidth()), h);
     // panneau avancé : une ligne de 26 px à y = 648
-    e.resSeg.setBounds (40 + 150, 648, juce::roundToInt (e.resSeg.idealWidth()), 26);
+    e.resSeg.setBounds (192, 645, 328, 32);   // 5 segments de 64, marge intérieure 4
     int rx = baseW - 24;
     const int aw = juce::roundToInt (e.autoBtn.idealWidth());
     e.autoBtn.setBounds (rx - aw, y, aw, h); rx -= aw + 16;
