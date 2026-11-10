@@ -131,7 +131,8 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        if (! isEnabled()) return;
+        if (! isEnabled() || e.mods.isPopupMenu()) return;
+        if (e.mods.isAltDown() || e.mods.isCommandDown()) { resetToDefault(); return; }   // Alt ou Cmd + clic : valeur par défaut
         if (onGestureStart) onGestureStart();
         y0 = e.position.y; v0 = param.getValue();
         attachment.beginGesture(); dragging = true; repaint();
@@ -143,12 +144,68 @@ public:
         setNorm (v0 + (y0 - e.position.y) / k, true);
     }
     void mouseUp (const juce::MouseEvent&) override { if (dragging) { attachment.endGesture(); dragging = false; repaint(); } }
-    void mouseDoubleClick (const juce::MouseEvent&) override
+    // Double-clic (ou Entrée quand le potentiomètre a le focus) : saisie de la valeur au clavier.
+    void mouseDoubleClick (const juce::MouseEvent&) override { if (isEnabled()) showEditor(); }
+    void resetToDefault()
     {
-        if (! isEnabled()) return;
         if (onGestureStart) onGestureStart();
         attachment.setValueAsCompleteGesture (param.convertFrom0to1 (param.getDefaultValue()));
     }
+    // « 2k », « 2.5 kHz », « -3 », « −3 dB », « 1,5 » ; parseFn (facultatif) passe en premier (notes : « A4 »)
+    std::function<bool (const juce::String&, float&)> parseFn;
+    std::function<juce::String (float)> editFmt;   // texte de départ de la saisie quand l'affichage change d'unité (Hz / kHz)
+    static bool parseNumber (juce::String t, float& out)
+    {
+        t = t.trim().toLowerCase().replace (juce::String::fromUTF8 ("−"), "-").replaceCharacter (',', '.');
+        const auto num = t.retainCharacters ("0123456789.-+");
+        if (num.isEmpty() || ! num.containsAnyOf ("0123456789")) return false;
+        double v = num.getDoubleValue();
+        const auto rest = t.removeCharacters ("0123456789.-+ ");
+        if (rest.startsWithChar ('k')) v *= 1000.0;
+        out = (float) v; return true;
+    }
+    void showEditor()
+    {
+        if (dragging) { attachment.endGesture(); dragging = false; }
+        editor = std::make_unique<juce::TextEditor>();
+        const auto& p = theme.pal();
+        editor->setFont (theme.ui (12, 600));
+        editor->setJustification (juce::Justification::centred);
+        editor->setColour (juce::TextEditor::backgroundColourId, p.win);
+        editor->setColour (juce::TextEditor::textColourId, p.text);
+        editor->setColour (juce::TextEditor::highlightColourId, p.select);
+        editor->setColour (juce::TextEditor::highlightedTextColourId, p.text);
+        editor->setColour (juce::TextEditor::outlineColourId, p.teal2);
+        editor->setColour (juce::TextEditor::focusedOutlineColourId, p.teal2);
+        editor->setIndents (2, 3);
+        const float cur = param.convertFrom0to1 (param.getValue());
+        editor->setText (editFmt ? editFmt (cur) : fmt (cur), false);
+        if (sz == Size::main) editor->setBounds (getWidth() / 2 - 28, 32 - 11, 56, 22);
+        else                  editor->setBounds (labelLeft ? 0 : 40, getHeight() / 2 - 11, getWidth() - 40, 22);
+        addAndMakeVisible (*editor);
+        editor->selectAll();
+        editor->grabKeyboardFocus();
+        editor->onReturnKey = [this]
+        {
+            float v = 0;
+            const auto t = editor->getText();
+            if ((parseFn && parseFn (t, v)) || parseNumber (t, v))
+            {
+                if (onGestureStart) onGestureStart();
+                const auto& r = param.getNormalisableRange();
+                attachment.setValueAsCompleteGesture (juce::jlimit (r.start, r.end, v));
+            }
+            hideEditor();
+        };
+        editor->onEscapeKey = [this] { hideEditor(); };
+        editor->onFocusLost = [this] { hideEditor(); };
+    }
+    void hideEditor()
+    {
+        if (editor == nullptr) return;
+        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ArcKnob> (this)] { if (safe != nullptr) { safe->editor.reset(); safe->repaint(); } });
+    }
+    std::unique_ptr<juce::TextEditor> editor;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& w) override
     {
         if (std::abs (w.deltaY) < 1e-6f || ! isEnabled()) return;
@@ -159,6 +216,7 @@ public:
     bool keyPressed (const juce::KeyPress& k) override
     {
         const float st = 1.0f / 50;
+        if (k.isKeyCode (juce::KeyPress::returnKey) && isEnabled()) { showEditor(); return true; }
         if (k.isKeyCode (juce::KeyPress::upKey) || k.isKeyCode (juce::KeyPress::rightKey)) { setNorm (param.getValue() + st, false); return true; }
         if (k.isKeyCode (juce::KeyPress::downKey) || k.isKeyCode (juce::KeyPress::leftKey)) { setNorm (param.getValue() - st, false); return true; }
         if (k.isKeyCode (juce::KeyPress::homeKey)) { setNorm (0, false); return true; }

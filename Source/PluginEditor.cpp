@@ -78,9 +78,9 @@ AudioLabEqEditor::AudioLabEqEditor (AudioLabEqProcessor& p)
     // petits potentiomètres : échelle (forme de la courbe, teal), sortie (gain, teal secondaire, départ à 12 h)
     vScale = std::make_unique<ArcKnob> (theme, prm (P::gainScale), U ("Scale"), "%", Fam::teal, ArcKnob::Size::small,
         [] (float v) { return String (juce::roundToInt (v)) + " %"; }, 0.0f,
-        U ("Gain scale: multiplies the gain of every band (100 % = as is, 0 % = flat curve, 200 % = doubled). Double-click: 100 %"));
+        U ("Gain scale: multiplies the gain of every band (100 % = as is, 0 % = flat curve, 200 % = doubled). Alt-click: 100 %"));
     vOut = std::make_unique<ArcKnob> (theme, prm (P::outGain), U ("Output"), "dB", Fam::teal2, ArcKnob::Size::small,
-        [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Output gain. Double-click: 0 dB"));
+        [] (float v) { return P::fmtDb (v) + " dB"; }, 0.0f, U ("Output gain. Alt-click: 0 dB"));
     for (auto* v : { vScale.get(), vOut.get() }) { v->labelLeft = true; v->onGestureStart = [this] { proc.pushUndo(); }; }
 
     autoBtn.setTooltip (U ("Auto gain: compensates the average loudness added or removed by the EQ, to compare at equal level"));

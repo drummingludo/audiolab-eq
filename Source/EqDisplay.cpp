@@ -34,7 +34,7 @@ juce::Rectangle<float> EqDisplay::pianoArea() const
 juce::Rectangle<float> EqDisplay::helpCard() const
 {
     auto r = plot();
-    return { r.getRight() - 16.0f - 360.0f, r.getY() + 32.0f, 360.0f, 282.0f };
+    return { r.getRight() - 16.0f - 360.0f, r.getY() + 32.0f, 360.0f, 360.0f };
 }
 juce::Rectangle<float> EqDisplay::helpClose() const
 {
@@ -322,6 +322,7 @@ void EqDisplay::paint (juce::Graphics& g)
     {
         paintAnalyzer (g, anPre, p.ref, false);
         paintAnalyzer (g, anPost, p.teal2, true);
+        paintGrab (g);
     }
 
     // ligne 0 dB : repère en pointillés, opacité 100 %
@@ -521,6 +522,65 @@ void EqDisplay::paintNode (juce::Graphics& g, int b) const
     }
 }
 
+// Crête du spectre la plus proche du curseur : maximum local à ±24 px, qui dépasse d'au moins 6 dB les creux
+// voisins (±48 px), au-dessus de −80 dB, et dont le sommet est à moins de 32 px du curseur en hauteur.
+int EqDisplay::findPeak (juce::Point<float> pos) const
+{
+    auto r = plot();
+    if (! r.contains (pos) || numCols < 8) return -1;
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const auto& a = *src;
+    const int c0 = (int) (pos.x - r.getX());
+    int best = -1; float bestScore = 1e9f;
+    for (int i = std::max (1, c0 - 24); i <= std::min (numCols - 2, c0 + 24); ++i)
+    {
+        const float v = a[(size_t) i];
+        if (v < -80.0f || v < a[(size_t) i - 1] || v < a[(size_t) i + 1]) continue;
+        float lo = v, hi = v;
+        for (int k = std::max (0, i - 48); k < i; ++k) lo = std::min (lo, a[(size_t) k]);
+        for (int k = i + 1; k <= std::min (numCols - 1, i + 48); ++k) hi = std::min (hi, a[(size_t) k]);
+        if (v - lo < 6.0f || v - hi < 6.0f) continue;
+        bool top = true;   // sommet du massif : rien de plus haut à ±6 px
+        for (int k = std::max (0, i - 6); k <= std::min (numCols - 1, i + 6); ++k) if (a[(size_t) k] > v) top = false;
+        if (! top) continue;
+        const float dy = std::abs (yAn (v) - pos.y);
+        if (dy > 32.0f) continue;
+        const float score = std::abs ((float) (i - c0)) + dy * 0.5f;
+        if (score < bestScore) { bestScore = score; best = i; }
+    }
+    return best;
+}
+
+double EqDisplay::peakFreq (int col) const
+{
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const auto& a = *src;
+    if (col < 1 || col >= numCols - 1) return colFreq[(size_t) juce::jlimit (0, numCols - 1, col)];
+    const double l = a[(size_t) col - 1], m = a[(size_t) col], h = a[(size_t) col + 1], den = l - 2.0 * m + h;
+    const double d = std::abs (den) < 1e-9 ? 0.0 : juce::jlimit (-0.5, 0.5, 0.5 * (l - h) / den);
+    return colFreq[(size_t) col] * std::pow (colFreq[(size_t) col + 1] / colFreq[(size_t) col], d);
+}
+
+void EqDisplay::paintGrab (juce::Graphics& g)
+{
+    if (grabCol < 0 || grabCol >= numCols) return;
+    const auto& p = theme.pal();
+    auto r = plot();
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const float x = r.getX() + grabCol + 0.5f, y = juce::jlimit (r.getY() + 6, r.getBottom() - 6, yAn ((*src)[(size_t) grabCol]));
+    g.setColour (p.surface); g.fillEllipse (x - 5, y - 5, 10, 10);
+    g.setColour (p.text); g.drawEllipse (x - 4, y - 4, 8, 8, 2.0f);
+    const String t = params::fmtHz ((float) peakFreq (grabCol));
+    g.setFont (theme.ui (10, 600));
+    const float w = juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), t) + 12;
+    auto box = juce::Rectangle<float> (x - w * 0.5f, y - 28, w, 16).constrainedWithin (r.reduced (4));
+    g.setColour (p.cap); g.fillRoundedRectangle (box, 4);
+    g.setColour (p.text); g.drawText (t, box, juce::Justification::centred, false);
+}
+
 void EqDisplay::paintAnalyzer (juce::Graphics& g, const std::vector<float>& col, juce::Colour c, bool fill)
 {
     auto r = plot();
@@ -649,6 +709,9 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
         { "Alt + mouse wheel", "Dynamic EQ range" },
         { "Alt + click and hold", "Listen to the band alone" },
         { "Double-click", "Turn on / off" },
+        { "Double-click a knob", "Type a value (2k, A4, −3)" },
+        { "Alt + click a knob", "Default value" },
+        { "Click a spectrum peak", "New band on that peak" },
         { "Right-click", "Shape, slope, Mid/Side, drawing…" },
         { "Drag on empty space", "Multiple selection" },
         { "⌘Z · ⌘⇧Z", "Undo · redo" } };
@@ -785,23 +848,26 @@ void EqDisplay::endEdit()
 void EqDisplay::mouseMove (const juce::MouseEvent& e)
 {
     const int h = sketchMode ? -1 : hitBand (e.position);
-    if (h != hover) { hover = h; repaint(); }
+    const int gc = (sketchMode || h >= 0 || (helpShown() && helpCard().contains (e.position))) ? -1 : findPeak (e.position);
+    if (h != hover || gc != grabCol) { hover = h; grabCol = gc; repaint(); }
     if (sketchMode) setMouseCursor (juce::MouseCursor::CrosshairCursor);
     else if (rangeButton().contains (e.position) || (helpShown() && helpClose().expanded (4).contains (e.position))) setMouseCursor (juce::MouseCursor::PointingHandCursor);
     else if (helpShown() && helpCard().contains (e.position)) setMouseCursor (juce::MouseCursor::NormalCursor);
+    else if (grabCol >= 0) setMouseCursor (juce::MouseCursor::PointingHandCursor);
     else setMouseCursor (h >= 0 ? juce::MouseCursor::DraggingHandCursor
                                 : plot().contains (e.position) ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
 }
 
 void EqDisplay::mouseExit (const juce::MouseEvent&)
 {
-    if (hover >= 0) { hover = -1; repaint(); }
+    if (hover >= 0 || grabCol >= 0) { hover = -1; grabCol = -1; repaint(); }
 }
 
 void EqDisplay::mouseDown (const juce::MouseEvent& e)
 {
     grabKeyboardFocus();
     downPos = lastPos = e.position;
+    grabDown = grabCol;
     drag = Drag::none;
 
     if (rangeButton().contains (e.position))
@@ -926,16 +992,19 @@ void EqDisplay::mouseUp (const juce::MouseEvent& e)
     {
         // clic dans le vide : nouvelle bande (cloche ; coupe-bas / coupe-haut aux extrémités)
         auto r = plot();
-        const double f = fOf (e.position.x);
+        // clic sur une crête du spectre (« spectrum grab ») : cloche étroite à 0 dB, exactement sur la crête
+        const bool grab = grabDown >= 0;
+        const double f = grab ? peakFreq (grabDown) : fOf (e.position.x);
         const float rel = (e.position.x - r.getX()) / r.getWidth();
         Shape shape = Shape::bell;
-        if (rel < 0.035f) shape = Shape::lowCut;
-        else if (rel > 0.965f) shape = Shape::highCut;
+        if (! grab && rel < 0.035f) shape = Shape::lowCut;
+        else if (! grab && rel > 0.965f) shape = Shape::highCut;
         const double sc = std::max (0.01, proc.gainScale());
-        const float g = shape == Shape::bell ? (float) juce::jlimit (-30.0, 30.0, dbOf (e.position.y) / sc) : 0.0f;
+        const float g = grab ? 0.0f : shape == Shape::bell ? (float) juce::jlimit (-30.0, 30.0, dbOf (e.position.y) / sc) : 0.0f;
         proc.pushUndo();
         const int b = proc.createBand (shape, (float) juce::jlimit (fMin, fMax, f),
-                                       std::abs (g) < 0.15f ? 0.0f : g, shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
+                                       std::abs (g) < 0.15f ? 0.0f : g, grab ? 4.0f : shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
+        grabCol = grabDown = -1;
         if (b < 0) { if (onMessage) onMessage (U ("All 24 bands are in use")); return; }
         createdBand = b; createdAt = juce::Time::getMillisecondCounter();
         select (b);

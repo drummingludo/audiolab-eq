@@ -64,6 +64,21 @@ public:
         fitSketch();
     }
     void testHover (int b) { hover = b; repaint(); }
+    // tests : place le curseur sur la crête du spectre la plus haute ; rend sa fréquence (0 = aucune crête)
+    double testGrab()
+    {
+        auto r = plot(); int best = -1; float top = -200.0f;
+        for (int i = 8; i < numCols - 8; ++i)
+        {
+            const float v = anPost[(size_t) i];
+            const int c = findPeak ({ r.getX() + i + 0.5f, yAn (v) });
+            if (c == i && v > top) { top = v; best = i; }
+        }
+        grabCol = best; repaint();
+        return best < 0 ? 0.0 : peakFreq (best);
+    }
+    double testGrabNear (juce::Point<float> pos) const { const int c = findPeak (pos); return c < 0 ? 0.0 : peakFreq (c); }
+    juce::Point<float> testGrabPos() const { auto r = plot(); return { r.getX() + grabCol + 0.5f, yAn (anPost[(size_t) std::max (0, grabCol)]) }; }
 
 private:
     void timerCallback() override;
@@ -112,6 +127,11 @@ private:
     juce::dsp::FFT fft { fftOrder };
     std::vector<float> fftBuf, window;
     std::vector<float> anPre, anPost;
+    // « spectrum grab » : crête du spectre sous le curseur (colonne, −1 = aucune) ; un clic y pose une cloche
+    int grabCol = -1, grabDown = -1;
+    int findPeak (juce::Point<float> pos) const;
+    double peakFreq (int col) const;   // fréquence de la crête, affinée entre colonnes (parabole sur les dB)
+    void paintGrab (juce::Graphics&);
     bool analyzerLive = false;
     void analyse (const AudioLabEqProcessor::Tap& tap, std::vector<float>& col);
 

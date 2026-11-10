@@ -142,6 +142,8 @@ public:
         setSize (panelW, panelH);
     }
 
+    void testEditFrequency() { if (kFreq != nullptr) kFreq->showEditor(); }   // tests
+
     int getBand() const { return band; }
     int getCount() const { return count; }
 
@@ -167,6 +169,21 @@ public:
             // teal : fréquence, gain, Q, seuil (forme de la courbe, niveau) ; orange : plage, attaque, retour (action, temps)
             kFreq = std::make_unique<K> (theme, *proc.bandParam (b, P::fFreq), fr ("Frequency"), "Hz", Fam::teal, M,
                 [] (float v) { return v < 1000.0f ? juce::String (juce::roundToInt (v)) : juce::String (v / 1000.0f, 2); }, 20.0f, fr ("Centre or cut-off frequency"));
+            // saisie au clavier : « 2k », « 440 », ou une note (« A4 », « C#3 », « Bb2 »)
+            kFreq->parseFn = [] (const juce::String& txt, float& out)
+            {
+                const auto t = txt.trim().toUpperCase();
+                if (t.length() < 2 || ! juce::String ("CDEFGAB").containsChar (t[0])) return false;
+                static const int semis[] = { 9, 11, 0, 2, 4, 5, 7 };   // A B C D E F G
+                int n = semis[t[0] - 'A'], i = 1;
+                if (t[i] == '#') { ++n; ++i; } else if (t[i] == 'B' && t.length() > 2) { --n; ++i; }
+                const auto oct = t.substring (i);
+                if (oct.isEmpty() || ! oct.containsOnly ("-0123456789")) return false;
+                const int midi = (oct.getIntValue() + 1) * 12 + n;
+                out = (float) (440.0 * std::pow (2.0, (midi - 69) / 12.0));
+                return true;
+            };
+            kFreq->editFmt = [] (float v) { return juce::String (juce::roundToInt (v)); };   // toujours en Hz
             kFreq->unitFmt = [] (float v) { return juce::String (v < 1000.0f ? "Hz" : "kHz"); };
             kGain = std::make_unique<K> (theme, *proc.bandParam (b, P::fGain), "Gain", "dB", Fam::teal, M,
                 [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Band gain (bells, shelves, tilt)"));
@@ -177,9 +194,9 @@ public:
             kRange = std::make_unique<K> (theme, *proc.bandParam (b, P::fRange), "Range", "dB", Fam::orange, M,
                 [] (float v) { return P::fmtDb (v); }, 0.0f, fr ("Maximum gain added (+) or removed (−) when the signal goes above the threshold (Alt + mouse wheel on the handle)"));
             kAtt = std::make_unique<K> (theme, *proc.bandParam (b, P::fAtt), fr ("Attack"), "ms", Fam::orange, S,
-                [] (float v) { return P::fmtMs (v); }, 0.5f, fr ("How fast this band's dynamics react (double-click: 10 ms)"));
+                [] (float v) { return P::fmtMs (v); }, 0.5f, fr ("How fast this band's dynamics react (Alt-click: 10 ms)"));
             kRel = std::make_unique<K> (theme, *proc.bandParam (b, P::fRel), fr ("Release"), "ms", Fam::orange, S,
-                [] (float v) { return P::fmtMs (v); }, 10.0f, fr ("Release time of this band's dynamics (double-click: 150 ms)"));
+                [] (float v) { return P::fmtMs (v); }, 10.0f, fr ("Release time of this band's dynamics (Alt-click: 150 ms)"));
             for (auto* k : { kFreq.get(), kGain.get(), kQ.get(), kThr.get(), kRange.get(), kAtt.get(), kRel.get() })
             {
                 k->onGestureStart = [this] { proc.pushUndo(); };
@@ -276,7 +293,7 @@ public:
         else
         {
             g.setColour (p.text2); g.setFont (theme.ui (12));
-            g.drawText (count == 0 ? fr ("Click a handle to edit a band · Double-click the curve to add one · Drag on the background to select several")
+            g.drawText (count == 0 ? fr ("Click a handle to edit a band · Click the curve to add one · Drag on the background to select several")
                                    : fr ("Drag a handle to move the whole selection · Shift: fine adjustment"),
                         juce::Rectangle<float> (16, 56, (float) getWidth() - 32, 32), juce::Justification::centredLeft, false);
         }

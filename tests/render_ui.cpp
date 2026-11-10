@@ -29,10 +29,17 @@ int main (int argc, char** argv)
     proc->setPlayConfigDetails (2, 2, 48000, 512);
     proc->prepareToPlay (48000, 512);
 
-    std::atomic<bool> run { true };
+    std::atomic<bool> run { true }, pureTones { false };
     std::thread audio ([&] {
         juce::AudioBuffer<float> buf (2, 512); juce::MidiBuffer midi; int64_t pos = 0; juce::Random rnd (7);
-        while (run) { fillMusic (buf, 48000, pos, rnd); proc->processBlock (buf, midi); std::this_thread::sleep_for (std::chrono::microseconds (10600)); }
+        while (run) { fillMusic (buf, 48000, pos, rnd);
+            if (pureTones) for (int i = 0; i < 512; ++i)
+            {   // trois sinus purs : mesure de la précision de la saisie d'une crête
+                const double t = (double) (pos - 512 + i) / 48000.0, tp = 2 * juce::MathConstants<double>::pi;
+                const float s = (float) (0.2 * std::sin (tp * 110.0 * t) + 0.1 * std::sin (tp * 1000.0 * t) + 0.05 * std::sin (tp * 6300.0 * t));
+                buf.setSample (0, i, s); buf.setSample (1, i, s);
+            }
+            proc->processBlock (buf, midi); std::this_thread::sleep_for (std::chrono::microseconds (10600)); }
     });
 
     std::unique_ptr<AudioLabEqEditor> ed;
@@ -78,7 +85,7 @@ int main (int argc, char** argv)
         // gestes : croix de l'aide, puis clic dans la courbe → nouvelle bande + panneau
         auto& d = ed->getDisplay();
         const auto r = d.plot();
-        click ({ r.getRight() - 16 - 16 - 11, r.getY() + 16 + 12 + 11 });
+        click ({ r.getRight() - 16 - 16 - 11, r.getY() + 32 + 12 + 11 });
         std::printf ("aide masquée : %s\n", (bool) proc->ui.getProperty ("helpHidden", false) ? "oui" : "NON");
         click ({ r.getX() + r.getWidth() * 0.5f, r.getY() + 120 });
         int used = 0; for (int b = 0; b < audiolab::eq::maxBands; ++b) used += proc->isUsed (b) ? 1 : 0;
@@ -122,7 +129,27 @@ int main (int argc, char** argv)
     steps.push_back ({ 1200, [&] { shot ("13_avance_200pc"); preset ("Vocal: de-esser"); proc->ui.setProperty ("adv", false, nullptr);
         P_phase.setValueNotifyingHost (0.0f); rebuild(); ed->setSize (AudioLabEqEditor::baseW * 2, AudioLabEqEditor::baseH * 2); ed->getDisplay().select (1); } });
     steps.push_back ({ 1500, [&] { shot ("14_principal_200pc_dynamique"); ed->setSize (AudioLabEqEditor::baseW * 6 / 10, AudioLabEqEditor::baseH * 6 / 10); } });
-    steps.push_back ({ 1200, [&] { shot ("15_principal_60pc_dynamique"); juce::MessageManager::getInstance()->stopDispatchLoop(); } });
+    // 3.0 : saisie d'une valeur au clavier, puis crête du spectre saisie d'un clic
+    steps.push_back ({ 1200, [&] { shot ("15_principal_60pc_dynamique"); ed->setSize (AudioLabEqEditor::baseW, AudioLabEqEditor::baseH); ed->getPanel().testEditFrequency(); } });
+    steps.push_back ({ 600,  [&] { shot ("16_saisie_clavier"); proc->clearAllBands(); proc->ui.setProperty ("helpHidden", true, nullptr); rebuild(); } });
+    steps.push_back ({ 2500, [&] { const double f = ed->getDisplay().testGrab(); std::printf ("crête du spectre : %.1f Hz\n", f); } });
+    steps.push_back ({ 300,  [&] { shot ("17_crete_du_spectre");
+        auto& d = ed->getDisplay(); const auto pos = d.testGrabPos();
+        auto src = juce::Desktop::getInstance().getMainMouseSource(); const auto now = juce::Time::getCurrentTime();
+        juce::MouseEvent ev (src, pos, {}, juce::MouseInputSource::defaultPressure, 0, 0, 0, 0, &d, &d, now, pos, now, 1, false);
+        d.mouseMove (ev); d.mouseDown (ev); d.mouseUp (ev);
+        for (int b = 0; b < audiolab::eq::maxBands; ++b) if (proc->isUsed (b))
+            std::printf ("bande créée sur la crête : %.1f Hz, Q %.1f, %.1f dB\n", (double) proc->getBandSpec (b, false).freq, (double) proc->getBandSpec (b, false).q, (double) proc->getBandSpec (b, false).gainDb); } });
+    steps.push_back ({ 800,  [&] { shot ("18_bande_sur_la_crete"); proc->clearAllBands(); pureTones = true; } });
+    steps.push_back ({ 3000, [&] {
+        auto& d = ed->getDisplay(); const auto r = d.plot();
+        for (double f : { 110.0, 1000.0, 6300.0 })
+        {
+            const float x = r.getX() + r.getWidth() * (float) (std::log (f / 20.0) / std::log (1000.0));
+            double best = 0; for (float y = r.getY(); y < r.getBottom(); y += 8) { const double g = d.testGrabNear ({ x + 6, y }); if (g > 0) best = g; }
+            std::printf ("sinus %.0f Hz : crête saisie à %.2f Hz (écart %+.2f %%)\n", f, best, best > 0 ? 100.0 * (best / f - 1.0) : 0.0);
+        }
+        juce::MessageManager::getInstance()->stopDispatchLoop(); } });
 
     std::function<void (size_t)> next = [&] (size_t i)
     {

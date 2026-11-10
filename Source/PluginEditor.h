@@ -22,6 +22,7 @@ public:
     static constexpr int baseW = 1120, baseH = 640, baseHOpen = 714;
 
     audiolab::EqDisplay& getDisplay() { return display; }   // tests
+    audiolab::BandPanel& getPanel() { return panel; }       // tests
 
 private:
     class Content : public juce::Component
