@@ -13,6 +13,7 @@
 // des bandes (comme la chaîne zéro latence), donne 4 FIR : L' = A·L + B·R ; R' = C·L + D·R.
 #pragma once
 #include "EqMath.h"
+#include <string>
 #include <vector>
 
 namespace audiolab::eq::fir
@@ -116,6 +117,9 @@ inline double requiredLength (const BandSpec& b, double fs, Mode mode, double ex
     return K * tau;
 }
 
+// Bande dont le gain bouge avec la dynamique (plage utile non nulle)
+inline bool isDynamicSpan (const BandSpec& b, double span) { return b.active && canBeDynamic (b.shape) && std::abs (span) > 1.0e-6; }
+
 // Longueur choisie : réglage fixe, ou Auto d'après les bandes (puissance de 2 entre Low et Max)
 inline int chooseLength (Res r, const std::array<BandSpec, maxBands>& bands, double fs, Mode mode,
                          const std::array<double, maxBands>* dynSpan = nullptr)
@@ -160,6 +164,7 @@ struct Work
     std::vector<cd> bandH[maxBands];
     BandSpec bandKey[maxBands];
     double bandFs[maxBands] {};
+    int bandMode[maxBands] {};
 };
 
 // Fenêtre « plate à bords Blackman-Harris »
@@ -250,11 +255,13 @@ inline void design (const Request& rq, Result& out, Work& w)
         if (! b.active) continue;
         const auto& key = w.bandKey[i];
         auto& H = w.bandH[i];
+        // (3.0 : la pente libre, le Brickwall et le mode comptent aussi, la cible d'un Brickwall dépend du mode)
         if ((int) H.size() == M / 2 + 1 && w.bandFs[i] == fs && key.shape == b.shape && key.slope == b.slope
-            && key.freq == b.freq && key.gainDb == b.gainDb && key.q == b.q) continue;
+            && key.freq == b.freq && key.gainDb == b.gainDb && key.q == b.q
+            && key.slopeFree == b.slopeFree && key.brick == b.brick && w.bandMode[i] == (int) rq.mode) continue;
         H.resize ((size_t) M / 2 + 1);
         for (int k = 0; k <= M / 2; ++k) H[(size_t) k] = response (des[i], std::max (k * fs / M, 0.01), fs, true);
-        w.bandKey[i] = b; w.bandFs[i] = fs;
+        w.bandKey[i] = b; w.bandFs[i] = fs; w.bandMode[i] = (int) rq.mode;
     }
     for (int k = 0; k <= M / 2; ++k)
     {
@@ -405,5 +412,157 @@ inline cd responseAt (const std::vector<double>& h, int latency, double fs, doub
         z *= rot;
     }
     return s * std::polar (1.0, w * latency);
+}
+
+// ── 3.0 : pré-écho d'un FIR ─────────────────────────────────────────────
+// Un FIR à phase linéaire répond AVANT son pic principal (pré-écho), d'autant plus longtemps que la
+// courbe est étroite et grave. Mesure : énergie cumulée depuis le début de la réponse, rapportée à
+// l'énergie du pic (échantillon le plus fort).
+//   ms60 / ms90 : durée, avant le pic, pendant laquelle cette énergie cumulée dépasse −60 / −90 dB ;
+//   dbAt5ms / dbAt20ms : énergie cumulée de tout ce qui arrive plus de 5 / 20 ms avant le pic (dB).
+// Rien avant le pic : durées nulles, niveaux à preEchoFloorDb.
+constexpr float preEchoFloorDb = -200.0f;
+struct PreEcho { float ms60 = 0.0f, ms90 = 0.0f, dbAt5ms = preEchoFloorDb, dbAt20ms = preEchoFloorDb; };
+
+// a : réponse principale (n points) ; b : réponse croisée de la même sortie (R → L), ou nul.
+template <class T>
+inline PreEcho measurePreEcho (const T* a, const T* b, int n, double fs)
+{
+    PreEcho r;
+    if (a == nullptr || n <= 0) return r;
+    int pk = 0;
+    for (int i = 1; i < n; ++i) if (std::abs ((double) a[i]) > std::abs ((double) a[pk])) pk = i;
+    const double ref = (double) a[pk] * (double) a[pk];
+    if (ref <= 0.0 || pk == 0) return r;
+    const int i5 = pk - (int) std::lround (0.005 * fs), i20 = pk - (int) std::lround (0.020 * fs);
+    int n60 = -1, n90 = -1;
+    double cum = 0.0;
+    for (int i = 0; i < pk; ++i)
+    {
+        cum += (double) a[i] * (double) a[i];
+        if (b != nullptr) cum += (double) b[i] * (double) b[i];
+        if (n90 < 0 && cum > 1.0e-9 * ref) n90 = i;
+        if (n60 < 0 && cum > 1.0e-6 * ref) n60 = i;
+        if (i == i5 && cum > 0.0)  r.dbAt5ms  = (float) std::max ((double) preEchoFloorDb, 10.0 * std::log10 (cum / ref));
+        if (i == i20 && cum > 0.0) r.dbAt20ms = (float) std::max ((double) preEchoFloorDb, 10.0 * std::log10 (cum / ref));
+    }
+    if (n60 >= 0) r.ms60 = (float) (1000.0 * (pk - n60) / fs);
+    if (n90 >= 0) r.ms90 = (float) (1000.0 * (pk - n90) / fs);
+    return r;
+}
+
+// Pré-écho d'un jeu de FIR : la pire des deux sorties (gauche : A et B ; droite : D et C)
+inline PreEcho measurePreEcho (const Result& r, double fs)
+{
+    const int n = (int) r.h[0].size();
+    if (n == 0) return {};
+    PreEcho p = measurePreEcho (r.h[0].data(), r.matrix && (int) r.h[1].size() == n ? r.h[1].data() : nullptr, n, fs);
+    if ((int) r.h[3].size() == n)
+    {
+        const PreEcho q = measurePreEcho (r.h[3].data(), r.matrix && (int) r.h[2].size() == n ? r.h[2].data() : nullptr, n, fs);
+        p.ms60 = std::max (p.ms60, q.ms60); p.ms90 = std::max (p.ms90, q.ms90);
+        p.dbAt5ms = std::max (p.dbAt5ms, q.dbAt5ms); p.dbAt20ms = std::max (p.dbAt20ms, q.dbAt20ms);
+    }
+    return p;
+}
+
+// Texte court pour l'interface (anglais, UTF-8), par exemple « Pre-echo: 12 ms above −60 dB ».
+// (mise en forme à la main : point décimal quel que soit le réglage régional de l'hôte)
+inline std::string preEchoText (const PreEcho& p)
+{
+    if (p.ms60 < 0.05f) return "Pre-echo: none above \xe2\x88\x92" "60 dB";
+    const int tenths = (int) std::lround ((double) p.ms60 * 10.0);
+    std::string s = "Pre-echo: ";
+    if (tenths >= 100) s += std::to_string ((tenths + 5) / 10);
+    else s += std::to_string (tenths / 10) + "." + std::to_string (tenths % 10);
+    return s + " ms above \xe2\x88\x92" "60 dB";
+}
+
+// ── 3.0 : résolution Auto vérifiée par la mesure (Linear phase) ─────────
+// Écart max (dB) entre la réponse réelle d'un jeu de FIR Linear phase et sa cible, de 20 Hz à 20 kHz,
+// là où la cible dépasse floorDb. Les creux des notch sont jugés à part (leur centre est tenu exactement
+// par la correction, voir design()) : on ne compare pas là où un notch est sous −3 dB, comme dans le banc.
+// Réponse : FFT du FIR avec bourrage (×4) puis interpolation cubique de l'amplitude (réelle, latence retirée).
+constexpr double autoTolDb = 0.1;      // écart admis par la résolution Auto
+constexpr double autoFloorDb = -60.0;  // on ne juge pas la courbe sous ce niveau
+inline double linearError (const Request& rq, const Result& r, std::vector<cd>& scratch, double floorDb = autoFloorDb, double* atHz = nullptr)
+{
+    const int N = (int) r.h[0].size();
+    if (N <= 0) return 0.0;
+    const double fs = rq.fs;
+    Design des[maxBands];
+    for (int i = 0; i < maxBands; ++i)
+        if (rq.bands[(size_t) i].active) eq::designFir (rq.bands[(size_t) i], fs, des[i], true, N);
+    int L = 1; while (L < 4 * N) L <<= 1;
+    const int lat = N / 2;
+    const double fTop = std::min (20000.0, 0.499 * fs);
+    double worst = 0.0;
+    const bool rows[4] = { true, r.matrix, r.matrix, r.h[3] != r.h[0] };
+    for (int e = 0; e < 4; ++e)
+    {
+        if (! rows[e] || (int) r.h[e].size() != N) continue;
+        // réponse sans la latence : h tourné pour que le centre soit à l'indice 0 (spectre réel et lisse)
+        scratch.assign ((size_t) L, cd (0, 0));
+        for (int n = 0; n < N; ++n) scratch[(size_t) ((n - lat + L) % L)] = r.h[e][(size_t) n];
+        fft (scratch.data(), L, false);
+        auto amp = [&] (double f)
+        {
+            const double x = f * L / fs;
+            const int k = std::clamp ((int) x, 1, L / 2 - 2);
+            const double t = x - k;
+            const double y0 = scratch[(size_t) (k - 1)].real(), y1 = scratch[(size_t) k].real(),
+                         y2 = scratch[(size_t) (k + 1)].real(), y3 = scratch[(size_t) (k + 2)].real();
+            return y1 + 0.5 * t * (y2 - y0 + t * (2.0 * y0 - 5.0 * y1 + 4.0 * y2 - y3 + t * (3.0 * (y1 - y2) + y3 - y0)));
+        };
+        auto check = [&] (double f)
+        {
+            if (f < 20.0 || f > fTop) return;
+            for (int i = 0; i < maxBands; ++i)
+            {
+                const auto& b = rq.bands[(size_t) i];
+                if (b.active && b.shape == Shape::notch && std::abs (response (des[i], f, fs, true)) < 0.7079) return;
+            }
+            const M2 t = targetAt (rq, des, f);
+            const double tv = std::abs (e == 0 ? t.a : e == 1 ? t.b : e == 2 ? t.c : t.d);
+            const double tdb = 20.0 * std::log10 (std::max (1e-12, tv));
+            if (tdb < floorDb) return;
+            const double d = std::abs (20.0 * std::log10 (std::max (1e-12, std::abs (amp (f)))) - tdb);
+            if (d > worst) { worst = d; if (atHz != nullptr) *atHz = f; }
+        };
+        constexpr int grid = 360;
+        for (int i = 0; i < grid; ++i) check (20.0 * std::pow (fTop / 20.0, i / (grid - 1.0)));
+        // (points serrés autour de chaque bande : ± 1 octave)
+        for (const auto& b : rq.bands)
+            if (b.active)
+                for (int i = -40; i <= 40; ++i) check (b.freq * std::pow (2.0, i / 40.0));
+    }
+    return worst;
+}
+
+// Longueur de la résolution Auto en Linear phase : celle de la règle (requiredLength), puis vérifiée par
+// la mesure et allongée tant que l'écart à la cible dépasse autoTolDb (au plus la longueur Max).
+// Bandes dynamiques : la courbe est vérifiée au gain de base et à pleine plage. Fil de conception
+// seulement (plusieurs conceptions de FIR). errOut : écart mesuré à la longueur retenue.
+inline int verifiedAutoLength (const std::array<BandSpec, maxBands>& bands, const std::array<double, maxBands>& dynSpan,
+                               bool stereo, double fs, Work& w, Result& tmp, std::vector<cd>& scratch, double* errOut = nullptr)
+{
+    int n = chooseLength (Res::automatic, bands, fs, Mode::linear, &dynSpan);
+    bool anyDyn = false;
+    for (int i = 0; i < maxBands; ++i) anyDyn = anyDyn || isDynamicSpan (bands[(size_t) i], dynSpan[(size_t) i]);
+    for (;; n *= 2)
+    {
+        Request rq; rq.bands = bands; rq.stereo = stereo; rq.mode = Mode::linear; rq.N = n; rq.fs = fs;
+        design (rq, tmp, w);
+        double e = linearError (rq, tmp, scratch);
+        if (anyDyn && e <= autoTolDb)
+        {
+            for (int i = 0; i < maxBands; ++i)
+                if (isDynamicSpan (bands[(size_t) i], dynSpan[(size_t) i])) rq.bands[(size_t) i].gainDb += dynSpan[(size_t) i];
+            design (rq, tmp, w);
+            e = std::max (e, linearError (rq, tmp, scratch));
+        }
+        if (errOut != nullptr) *errOut = e;
+        if (e <= autoTolDb || n >= maxLength (fs)) return n;
+    }
 }
 } // namespace audiolab::eq::fir

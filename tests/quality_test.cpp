@@ -35,9 +35,16 @@
 // 27. Brickwall : ondulation (0,1 dB), atténuation (−96 dB à un tiers d'octave), mur des FIR selon la résolution
 // 28. Seuil dynamique automatique : repos, dépassement, retour, déterminisme
 // 29. Stabilité avec les nouvelles formes et pentes, coût CPU
+// Auto gain, pré-écho, résolution Auto (« ./qt gain » ne lance que ces sections) :
+// 30. Mesureur de sonie ITU-R BS.1770-4 : sinus de référence à 44,1 / 48 / 96 / 192 kHz, courbe K, portes
+// 31. Auto gain à sonie égale : 6 réglages sur du bruit rose, écart de sonie sortie / entrée (avant / après), convergence
+// 32. Auto gain : silence, mouvement d'une bande, bornes, coût
+// 33. Pré-écho des FIR : cas calculable, valeurs annoncées contre la réponse impulsionnelle mesurée
+// 34. Résolution Auto : écart réel du FIR à la cible dans le grave, aux quatre fréquences d'échantillonnage
 #include "EqEngine.h"
 #include "FirDesign.h"
 #include "LinearPhaseCore.h"
+#include "AutoGain.h"
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -1060,8 +1067,457 @@ static void testShapes30()
     }
 }
 
+// ── Outils des sections 30 à 34 (Auto gain à sonie égale, pré-écho, résolution Auto) ──
+// Bruit rose stéréo (filtre de Voss-McCartney à 7 étages), voies en partie corrélées, niveau ≈ −20 dBFS efficace
+static void pinkStereo (std::vector<float>& l, std::vector<float>& r, int n, unsigned seed, double corr = 0.6)
+{
+    std::mt19937 rng (seed); std::normal_distribution<double> g (0.0, 1.0);
+    auto gen = [&] (std::vector<double>& x)
+    {
+        // somme de bruits blancs filtrés (Paul Kellet) : pente −3 dB/oct à ± 0,05 dB de 10 Hz à Nyquist
+        double b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        x.resize ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double w = g (rng);
+            b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.96900 * b2 + w * 0.1538520;
+            b3 = 0.86650 * b3 + w * 0.3104856; b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+            x[(size_t) i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362; b6 = w * 0.115926;
+        }
+    };
+    std::vector<double> a, b; gen (a); gen (b);
+    double ss = 0; for (double v : a) ss += v * v;
+    const double k = 0.1 / std::sqrt (ss / n);
+    l.resize ((size_t) n); r.resize ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        l[(size_t) i] = (float) (k * a[(size_t) i]);
+        r[(size_t) i] = (float) (k * (corr * a[(size_t) i] + std::sqrt (1.0 - corr * corr) * b[(size_t) i]));
+    }
+}
+
+// Sonie intégrée d'un signal stéréo (ou mono si r est nul) entre deux instants
+static double integratedLufs (const float* l, const float* r, int n, double fs)
+{
+    audiolab::loud::Meter m; m.prepare (fs, n / fs + 1.0);
+    m.process (l, r, n);
+    return m.integrated();
+}
+
+// Le plugin en zéro latence (moteur) avec Auto gain, comme PluginProcessor::processBlock : mesure sur
+// l'entrée et la sortie avant gain, gain lissé sur 30 ms. Renvoie le gain (dB) à chaque bloc.
+struct GainRig
+{
+    Engine eng; AutoGain ag;
+    double fs = 48000, gLin = 1.0, gStep = 0.0; int gLeft = 0;
+    std::array<BandSpec, maxBands> bands {};
+    std::array<DynSettings, maxBands> dyn {};
+    bool applyGain = true;
+    void start (double rate)
+    {
+        fs = rate; eng.prepare (fs); ag.prepare (fs);
+        push(); ag.setRunning (true);
+        gLin = std::pow (10.0, ag.gainDb() / 20.0); gLeft = 0;
+    }
+    void push() { for (int b = 0; b < maxBands; ++b) eng.setBand (b, bands[(size_t) b], dyn[(size_t) b], 1.0); ag.setCurve (bands, true, false); }
+    // traite n échantillons sur place (blocs de 512) ; pre : copie de la sortie avant gain (peut être nul)
+    void run (float* l, float* r, int n, std::vector<float>* gTrace = nullptr, float* preL = nullptr, float* preR = nullptr)
+    {
+        std::vector<float> il (512), ir (512);
+        for (int off = 0; off < n; off += 512)
+        {
+            const int m = std::min (512, n - off);
+            push();
+            std::copy (l + off, l + off + m, il.begin()); std::copy (r + off, r + off + m, ir.begin());
+            eng.process (l + off, r + off, m, false);
+            ag.process (il.data(), ir.data(), l + off, r + off, m);
+            if (preL != nullptr) { std::copy (l + off, l + off + m, preL + off); std::copy (r + off, r + off + m, preR + off); }
+            const double target = std::pow (10.0, ag.gainDb() / 20.0);
+            if (std::abs (target - (gLin + gStep * gLeft)) > 1e-12) { gLeft = (int) (0.03 * fs); gStep = (target - gLin) / gLeft; }
+            for (int i = 0; i < m; ++i)
+            {
+                if (gLeft > 0) { gLin += gStep; --gLeft; }
+                if (applyGain) { l[off + i] = (float) (l[off + i] * gLin); r[off + i] = (float) (r[off + i] * gLin); }
+            }
+            if (gTrace != nullptr) gTrace->push_back (ag.gainDb());
+        }
+    }
+};
+
+static BandSpec mk (Shape s, double f, double g, double q, int slope = 12, Place p = Place::stereo, double slopeFree = 0, bool brick = false)
+{
+    BandSpec b; b.active = true; b.shape = s; b.freq = f; b.gainDb = g; b.q = q; b.slope = slope; b.place = p; b.slopeFree = slopeFree; b.brick = brick;
+    return b;
+}
+
+static std::vector<float> pinkL, pinkR;
+static void testGain30()
+{
+    namespace L = audiolab::loud;
+    // ── 30. Mesureur de sonie ITU-R BS.1770-4 ────────────────────────────
+    std::printf ("30. Mesureur de sonie ITU-R BS.1770-4 (pondération K recalculée pour chaque fréquence d'échantillonnage)\n");
+    {
+        L::Biquad s, h; L::kWeighting (48000.0, s, h);
+        const double ref[10] = { 1.53512485958697, -2.69169618940638, 1.19839281085285, -1.69065929318241, 0.73248077421585,
+                                 1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621 };
+        const double got[10] = { s.b0, s.b1, s.b2, s.a1, s.a2, h.b0, h.b1, h.b2, h.a1, h.a2 };
+        double e = 0; for (int i = 0; i < 10; ++i) e = std::max (e, std::abs (got[i] - ref[i]));
+        std::printf ("   coefficients à 48 kHz : écart max aux coefficients de la norme %.1e [seuil 1e-9]\n", e);
+        CHECK (e < 1e-9, "coefficients de la pondération K à 48 kHz (%.2e)", e);
+        const double amp = std::pow (10.0, -23.0 / 20.0);
+        double worst997 = 0, worstK = 0, worstCurve = 0;
+        for (double fs : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        {
+            const int n = (int) (12 * fs);
+            std::vector<float> x ((size_t) n);
+            double res[3];
+            const double fr[3] = { 997.0, 100.0, 10000.0 };
+            for (int k = 0; k < 3; ++k)
+            {
+                for (int i = 0; i < n; ++i) x[(size_t) i] = (float) (amp * std::sin (2 * pi * fr[k] * i / fs));
+                res[k] = integratedLufs (x.data(), x.data(), n, fs);
+            }
+            // théorie : −23 dBFS sur deux voies = −23 − 0,691 + K(f) LUFS, K(f) = courbe des coefficients de la norme
+            const double e100 = res[1] - (-23.0 - 0.691 + L::kReferenceDb (100.0)), e10k = res[2] - (-23.0 - 0.691 + L::kReferenceDb (10000.0));
+            double curve = 0;   // écart entre la pondération recalculée et celle de la norme, 20 Hz – 20 kHz
+            for (int i = 0; i < 200; ++i) { const double f = 20.0 * std::pow (1000.0, i / 199.0); curve = std::max (curve, std::abs (L::kGainDb (f, fs) - L::kReferenceDb (f))); }
+            std::printf ("   %5.1f kHz : sinus 997 Hz −23 dBFS stéréo → %.3f LUFS ; 100 Hz → %.3f LUFS (écart à la courbe K %+.3f dB) ; 10 kHz → %.3f LUFS (%+.3f dB) ;\n"
+                         "               courbe K recalculée contre celle de la norme, 20 Hz – 20 kHz : écart max %.3f dB\n",
+                         fs / 1000, res[0], res[1], e100, res[2], e10k, curve);
+            worst997 = std::max (worst997, std::abs (res[0] + 23.0));
+            worstK = std::max (worstK, std::max (std::abs (e100), std::abs (e10k)));
+            worstCurve = std::max (worstCurve, curve);
+        }
+        std::printf ("   écart max : 997 Hz %.3f LU [seuil 0.1] ; 100 Hz et 10 kHz contre la courbe K %.3f dB [seuil 0.1] ; courbe entière %.3f dB (information)\n", worst997, worstK, worstCurve);
+        CHECK (worst997 <= 0.1, "sinus 997 Hz −23 dBFS (%.3f LU)", worst997);
+        CHECK (worstK <= 0.1, "courbe K à 100 Hz / 10 kHz (%.3f dB)", worstK);
+        // une seule voie : −3,01 LU ; portes : silence et passage 20 dB plus bas sans effet
+        const double fs = 48000; const int n = (int) (10 * fs);
+        std::vector<float> x ((size_t) (2 * n)), z ((size_t) (2 * n), 0.0f);
+        for (int i = 0; i < 2 * n; ++i) x[(size_t) i] = (float) (amp * std::sin (2 * pi * 997.0 * i / fs) * (i < n ? 1.0 : 0.0));
+        const double oneCh = integratedLufs (x.data(), z.data(), n, fs), withSilence = integratedLufs (x.data(), x.data(), 2 * n, fs);
+        for (int i = n; i < 2 * n; ++i) x[(size_t) i] = (float) (0.1 * amp * std::sin (2 * pi * 997.0 * i / fs));
+        const double withQuiet = integratedLufs (x.data(), x.data(), 2 * n, fs);
+        std::printf ("   une seule voie : %.3f LUFS (attendu −26.01) ; suivi de 10 s de silence : %.3f (porte absolue) ; suivi de 10 s à −43 dBFS : %.3f (porte relative) [−23.0 ± 0.1]\n",
+                     oneCh, withSilence, withQuiet);
+        CHECK (std::abs (oneCh + 26.01) <= 0.1 && std::abs (withSilence + 23.0) <= 0.1 && std::abs (withQuiet + 23.0) <= 0.1, "voies et portes du mesureur");
+    }
+
+    // ── 31. Auto gain à sonie égale : 6 réglages sur du bruit rose ───────
+    std::printf ("31. Auto gain à sonie égale, bruit rose stéréo à 48 kHz, 40 s par réglage (sonie intégrée BS.1770 de 10 à 40 s)\n"
+                 "    avant = méthode 2.0 (moyenne de la courbe en dB, sans mesure) ; après = 3.0 ; convergence = dernier instant où le gain est à plus de 0,1 dB de sa valeur finale\n");
+    const double fs = 48000;
+    const int nTot = (int) (40 * fs), nSkip = (int) (10 * fs);
+    pinkStereo (pinkL, pinkR, nTot, 21);
+    const auto& pl = pinkL; const auto& pr = pinkR;
+    struct GCase { const char* name; std::vector<BandSpec> b; int dynBand = -1; bool dark = false; };
+    std::vector<GCase> cases;
+    cases.push_back ({ "étagère grave +9 dB à 100 Hz", { mk (Shape::lowShelf, 100, 9, 0.71) } });
+    cases.push_back ({ "coupe-bas 120 Hz 24 dB/oct", { mk (Shape::lowCut, 120, 0, 0.71, 24) } });
+    cases.push_back ({ "cloche +12 dB à 3 kHz Q 1", { mk (Shape::bell, 3000, 12, 1.0) } });
+    cases.push_back ({ "tilt +6 dB à 1 kHz", { mk (Shape::tiltShelf, 1000, 6, 0.71, 6) } });
+    cases.push_back ({ "mixte (coupe-bas 40 Hz, −4 dB 250 Hz, +3 dB 2,5 kHz Mid, +5 dB 8 kHz Side)",
+                       { mk (Shape::lowCut, 40, 0, 0.71, 18), mk (Shape::bell, 250, -4, 1.4), mk (Shape::bell, 2500, 3, 0.9, 12, Place::mid), mk (Shape::highShelf, 8000, 5, 0.71, 12, Place::side) } });
+    cases.push_back ({ "bande dynamique en action (cloche 1 kHz Q 1, plage −9 dB, seuil −45 dB)", { mk (Shape::bell, 1000, 0, 1.0) }, 0 });
+    cases.push_back ({ "étagère grave +9 dB à 100 Hz, signal au grave dominant (bruit rose filtré : −6 dB/oct au-dessus de 150 Hz)", { mk (Shape::lowShelf, 100, 9, 0.71) }, -1, true });
+    double worstAfter = 0, worstConv = 0;
+    // (signal au spectre non rose, pour que la prévision de départ, faite sur un spectre rose, soit fausse)
+    std::vector<float> dl = pl, dr = pr;
+    {
+        double zl = 0, zr = 0; const double a = std::exp (-2 * pi * 150.0 / fs);
+        for (int i = 0; i < nTot; ++i) { zl = a * zl + (1 - a) * dl[(size_t) i]; zr = a * zr + (1 - a) * dr[(size_t) i]; dl[(size_t) i] = (float) (3.0 * zl); dr[(size_t) i] = (float) (3.0 * zr); }
+    }
+    for (auto& c : cases)
+    {
+        const auto& pl = c.dark ? dl : ::pinkL; const auto& pr = c.dark ? dr : ::pinkR;
+        GainRig rig;
+        for (size_t i = 0; i < c.b.size(); ++i) rig.bands[i] = c.b[i];
+        if (c.dynBand >= 0) { auto& d = rig.dyn[(size_t) c.dynBand]; d.on = true; d.thrDb = -45; d.rangeDb = -9; d.attackMs = 10; d.releaseMs = 150; }
+        rig.start (fs);
+        const double gStart = rig.ag.gainDb();
+        auto l = pl, r = pr;
+        std::vector<float> preL ((size_t) nTot), preR ((size_t) nTot), gt;
+        rig.run (l.data(), r.data(), nTot, &gt, preL.data(), preR.data());
+        const double lin = integratedLufs (pl.data() + nSkip, pr.data() + nSkip, nTot - nSkip, fs);
+        const double lpre = integratedLufs (preL.data() + nSkip, preR.data() + nSkip, nTot - nSkip, fs);
+        const double lout = integratedLufs (l.data() + nSkip, r.data() + nSkip, nTot - nSkip, fs);
+        const double legacy = legacyAutoGainDb (rig.bands, fs);
+        const double gEnd = gt.back();
+        int last = -1; double wob = 0;
+        for (size_t i = 0; i < gt.size(); ++i)
+        {
+            if (std::abs (gt[i] - gEnd) > 0.1) last = (int) i;
+            if ((double) i * 512 / fs >= 10.0) wob = std::max (wob, (double) std::abs (gt[i] - gEnd));
+        }
+        const double conv = (last + 1) * 512 / fs;
+        std::printf ("   %s :\n      sonie entrée %.2f LUFS, sortie sans compensation %+.2f LU ; avant : gain %+.2f dB → écart %+.2f LU ; après : gain %+.2f dB (départ %+.2f, d'après la courbe) → écart %+.3f LU ;\n"
+                     "      convergence en %.1f s ; mouvement du gain ensuite : ± %.3f dB\n",
+                     c.name, lin, lpre - lin, legacy, lpre + legacy - lin, gEnd, gStart, lout - lin, conv, wob);
+        worstAfter = std::max (worstAfter, std::abs (lout - lin)); worstConv = std::max (worstConv, conv);
+    }
+    std::printf ("   écart de sonie sortie / entrée après convergence, pire réglage : %.3f LU [seuil 0.1] ; convergence la plus lente : %.1f s [seuil 6]\n", worstAfter, worstConv);
+    CHECK (worstAfter <= 0.1, "Auto gain : écart de sonie %.3f LU", worstAfter);
+    CHECK (worstConv <= 6.0, "Auto gain : convergence en %.1f s", worstConv);
+
+    // ── 32. Auto gain : silence, mouvement d'une bande, bornes, coût ─────
+    std::printf ("32. Auto gain : silence, mouvement d'une bande, bornes, coût\n");
+    {
+        // (a) 5 s de silence après 20 s de bruit rose : le gain ne bouge pas
+        for (int kind = 0; kind < 2; ++kind)
+        {
+            GainRig rig; rig.bands[0] = mk (Shape::lowShelf, 100, 9, 0.71); rig.start (fs);
+            const int n1 = (int) (20 * fs) + 1234, n2 = (int) (5 * fs);
+            auto l = pl, r = pr; l.resize ((size_t) (n1 + n2)); r.resize ((size_t) (n1 + n2));
+            std::mt19937 rng (4); std::uniform_real_distribution<float> U (-1.0f, 1.0f);
+            for (int i = n1; i < n1 + n2; ++i) { l[(size_t) i] = kind == 0 ? 0.0f : 3.0e-5f * U (rng); r[(size_t) i] = kind == 0 ? 0.0f : 3.0e-5f * U (rng); }
+            // (échantillon par échantillon autour du début du silence : le gain est lu après chaque échantillon)
+            rig.run (l.data(), r.data(), n1);
+            const double g0 = rig.ag.gainDb();
+            double move = 0;
+            std::vector<float> il (64), ir (64);
+            for (int off = n1; off < n1 + n2; off += 64)
+            {
+                std::copy (l.begin() + off, l.begin() + off + 64, il.begin()); std::copy (r.begin() + off, r.begin() + off + 64, ir.begin());
+                rig.eng.process (l.data() + off, r.data() + off, 64, false);
+                rig.ag.process (il.data(), ir.data(), l.data() + off, r.data() + off, 64);
+                move = std::max (move, std::abs ((double) rig.ag.gainDb() - g0));
+            }
+            // puis le signal revient : le gain repart du même point
+            auto l2 = pl, r2 = pr; std::vector<float> gt;
+            rig.run (l2.data(), r2.data(), (int) (3 * fs), &gt);
+            double back = 0; for (float g : gt) back = std::max (back, std::abs ((double) g - g0));
+            std::printf ("   %s de 5 s après 20 s de signal : mouvement du gain %.6f dB [seuil %s] ; au retour du signal (3 s) : ± %.3f dB\n",
+                         kind == 0 ? "silence numérique" : "bruit de fond à −90 dBFS", move, kind == 0 ? "0" : "0.01", back);
+            if (kind == 0) CHECK (move == 0.0, "le gain bouge pendant un silence (%.6f dB)", move);
+            else CHECK (move <= 0.01, "le gain bouge pendant un bruit de fond sous la porte (%.4f dB)", move);
+            CHECK (back <= 0.3, "saut du gain au retour du signal (%.3f dB)", back);
+        }
+        // (b) une bande bouge d'un coup, puis par un glissement de 2 s : décalage immédiat, puis convergence
+        {
+            GainRig rig; rig.bands[0] = mk (Shape::bell, 1000, 0, 1.0); rig.start (fs);
+            auto l = pl, r = pr;
+            const int n1 = (int) (15 * fs);
+            rig.run (l.data(), r.data(), n1);
+            const double gA = rig.ag.gainDb();
+            rig.bands[0].gainDb = 12.0; rig.push();
+            const double gNow = rig.ag.gainDb();
+            std::vector<float> gt;
+            rig.run (l.data() + n1, r.data() + n1, (int) (15 * fs), &gt);
+            const double gEnd = gt.back();
+            double exc = 0; for (float g : gt) exc = std::max (exc, std::abs ((double) g - gEnd));
+            std::printf ("   cloche 1 kHz Q 1 de 0 à +12 dB d'un coup : gain %+.2f → %+.2f dB dans le même bloc (prévision), %+.2f dB après convergence :\n"
+                         "      écart de la prévision immédiate %.3f dB [seuil 0.5], écart max du gain à sa valeur finale ensuite %.3f dB\n", gA, gNow, gEnd, std::abs (gNow - gEnd), exc);
+            CHECK (std::abs (gNow - gA) > 1.0, "le gain ne suit pas tout de suite le mouvement d'une bande");
+            CHECK (std::abs (gNow - gEnd) <= 0.5 && exc <= 0.5, "prévision immédiate trop loin de la mesure (%.3f dB)", std::max (std::abs (gNow - gEnd), exc));
+
+            // glissement : gain de la cloche de +12 à −12 dB en 2 s (un pas par bloc), sonie momentanée pendant et après
+            GainRig rg; rg.bands[0] = mk (Shape::bell, 1000, 12, 1.0); rg.start (fs);
+            auto l2 = pl, r2 = pr;
+            rg.run (l2.data(), r2.data(), n1);
+            const int nDrag = (int) (2 * fs), nAfter = (int) (4 * fs);
+            for (int off = 0; off < nDrag; off += 512)
+            {
+                rg.bands[0].gainDb = 12.0 - 24.0 * std::min (1.0, (double) (off + 512) / nDrag);
+                rg.run (l2.data() + n1 + off, r2.data() + n1 + off, std::min (512, nDrag - off));
+            }
+            rg.run (l2.data() + n1 + nDrag, r2.data() + n1 + nDrag, nAfter);
+            // sonie momentanée (400 ms) de la sortie contre l'entrée, toutes les 100 ms, du début du glissement à 4 s après
+            L::Meter mi, mo; mi.prepare (fs); mo.prepare (fs);
+            double worst = 0;
+            const int hop = 4800, s0 = n1 - 4 * hop;
+            for (int off = s0; off + hop <= n1 + nDrag + nAfter; off += hop)
+            {
+                mi.process (pl.data() + off, pr.data() + off, hop); mo.process (l2.data() + off, r2.data() + off, hop);
+                if (off >= n1) worst = std::max (worst, std::abs (mo.momentary() - mi.momentary()));
+            }
+            std::printf ("   cloche 1 kHz glissée de +12 à −12 dB en 2 s : écart max de sonie momentanée sortie / entrée pendant le glissement et les 4 s suivantes %.2f LU [seuil 1.0]\n"
+                         "      (sans Auto gain, la sonie irait de %+.1f à %+.1f LU par rapport à l'entrée)\n", worst, -gEnd, -(double) rg.ag.gainDb());
+            CHECK (worst <= 1.0, "sonie pendant le glissement d'une bande (%.2f LU)", worst);
+        }
+        // (c) bornes : ± 24 dB
+        {
+            GainRig rig; rig.bands[0] = mk (Shape::bell, 1000, 30, 0.3); rig.bands[1] = mk (Shape::bell, 1000, 30, 0.3); rig.start (fs);
+            auto l = pl, r = pr; for (auto& v : l) v *= 0.01f; for (auto& v : r) v *= 0.01f;
+            std::vector<float> gt; rig.run (l.data(), r.data(), (int) (8 * fs), &gt);
+            float lo = 0; for (float g : gt) lo = std::min (lo, g);
+            std::printf ("   deux cloches larges de +30 dB : gain le plus bas %.2f dB [borne −24]\n", lo);
+            CHECK (lo >= -24.0f && lo <= -23.9f, "borne du gain de compensation (%.2f dB)", lo);
+        }
+        // (d) coût : la mesure seule (pondération K ×4, FFT étalée du spectre), 20 s de bruit rose stéréo
+        {
+            AutoGain ag; ag.prepare (fs);
+            std::array<BandSpec, maxBands> b {}; b[0] = mk (Shape::bell, 1000, 6, 1.0);
+            ag.setCurve (b, true, false); ag.setRunning (true);
+            double best = 1e9;
+            const int n = (int) (20 * fs);
+            for (int pass = 0; pass < 3; ++pass)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int off = 0; off + 512 <= n; off += 512) ag.process (pl.data() + off, pr.data() + off, pr.data() + off, pl.data() + off, 512);
+                best = std::min (best, std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count());
+            }
+            // changement de courbe : 24 bandes actives, une bande retouchée à chaque bloc
+            for (int i = 0; i < maxBands; ++i) b[(size_t) i] = mk (i % 3 == 0 ? Shape::lowCut : Shape::bell, 40.0 * std::pow (1.3, i), 3, 1.0, i % 3 == 0 ? 48 : 12);
+            ag.setCurve (b, true, false);
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int k = 0; k < 2000; ++k) { b[5].gainDb = 3.0 + 0.001 * k; ag.setCurve (b, true, false); }
+            const double us = 1e6 * std::chrono::duration<double> (std::chrono::steady_clock::now() - t1).count() / 2000;
+            std::printf ("   coût de la mesure : %.2f %% d'un cœur à 48 kHz stéréo (%d opérations de FFT par échantillon, aucune pointe) ;\n"
+                         "      courbe retouchée (24 bandes actives, une qui bouge) : %.0f µs par bloc où un réglage change (information)\n", 100.0 * best / 20.0, ag.unitsPerSample(), us);
+        }
+    }
+
+    // ── 33. Pré-écho de la phase linéaire ────────────────────────────────
+    std::printf ("33. Pré-écho des FIR (énergie cumulée avant le pic, rapportée au pic)\n");
+    {
+        // cas calculable : un pic et un écho 10 ms avant, 40 dB plus bas
+        std::vector<double> h (8192, 0.0);
+        h[4096] = 1.0; h[4096 - 480] = 0.01;
+        const auto p = fir::measurePreEcho (h.data(), (const double*) nullptr, 8192, 48000.0);
+        std::printf ("   écho de −40 dB placé 10 ms avant le pic : %.2f ms au-dessus de −60 dB, %.2f ms au-dessus de −90 dB, %.1f dB à 5 ms, %.1f dB à 20 ms [10 ; 10 ; −40 ; rien]\n",
+                     p.ms60, p.ms90, p.dbAt5ms, p.dbAt20ms);
+        CHECK (std::abs (p.ms60 - 10.0f) < 0.03f && std::abs (p.ms90 - 10.0f) < 0.03f && std::abs (p.dbAt5ms + 40.0f) < 0.01f && p.dbAt20ms == fir::preEchoFloorDb, "pré-écho d'un cas calculable");
+        struct PC { const char* name; BandSpec b; fir::Mode mode; int N; };
+        const PC pcs[] = {
+            { "courbe plate, Linear Max", BandSpec(), fir::Mode::linear, 32768 },
+            { "cloche 3 kHz +6 dB Q 1, Linear Low", mk (Shape::bell, 3000, 6, 1.0), fir::Mode::linear, 4096 },
+            { "coupe-bas 80 Hz 24 dB/oct, Linear Medium", mk (Shape::lowCut, 80, 0, 0.71, 24), fir::Mode::linear, 8192 },
+            { "cloche 40 Hz +6 dB Q 8, Linear Max", mk (Shape::bell, 40, 6, 8.0), fir::Mode::linear, 32768 },
+            { "cloche 40 Hz +6 dB Q 8, Natural", mk (Shape::bell, 40, 6, 8.0), fir::Mode::natural, 32768 },
+            { "coupe-bas 80 Hz 24 dB/oct, Natural", mk (Shape::lowCut, 80, 0, 0.71, 24), fir::Mode::natural, 8192 },
+        };
+        fir::PreEcho res[6];
+        for (int i = 0; i < 6; ++i)
+        {
+            // par le code du plugin (LinearPhaseCore : conception, puis mesure faite par le fil de conception)
+            TestLinear lp; lp.prepare (48000.0);
+            TestLinear::Snapshot sn; sn.bands[0] = pcs[i].b;
+            lp.design (sn, pcs[i].mode, pcs[i].N, false);
+            lp.switchTo (pcs[i].mode, pcs[i].N);
+            res[i] = lp.getPreEcho (pcs[i].mode, pcs[i].N);
+            // mesure directe : réponse impulsionnelle de la convolution
+            const int lat = lp.latencyFor (pcs[i].mode, pcs[i].N), len = lat + 4096;
+            std::vector<float> l ((size_t) len, 0.0f), r ((size_t) len, 0.0f);
+            l[0] = r[0] = 1.0f;
+            lp.process (l.data(), r.data(), len);
+            const auto direct = fir::measurePreEcho (l.data(), (const float*) nullptr, len, 48000.0);
+            std::printf ("   %-42s : %7.2f ms > −60 dB, %7.2f ms > −90 dB, %7.1f dB à 5 ms, %7.1f dB à 20 ms ; réponse impulsionnelle mesurée : %7.2f / %7.2f ms ; « %s »\n",
+                         pcs[i].name, res[i].ms60, res[i].ms90, res[i].dbAt5ms, res[i].dbAt20ms, direct.ms60, direct.ms90, fir::preEchoText (res[i]).c_str());
+            CHECK (std::abs (direct.ms60 - res[i].ms60) <= 0.05f + 0.01f * res[i].ms60, "pré-écho annoncé / mesuré à −60 dB (%s : %.2f contre %.2f ms)", pcs[i].name, res[i].ms60, direct.ms60);
+            // (à −90 dB la mesure directe passe par la convolution en simple précision : tolérance plus large)
+            CHECK (std::abs (direct.ms90 - res[i].ms90) <= 0.5f + 0.05f * res[i].ms90, "pré-écho annoncé / mesuré à −90 dB (%s : %.2f contre %.2f ms)", pcs[i].name, res[i].ms90, direct.ms90);
+        }
+        CHECK (res[0].ms60 == 0.0f && res[0].ms90 == 0.0f && res[0].dbAt5ms == fir::preEchoFloorDb, "courbe plate : aucun pré-écho");
+        CHECK (res[3].ms60 > 100.0f && res[3].ms60 > 20.0f * res[1].ms60, "cloche étroite dans le grave en Linear Max : pré-écho long (%.1f ms)", res[3].ms60);
+        CHECK (res[4].ms60 <= 3.0f && res[5].ms60 <= 3.0f, "Natural phase : pré-écho au plus la petite latence (%.2f et %.2f ms)", res[4].ms60, res[5].ms60);
+        CHECK (fir::preEchoText (res[0]) == std::string ("Pre-echo: none above \xe2\x88\x92" "60 dB"), "texte du pré-écho nul");
+    }
+
+    // ── 34. Résolution Auto vérifiée par la mesure ───────────────────────
+    std::printf ("34. Linear phase, résolution Auto : écart entre la réponse réelle du FIR et la cible, 20 Hz – 20 kHz là où la cible dépasse −60 dB\n"
+                 "    (hors du creux des notch sous −3 dB) ; avant = longueur de la règle seule ; après = règle vérifiée par la mesure (allongée jusqu'à 0,1 dB ou Max)\n");
+    {
+        struct AC { std::string name; std::array<BandSpec, maxBands> b; };
+        std::vector<AC> acs;
+        auto add1 = [&] (const std::string& n, const BandSpec& b) { AC a; a.name = n; a.b[0] = b; acs.push_back (a); };
+        char s[96];
+        for (double q : { 0.5, 1.0, 2.0, 5.0, 10.0, 20.0 }) for (double f : { 20.0, 30.0, 50.0, 100.0, 200.0 }) for (double g : { 12.0, -12.0, 3.0 })
+        { std::snprintf (s, sizeof s, "cloche %g Hz Q %g %+g dB", f, q, g); add1 (s, mk (Shape::bell, f, g, q)); }
+        for (int sl : { 12, 24, 48, 96 }) for (double f : { 20.0, 30.0, 60.0, 120.0 }) { std::snprintf (s, sizeof s, "coupe-bas %g Hz %d dB/oct", f, sl); add1 (s, mk (Shape::lowCut, f, 0, 0.71, sl)); }
+        for (double f : { 30.0, 60.0, 120.0 }) for (double q : { 1.0, 5.0, 10.0 }) { std::snprintf (s, sizeof s, "notch %g Hz Q %g", f, q); add1 (s, mk (Shape::notch, f, 0, q)); }
+        for (double f : { 30.0, 60.0, 120.0 }) for (double g : { 9.0, -9.0 }) for (int v = 0; v < 3; ++v)
+        { std::snprintf (s, sizeof s, "étagère grave %g Hz %+g dB %s", f, g, v == 0 ? "6 dB/oct" : v == 1 ? "12 dB/oct" : "12 dB/oct Q 2"); add1 (s, mk (Shape::lowShelf, f, g, v == 2 ? 2.0 : 0.71, v == 0 ? 6 : 12)); }
+        for (double g : { 6.0, -6.0, 12.0, -12.0 }) { std::snprintf (s, sizeof s, "Flat tilt %+g dB", g); add1 (s, mk (Shape::flatTilt, 1000, g, 0.71)); }
+        for (double g : { 6.0, -6.0 }) { std::snprintf (s, sizeof s, "tilt 100 Hz %+g dB", g); add1 (s, mk (Shape::tiltShelf, 100, g, 0.71, 6)); }
+        for (double sf : { 15.0, 40.5, 77.0 }) for (double f : { 40.0, 80.0 }) { std::snprintf (s, sizeof s, "coupe-bas %g Hz pente libre %g dB/oct", f, sf); add1 (s, mk (Shape::lowCut, f, 0, 0.71, 12, Place::stereo, sf)); }
+        for (double f : { 30.0, 60.0, 120.0 }) { std::snprintf (s, sizeof s, "coupe-bas Brickwall %g Hz", f); add1 (s, mk (Shape::lowCut, f, 0, 0.71, 12, Place::stereo, 0, true)); }
+        add1 ("coupe-haut 120 Hz 24 dB/oct", mk (Shape::highCut, 120, 0, 0.71, 24));
+        add1 ("passe-bande 60 Hz Q 2", mk (Shape::bandPass, 60, 0, 2.0));
+        { AC a; a.name = "grosse caisse (coupe-bas 30 Hz 24, +3 dB 60 Hz Q 1.4, −4 dB 350 Hz, +3 dB 4 kHz)";
+          a.b[0] = mk (Shape::lowCut, 30, 0, 0.71, 24); a.b[1] = mk (Shape::bell, 60, 3, 1.4); a.b[2] = mk (Shape::bell, 350, -4, 1.5); a.b[3] = mk (Shape::bell, 4000, 3, 1.2); acs.push_back (a); }
+        { AC a; a.name = "trois cloches graves (40 Hz +6 Q 3, 80 Hz −6 Q 3 Mid, 160 Hz +4 Q 2 Side)";
+          a.b[0] = mk (Shape::bell, 40, 6, 3.0); a.b[1] = mk (Shape::bell, 80, -6, 3.0, 12, Place::mid); a.b[2] = mk (Shape::bell, 160, 4, 2.0, 12, Place::side); acs.push_back (a); }
+
+        fir::Work w; fir::Result tmp; std::vector<fir::cd> sc;
+        const std::array<double, maxBands> span {};
+        // l'outil de mesure lui-même : contre une évaluation exacte de la réponse (somme directe), à 48 kHz
+        {
+            double worst = 0;
+            for (size_t ci = 0; ci < acs.size(); ci += 7)
+            {
+                fir::Request rq; rq.bands = acs[ci].b; rq.fs = 48000; rq.N = 8192; rq.mode = fir::Mode::linear;
+                fir::design (rq, tmp, w);
+                double atHz = 0;
+                const double e = fir::linearError (rq, tmp, sc, fir::autoFloorDb, &atHz);
+                if (atHz <= 0) continue;
+                Design des[maxBands];
+                for (int i = 0; i < maxBands; ++i) if (rq.bands[(size_t) i].active) designFir (rq.bands[(size_t) i], rq.fs, des[i], true, rq.N);
+                const double exact = std::abs (db (std::abs (fir::responseAt (tmp.h[0], rq.N / 2, rq.fs, atHz))) - db (std::abs (fir::targetAt (rq, des, atHz).a)));
+                if (! tmp.matrix) worst = std::max (worst, std::abs (exact - e));
+            }
+            std::printf ("   outil de mesure (FFT + interpolation) contre la somme directe, au point le plus défavorable de %d réglages : écart %.4f dB [seuil 0.01]\n", (int) (acs.size() + 6) / 7, worst);
+            CHECK (worst <= 0.01, "mesure de l'écart des FIR (%.4f dB)", worst);
+        }
+        for (double rate : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        {
+            const int nMin = fir::minLength (rate), nMax = fir::maxLength (rate);
+            int longer = 0, atMaxFail = 0, count[4] {}, bad = 0;
+            double worstOk = 0, worstRule = 0, worstMax = 0, ms = 0; std::string worstRuleName, worstMaxName;
+            std::vector<std::string> lines; std::string unreachable;
+            for (auto& c : acs)
+            {
+                const int nRule = fir::chooseLength (fir::Res::automatic, c.b, rate, fir::Mode::linear);
+                fir::Request rq; rq.bands = c.b; rq.fs = rate; rq.N = nRule; rq.mode = fir::Mode::linear;
+                fir::design (rq, tmp, w);
+                const double eRule = fir::linearError (rq, tmp, sc);
+                double e = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                const int n = fir::verifiedAutoLength (c.b, span, true, rate, w, tmp, sc, &e);
+                ms = std::max (ms, 1000.0 * std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count());
+                int idx = 0; for (int len = nMin; len < n; len *= 2) ++idx;
+                ++count[idx];
+                if (n > nRule)
+                {
+                    ++longer;
+                    if (rate == 48000.0)
+                    {
+                        std::snprintf (s, sizeof s, "%.3f dB à %d points → %.3f dB à %d points (latence %d → %d éch.)", eRule, nRule, e, n, nRule / 2 + fir::partitionSize (rate), n / 2 + fir::partitionSize (rate));
+                        lines.push_back ("      " + c.name + " : " + s);
+                    }
+                }
+                if (eRule > worstRule && nRule < nMax) { worstRule = eRule; worstRuleName = c.name; }
+                if (e <= fir::autoTolDb) worstOk = std::max (worstOk, e);
+                else
+                {
+                    if (n == nMax)
+                    {
+                        ++atMaxFail; if (e > worstMax) { worstMax = e; worstMaxName = c.name; }
+                        if (rate == 48000.0) { std::snprintf (s, sizeof s, " %.2f dB", e); unreachable += (unreachable.empty() ? "" : " ; ") + c.name + s; }
+                    }
+                    else ++bad;
+                }
+            }
+            std::printf ("   %5.1f kHz, %d réglages : longueurs choisies %d / %d / %d / %d (%d à %d points) ; la mesure allonge %d réglage(s) que la règle seule laissait à %.2f dB au pire (%s) ;\n"
+                         "      tenus à 0,1 dB : %d, écart max %.3f dB [seuil 0.1] ; hors d'atteinte même à Max (Auto choisit alors Max) : %d, pire %.2f dB (%s) ; vérification la plus longue %.0f ms\n",
+                         rate / 1000, (int) acs.size(), count[0], count[1], count[2], count[3], nMin, nMax, longer, worstRule, worstRuleName.c_str(),
+                         (int) acs.size() - atMaxFail - bad, worstOk, atMaxFail, worstMax, worstMaxName.c_str(), ms);
+            for (auto& ln : lines) std::printf ("%s\n", ln.c_str());
+            if (! unreachable.empty()) std::printf ("      hors d'atteinte à 48 kHz (écart à la longueur Max, 32768 points) : %s\n", unreachable.c_str());
+            CHECK (bad == 0, "résolution Auto à %.0f Hz : %d réglage(s) au-dessus de 0,1 dB sans être à la longueur Max", rate, bad);
+            CHECK (worstOk <= fir::autoTolDb, "résolution Auto à %.0f Hz : %.3f dB", rate, worstOk);
+        }
+    }
+}
+
 int main (int argc, char** argv)
 {
+    // « ./qt gain » : seulement les sections 30 à 34 (Auto gain à sonie égale, pré-écho, résolution Auto)
+    if (argc > 1 && std::string (argv[1]) == "gain")
+    {
+        testGain30();
+        std::printf ("\n%s (%d échec%s)\n", failures == 0 ? "TOUS LES TESTS PASSENT" : "DES TESTS ÉCHOUENT", failures, failures > 1 ? "s" : "");
+        return failures == 0 ? 0 : 1;
+    }
     // « ./qt 3.0 » : seulement les sections 17 à 22 (formes et pentes 3.0)
     if (argc > 1 && std::string (argv[1]) == "3.0")
     {
@@ -2361,6 +2817,9 @@ int main (int argc, char** argv)
 
     // ── 24 à 29 : formes et pentes 3.0 ───────────────────────────────────
     testShapes30();
+
+    // ── 30 à 34 : Auto gain à sonie égale, pré-écho, résolution Auto ─────
+    testGain30();
 
     std::printf ("\n%s (%d échec%s)\n", failures == 0 ? "TOUS LES TESTS PASSENT" : "DES TESTS ÉCHOUENT", failures, failures > 1 ? "s" : "");
     return failures == 0 ? 0 : 1;

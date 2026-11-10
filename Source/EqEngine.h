@@ -486,6 +486,21 @@ public:
         soloSt[0][0] = soloSt[0][1] = soloSt[1][0] = soloSt[1][1] = 0;
     }
 
+    // 3.0, changement de mode de phase sans silence : une seconde chaîne démarre en parallèle de celle en
+    // place ; elle reprend l'état des détecteurs (enveloppe, gain dynamique, seuil automatique) pour que
+    // ses bandes dynamiques soient tout de suite au même gain. Valeurs seules : aucune allocation.
+    void seedDetectors (const Engine& from)
+    {
+        for (size_t i = 0; i < bands.size(); ++i)
+        {
+            auto& b = bands[i];
+            const auto& o = from.bands[i];
+            b.env = o.env; b.dynOffset = o.dynOffset; b.avg = o.avg; b.avgCount = o.avgCount;
+            b.dynOut.store (o.dynOut.load (std::memory_order_relaxed), std::memory_order_relaxed);
+            b.autoThrOut.store (o.autoThrOut.load (std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+    }
+
     // Décalage de gain dynamique actuel (dB), lu par l'interface
     float getDynOffset (int i) const { return bands[(size_t) i].dynOut.load (std::memory_order_relaxed); }
     // Seuil automatique actuel (dBFS) d'une bande dont le seuil automatique est en service, lu par l'interface
