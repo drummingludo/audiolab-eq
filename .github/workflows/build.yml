@@ -43,6 +43,13 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release --target AudioLabEQ_VST3 AudioLabEQ_AU -j 4
 
+      - name: Tests du plugin et charge CPU sur Mac (Apple Silicon)
+        run: |
+          cmake -B build-tests -DALEQ_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build-tests --config Release --target ALEQProcessorTest -j 4
+          sysctl -n machdep.cpu.brand_string
+          "$(find build-tests -name ALEQProcessorTest -type f | head -1)"
+
       - name: Signer (signature locale, sans compte Apple)
         run: |
           A=build/AudioLabEQ_artefacts/Release

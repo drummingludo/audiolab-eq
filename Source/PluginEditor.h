@@ -4,8 +4,8 @@
 #include "EqDisplay.h"
 #include "BandPanel.h"
 
-// Fenêtre v2 : la courbe occupe tout le haut, le panneau de la bande flotte sous la courbe,
-// les réglages généraux sont dans la barre du bas.
+// Fenêtre 3.0 (piste B validée) : écran de la courbe 1072 × 400, clavier, bandeau fixe de la bande
+// (1072 × 104), barre du bas. Tout est posé sur le module de 8 px de Lab Comp 3.0.0, marges de 24.
 class AudioLabEqEditor : public juce::AudioProcessorEditor,
                          private juce::Timer,
                          private juce::DarkModeSettingListener
@@ -22,6 +22,7 @@ public:
     static constexpr int baseW = 1120, baseH = 640, baseHOpen = 714;
 
     audiolab::EqDisplay& getDisplay() { return display; }   // tests
+    audiolab::BandPanel& getPanel() { return panel; }       // tests
 
 private:
     class Content : public juce::Component
@@ -33,46 +34,16 @@ private:
         AudioLabEqEditor& ed;
     };
 
-    // Ombre du panneau flottant, peinte au-dessus de la courbe
-    class Shadow : public juce::Component
-    {
-    public:
-        explicit Shadow (AudioLabEqEditor& e) : ed (e) { setInterceptsMouseClicks (false, false); }
-        void paint (juce::Graphics& g) override;
-        AudioLabEqEditor& ed;
-    };
-
-    // Poignées sélectionnées redessinées par-dessus le panneau quand elles passent dessous
-    // (elles restent visibles et saisissables ; les gestes sont transmis à la courbe).
-    class NodeOverlay : public juce::Component
-    {
-    public:
-        explicit NodeOverlay (AudioLabEqEditor& e) : ed (e) { setMouseCursor (juce::MouseCursor::DraggingHandCursor); }
-        void update();
-        void paint (juce::Graphics& g) override;
-        bool hitTest (int x, int y) override;
-        void mouseMove (const juce::MouseEvent& e) override        { ed.display.mouseMove (rel (e)); }
-        void mouseExit (const juce::MouseEvent& e) override        { ed.display.mouseExit (rel (e)); }
-        void mouseDown (const juce::MouseEvent& e) override        { ed.display.mouseDown (rel (e)); }
-        void mouseDrag (const juce::MouseEvent& e) override        { ed.display.mouseDrag (rel (e)); }
-        void mouseUp (const juce::MouseEvent& e) override          { ed.display.mouseUp (rel (e)); }
-        void mouseDoubleClick (const juce::MouseEvent& e) override { ed.display.mouseDoubleClick (rel (e)); }
-        void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override { ed.display.mouseWheelMove (rel (e), w); }
-    private:
-        juce::MouseEvent rel (const juce::MouseEvent& e) const { return e.getEventRelativeTo (&ed.display); }
-        juce::Array<int> shown;
-        AudioLabEqEditor& ed;
-    };
-
     void timerCallback() override;
     void darkModeSettingChanged() override { applyTheme(); }
     void applyTheme();
     void rebuildPanel();
-    void placePanel();
     void setAdvanced (bool open, bool resizeWindow);
     int currentH() const { return advOpen ? baseHOpen : baseH; }
     juce::String latencyText() const;
     juce::String sideChainText() const;
+    // niveaux de sortie : deux barres de 4 px dans la barre du bas, entre « Advanced settings » et « Scale »
+    juce::Rectangle<int> meterArea() const { return { 712, 594, 80, 12 }; }
 
     AudioLabEqProcessor& proc;
     audiolab::Theme theme;
@@ -80,9 +51,7 @@ private:
     juce::TooltipWindow tooltips { nullptr, 700 };
     Content content { *this };
     audiolab::EqDisplay display;
-    Shadow shadow { *this };
     audiolab::BandPanel panel;
-    NodeOverlay overlay { *this };
     audiolab::Toast toast { theme };
 
     // barre du bas : segments dans l'ordre Zero latency / Natural / Linear (paramètre : 0 / 2 / 1)

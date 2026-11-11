@@ -58,7 +58,7 @@ inline void drawArcControl (juce::Graphics& g, const Theme& th, juce::Point<floa
     g.setColour (juce::Colours::white.withAlpha (0.07f)); g.strokePath (lip, juce::PathStrokeType (1.0f));
     // repère
     const float av = ang (valueN);
-    const auto i0 = onCircle (c, capD / 2 - (capD > 30 ? 8.0f : 4.5f), av), i1 = onCircle (c, capD / 2 - 1.5f, av);
+    const auto i0 = onCircle (c, capD / 2 - (capD > 30 ? 5.5f : 4.5f), av), i1 = onCircle (c, capD / 2 - 1.5f, av);
     g.setColour (cols.second); g.drawLine (i0.x, i0.y, i1.x, i1.y, 1.5f);
 }
 
@@ -83,14 +83,16 @@ public:
     }
 
     std::function<void()> onGestureStart;   // pour « Annuler »
+    std::function<juce::String (float)> unitFmt;   // unité qui dépend de la valeur (Hz / kHz)
+    bool labelLeft = false;                 // petit potentiomètre : nom et valeur à gauche, calés à droite
 
     // Largeur conseillée (petit potentiomètre : 28 px + nom / valeur)
     int idealWidth() const
     {
-        if (sz == Size::main) return 84;
-        const float a = juce::GlyphArrangement::getStringWidth (theme.ui (9, 600, 0.04f), upper (labelText));
+        if (sz == Size::main) return 80;
+        const float a = juce::GlyphArrangement::getStringWidth (theme.ui (10, 600, 0.04f), upper (labelText));
         const float b = juce::GlyphArrangement::getStringWidth (theme.ui (10), fmt (param.convertFrom0to1 (param.getValue())) + "0");
-        return 28 + 8 + juce::roundToInt (std::max (a, b)) + 4;
+        return 32 + 8 + juce::roundToInt (std::max (a, b)) + 4;
     }
 
     void paint (juce::Graphics& g) override
@@ -101,30 +103,36 @@ public:
         const auto value = fmt (param.convertFrom0to1 (n));
         if (sz == Size::main)
         {
-            const juce::Point<float> c ((float) getWidth() * 0.5f, 36.0f);
-            drawArcControl (g, theme, c, 36.0f - 1.6f - 2.5f, 3.2f, 52.0f, startNorm, n, fam, hover, dragging);
+            // grille 3.0 : arc de 64 hors tout (rayon d'axe 30,5, trait 3), capuchon 46 (5/7 de l'arc),
+            // valeur 12 px remontée de 1 px, unité 10 px, nom 10 px en capitales 52 px sous l'axe
+            const juce::Point<float> c ((float) getWidth() * 0.5f, 32.0f);
+            drawArcControl (g, theme, c, 30.5f, 3.0f, 46.0f, startNorm, n, fam, hover, dragging);
             g.setColour (p.text);
-            theme.drawValue (g, value, { c.x - 26, c.y - 15, 52, 18 }, 14, 600);
-            g.setColour (p.soft); g.setFont (theme.ui (11));
-            g.drawText (unitText, juce::Rectangle<float> (c.x - 26, c.y + 3, 52, 14), juce::Justification::centred, false);
-            g.setColour (p.text); g.setFont (theme.ui (11, 600, 0.06f));
-            g.drawText (upper (labelText), juce::Rectangle<float> (0, 78, (float) getWidth(), 16), juce::Justification::centredTop, false);
+            theme.drawValue (g, value, { c.x - 23, c.y - 12, 46, 14 }, 12, 600);
+            g.setColour (p.soft); g.setFont (theme.ui (10));
+            g.drawText (unitFmt ? unitFmt (param.convertFrom0to1 (n)) : unitText, juce::Rectangle<float> (c.x - 23, c.y + 3, 46, 12), juce::Justification::centred, false);
+            g.setColour (p.text); g.setFont (theme.ui (10, 600, 0.06f));
+            g.drawText (upper (labelText), juce::Rectangle<float> (0.4f, c.y + 40, (float) getWidth(), 16), juce::Justification::centred, false);
         }
         else
         {
-            const juce::Point<float> c (14.0f, (float) getHeight() * 0.5f);
-            drawArcControl (g, theme, c, 14.0f - 1.2f - 2.5f, 2.4f, 16.0f, startNorm, n, fam, hover, dragging);
-            g.setColour (p.text); g.setFont (theme.ui (9, 600, 0.04f));
-            g.drawText (upper (labelText), juce::Rectangle<float> (36, c.y - 13, (float) getWidth() - 36, 12), juce::Justification::bottomLeft, false);
+            // petit potentiomètre : 32 hors tout (rayon d'axe 14,5, trait 3), capuchon 20
+            const float w = (float) getWidth();
+            const juce::Point<float> c (labelLeft ? w - 16.0f : 16.0f, (float) getHeight() * 0.5f);
+            drawArcControl (g, theme, c, 14.5f, 3.0f, 20.0f, startNorm, n, fam, hover, dragging);
+            const juce::Rectangle<float> tx (labelLeft ? 0.0f : 40.0f, c.y - 13, w - 40, 12);
+            g.setColour (p.text); g.setFont (theme.ui (10, 600, 0.04f));
+            g.drawText (upper (labelText), tx, labelLeft ? juce::Justification::bottomRight : juce::Justification::bottomLeft, false);
             g.setColour (p.text2);
-            theme.drawValue (g, value, { 36, c.y + 0.5f, (float) getWidth() - 36, 13 }, 10, 400, juce::Justification::left);
+            theme.drawValue (g, value, tx.translated (0, 13.5f).withHeight (13), 10, 400, labelLeft ? juce::Justification::right : juce::Justification::left);
         }
         if (focused) { g.setColour (p.teal2.withAlpha (0.5f)); g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1), 8, 1.5f); }
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        if (! isEnabled()) return;
+        if (! isEnabled() || e.mods.isPopupMenu()) return;
+        if (e.mods.isAltDown() || e.mods.isCommandDown()) { resetToDefault(); return; }   // Alt ou Cmd + clic : valeur par défaut
         if (onGestureStart) onGestureStart();
         y0 = e.position.y; v0 = param.getValue();
         attachment.beginGesture(); dragging = true; repaint();
@@ -136,12 +144,68 @@ public:
         setNorm (v0 + (y0 - e.position.y) / k, true);
     }
     void mouseUp (const juce::MouseEvent&) override { if (dragging) { attachment.endGesture(); dragging = false; repaint(); } }
-    void mouseDoubleClick (const juce::MouseEvent&) override
+    // Double-clic (ou Entrée quand le potentiomètre a le focus) : saisie de la valeur au clavier.
+    void mouseDoubleClick (const juce::MouseEvent&) override { if (isEnabled()) showEditor(); }
+    void resetToDefault()
     {
-        if (! isEnabled()) return;
         if (onGestureStart) onGestureStart();
         attachment.setValueAsCompleteGesture (param.convertFrom0to1 (param.getDefaultValue()));
     }
+    // « 2k », « 2.5 kHz », « -3 », « −3 dB », « 1,5 » ; parseFn (facultatif) passe en premier (notes : « A4 »)
+    std::function<bool (const juce::String&, float&)> parseFn;
+    std::function<juce::String (float)> editFmt;   // texte de départ de la saisie quand l'affichage change d'unité (Hz / kHz)
+    static bool parseNumber (juce::String t, float& out)
+    {
+        t = t.trim().toLowerCase().replace (juce::String::fromUTF8 ("−"), "-").replaceCharacter (',', '.');
+        const auto num = t.retainCharacters ("0123456789.-+");
+        if (num.isEmpty() || ! num.containsAnyOf ("0123456789")) return false;
+        double v = num.getDoubleValue();
+        const auto rest = t.removeCharacters ("0123456789.-+ ");
+        if (rest.startsWithChar ('k')) v *= 1000.0;
+        out = (float) v; return true;
+    }
+    void showEditor()
+    {
+        if (dragging) { attachment.endGesture(); dragging = false; }
+        editor = std::make_unique<juce::TextEditor>();
+        const auto& p = theme.pal();
+        editor->setFont (theme.ui (12, 600));
+        editor->setJustification (juce::Justification::centred);
+        editor->setColour (juce::TextEditor::backgroundColourId, p.win);
+        editor->setColour (juce::TextEditor::textColourId, p.text);
+        editor->setColour (juce::TextEditor::highlightColourId, p.select);
+        editor->setColour (juce::TextEditor::highlightedTextColourId, p.text);
+        editor->setColour (juce::TextEditor::outlineColourId, p.teal2);
+        editor->setColour (juce::TextEditor::focusedOutlineColourId, p.teal2);
+        editor->setIndents (2, 3);
+        const float cur = param.convertFrom0to1 (param.getValue());
+        editor->setText (editFmt ? editFmt (cur) : fmt (cur), false);
+        if (sz == Size::main) editor->setBounds (getWidth() / 2 - 28, 32 - 11, 56, 22);
+        else                  editor->setBounds (labelLeft ? 0 : 40, getHeight() / 2 - 11, getWidth() - 40, 22);
+        addAndMakeVisible (*editor);
+        editor->selectAll();
+        editor->grabKeyboardFocus();
+        editor->onReturnKey = [this]
+        {
+            float v = 0;
+            const auto t = editor->getText();
+            if ((parseFn && parseFn (t, v)) || parseNumber (t, v))
+            {
+                if (onGestureStart) onGestureStart();
+                const auto& r = param.getNormalisableRange();
+                attachment.setValueAsCompleteGesture (juce::jlimit (r.start, r.end, v));
+            }
+            hideEditor();
+        };
+        editor->onEscapeKey = [this] { hideEditor(); };
+        editor->onFocusLost = [this] { hideEditor(); };
+    }
+    void hideEditor()
+    {
+        if (editor == nullptr) return;
+        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ArcKnob> (this)] { if (safe != nullptr) { safe->editor.reset(); safe->repaint(); } });
+    }
+    std::unique_ptr<juce::TextEditor> editor;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& w) override
     {
         if (std::abs (w.deltaY) < 1e-6f || ! isEnabled()) return;
@@ -152,6 +216,7 @@ public:
     bool keyPressed (const juce::KeyPress& k) override
     {
         const float st = 1.0f / 50;
+        if (k.isKeyCode (juce::KeyPress::returnKey) && isEnabled()) { showEditor(); return true; }
         if (k.isKeyCode (juce::KeyPress::upKey) || k.isKeyCode (juce::KeyPress::rightKey)) { setNorm (param.getValue() + st, false); return true; }
         if (k.isKeyCode (juce::KeyPress::downKey) || k.isKeyCode (juce::KeyPress::leftKey)) { setNorm (param.getValue() - st, false); return true; }
         if (k.isKeyCode (juce::KeyPress::homeKey)) { setNorm (0, false); return true; }
@@ -226,23 +291,23 @@ public:
     {
         float w = 0;
         for (auto& o : options) w = std::max (w, juce::GlyphArrangement::getStringWidth (theme.ui (fontSize, 500), o) + 24);
-        return 6 + w * options.size() + 3 * (options.size() - 1);
+        return 8 + w * options.size();
     }
 
     void paint (juce::Graphics& g) override
     {
         const auto& p = theme.pal();
-        g.setColour (onSurface ? p.rail : p.surface); g.fillRoundedRectangle (getLocalBounds().toFloat(), 9);
+        g.setColour (onSurface ? p.rail : p.surface); g.fillRoundedRectangle (getLocalBounds().toFloat(), 8);
         for (int i = 0; i < options.size(); ++i)
         {
             auto r = cell (i);
             if (i == selected)
             {
-                juce::Path pill; pill.addRoundedRectangle (r, 7);
+                juce::Path pill; pill.addRoundedRectangle (r, 4);
                 juce::DropShadow (juce::Colours::black.withAlpha (0.18f), 3, { 0, 1 }).drawForPath (g, pill);
                 g.setColour (p.select); g.fillPath (pill);
             }
-            else if (i == hover) { g.setColour (p.cap.withAlpha (0.6f)); g.fillRoundedRectangle (r, 7); }
+            else if (i == hover) { g.setColour (p.cap.withAlpha (0.6f)); g.fillRoundedRectangle (r, 4); }
             g.setColour (i == selected ? p.text : p.text2);
             g.setFont (theme.ui (fontSize, i == selected ? 500 : 400));
             g.drawText (options[i], r, juce::Justification::centred, false);
@@ -259,8 +324,9 @@ public:
 private:
     juce::Rectangle<float> cell (int i) const
     {
-        const float w = ((float) getWidth() - 6 - 3 * (options.size() - 1)) / (float) options.size();
-        return { 3 + i * (w + 3), 3.0f, w, (float) getHeight() - 6 };
+        // marge intérieure 4 (rayons concentriques 8 et 4), segments jointifs
+        const float w = ((float) getWidth() - 8) / (float) options.size();
+        return { 4 + i * w, 4.0f, w, (float) getHeight() - 8 };
     }
     int hit (juce::Point<float> pt) const
     {
@@ -375,7 +441,7 @@ public:
         label.setFont (getComboBoxFont (box));
         label.setColour (juce::Label::textColourId, box.isEnabled() ? theme.pal().text : theme.pal().soft);
     }
-    juce::Font getPopupMenuFont() override { return theme.ui (13); }
+    juce::Font getPopupMenuFont() override { return theme.ui (12); }
     void drawPopupMenuBackground (juce::Graphics& g, int w, int h) override
     {
         const auto& p = theme.pal();
@@ -417,13 +483,13 @@ public:
     {
         if (text.isEmpty()) return;
         const auto& p = theme.pal();
-        const float w = juce::GlyphArrangement::getStringWidth (theme.ui (13, 500), text) + 36, h = 34;
+        const float w = juce::GlyphArrangement::getStringWidth (theme.ui (12, 500), text) + 36, h = 34;
         auto r = juce::Rectangle<float> ((getWidth() - w) / 2, atTop ? 14.0f : (float) getHeight() - h - 14, w, h);
         juce::Path box; box.addRoundedRectangle (r, 10);
         juce::DropShadow (juce::Colours::black.withAlpha (0.45f), 18, { 0, 6 }).drawForPath (g, box);
         g.setColour (p.cap); g.fillPath (box);
         g.setColour (p.rail); g.strokePath (box, juce::PathStrokeType (1));
-        g.setColour (good ? p.teal2 : p.text); g.setFont (theme.ui (13, 500));
+        g.setColour (good ? p.teal2 : p.text); g.setFont (theme.ui (12, 500));
         g.drawText (text, r, juce::Justification::centred, false);
     }
 

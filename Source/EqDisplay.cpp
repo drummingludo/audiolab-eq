@@ -34,7 +34,7 @@ juce::Rectangle<float> EqDisplay::pianoArea() const
 juce::Rectangle<float> EqDisplay::helpCard() const
 {
     auto r = plot();
-    return { r.getRight() - 16.0f - 360.0f, r.getY() + 16.0f, 360.0f, 282.0f };
+    return { r.getRight() - 16.0f - 360.0f, r.getY() + 32.0f, 360.0f, 360.0f };
 }
 juce::Rectangle<float> EqDisplay::helpClose() const
 {
@@ -49,7 +49,7 @@ bool EqDisplay::helpShown() const
 juce::Rectangle<float> EqDisplay::rangeButton() const
 {
     auto r = plot();
-    return { r.getRight() + 8.0f, r.getY(), 30.0f, 20.0f };
+    return { r.getRight() - 8.0f - 32.0f, r.getY() + 8.0f, 32.0f, 16.0f };
 }
 double EqDisplay::range() const { return (double) (int) proc.ui.getProperty ("dbRange", 12); }
 float EqDisplay::xOf (double f) const
@@ -133,6 +133,7 @@ void EqDisplay::timerCallback()
     {
         meterL = nl; meterR = nr;
         repaint();
+        if (onMeters) onMeters();
     }
 }
 
@@ -197,6 +198,33 @@ void EqDisplay::updateCurves()
                 const float t = (float) juce::jlimit (0.0, 1.0, pos - k);
                 totalCurve[(size_t) i] = ca[(size_t) k] + (ca[(size_t) k + 1] - ca[(size_t) k]) * t;
                 curveB[(size_t) i] = cb[(size_t) k] + (cb[(size_t) k + 1] - cb[(size_t) k]) * t;
+            }
+            // Bandes dynamiques (3.0) : la courbe du FIR ne les contient pas (Natural phase : elles sont
+            // faites par le moteur zéro latence) ou les contient à leur gain de base (Linear phase : le
+            // mélange de FIR ajoute leur mouvement). On ajoute ce qui manque, avec le gain du moment.
+            for (int b = 0; b < maxBands; ++b)
+            {
+                const uint32_t bit = 1u << b;
+                const bool viaEngine = (dd.engineMask & bit) != 0, mixed = (dd.mixMask & bit) != 0;
+                if (! (viaEngine || mixed) || ! proc.isUsed (b)) continue;
+                auto s = proc.getBandSpec (b, true);
+                if (! s.active || ! hasGain (s.shape)) continue;
+                const float off = proc.getDynOffset (b);
+                if (mixed && off == 0.0f) continue;
+                Design base, moved;
+                if (mixed) design (s, fs, base, true);
+                s.gainDb += off;
+                // moteur : conception des bandes dynamiques (matched, sans section de correction)
+                if (viaEngine) designMatched (s, fs, moved, 0); else design (s, fs, moved, true);
+                const bool toA = s.place == Place::stereo || s.place == Place::left || s.place == Place::mid;
+                const bool toB = s.place == Place::stereo || s.place == Place::right || s.place == Place::side;
+                for (int i = 0; i < numCols; ++i)
+                {
+                    const double f = std::min (colFreq[(size_t) i], 0.4999 * fs);
+                    const float v = (float) (magnitudeDb (moved, f, fs, ! viaEngine) - (mixed ? magnitudeDb (base, f, fs, true) : 0.0));
+                    if (toA) totalCurve[(size_t) i] += v;
+                    if (toB) curveB[(size_t) i] += v;
+                }
             }
         }
     }
@@ -266,7 +294,7 @@ void EqDisplay::paint (juce::Graphics& g)
     const auto& p = theme.pal();
     auto r = plot();
 
-    juce::Path bgPath; bgPath.addRoundedRectangle (r, 10);
+    juce::Path bgPath; bgPath.addRoundedRectangle (r, 12);
     g.setColour (p.surface); g.fillPath (bgPath);
     g.saveState();
     g.reduceClipRegion (bgPath);
@@ -294,6 +322,7 @@ void EqDisplay::paint (juce::Graphics& g)
     {
         paintAnalyzer (g, anPre, p.ref, false);
         paintAnalyzer (g, anPost, p.teal2, true);
+        paintGrab (g);
     }
 
     // ligne 0 dB : repère en pointillés, opacité 100 %
@@ -305,17 +334,17 @@ void EqDisplay::paint (juce::Graphics& g)
         g.setColour (p.ref); g.fillPath (d);
     }
 
-    // libellés de fréquence (graduations 8 px, gris doux)
-    g.setFont (theme.ui (8));
+    // libellés de fréquence (10 px, gris doux)
+    g.setFont (theme.ui (10));
     g.setColour (p.soft);
     for (double f : { 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0 })
     {
         const float x = xOf (f);
         const String t = f >= 1000 ? String ((int) (f / 1000)) + "k" : String ((int) f);
         if (x > r.getRight() - 30)   // 20 kHz : calé sur le bord droit
-            g.drawText (t, juce::Rectangle<float> (r.getRight() - 45, r.getBottom() - 14, 40, 10), juce::Justification::centredRight, false);
+            g.drawText (t, juce::Rectangle<float> (r.getRight() - 48, r.getBottom() - 18, 40, 12), juce::Justification::centredRight, false);
         else
-            g.drawText (t, juce::Rectangle<float> (std::max (r.getX() + 5, x + 3), r.getBottom() - 14, 40, 10), juce::Justification::centredLeft, false);
+            g.drawText (t, juce::Rectangle<float> (std::max (r.getX() + 8, x + 4), r.getBottom() - 18, 40, 12), juce::Justification::centredLeft, false);
     }
 
     const float y0 = yOf (0);
@@ -371,7 +400,7 @@ void EqDisplay::paint (juce::Graphics& g)
         const String a = curveMode == 2 ? "Mid" : U ("Left"), b = curveMode == 2 ? "Side" : U ("Right");
         auto lg = juce::Rectangle<float> (r.getX() + 12, r.getY() + 10, 150, 16);
         g.setColour (p.teal); g.fillRect (lg.getX(), lg.getCentreY() - 1.25f, 18.0f, 2.5f);
-        g.setColour (p.text); g.setFont (theme.ui (11, 500)); g.drawText (a, lg.withTrimmedLeft (24), juce::Justification::centredLeft, false);
+        g.setColour (p.text); g.setFont (theme.ui (10, 500)); g.drawText (a, lg.withTrimmedLeft (24), juce::Justification::centredLeft, false);
         lg.translate (0, 18);
         g.setColour (p.teal2);
         for (int k = 0; k < 3; ++k) g.fillRect (lg.getX() + k * 7.0f, lg.getCentreY() - 1, 4.0f, 2.0f);
@@ -384,7 +413,7 @@ void EqDisplay::paint (juce::Graphics& g)
         if (! bandShown[(size_t) b]) continue;
         const auto s = proc.getBandSpec (b, true);
         const auto pos = nodePos (b);
-        if (proc.bandValue (b, P::fDyn) > 0.5f && hasGain (s.shape))
+        if (proc.bandValue (b, P::fDyn) > 0.5f && canBeDynamic (s.shape))
         {
             const float yr = yOf (s.gainDb + proc.bandValue (b, P::fRange) * proc.gainScale());
             const float yd = yOf (s.gainDb + proc.getDynOffset (b));
@@ -436,23 +465,22 @@ void EqDisplay::paint (juce::Graphics& g)
     if (rb >= 0 && bandShown[(size_t) rb] && ! sketchMode) paintReadout (g, rb);
 
     g.restoreState();
-    g.setColour (p.rail); g.drawRoundedRectangle (r.reduced (0.5f), 10, 1.0f);
+    g.setColour (p.rail); g.drawRoundedRectangle (r.reduced (0.5f), 12, 1.0f);
 
-    // échelle dB (graduations 8 px) + bouton de plage
-    g.setFont (theme.ui (8));
+    // échelle dB (10 px, dans l'écran, calée à droite au-dessus de chaque ligne) + bouton de plage
+    g.setFont (theme.ui (10));
     for (double db = -rg; db <= rg + 1e-6; db += stepDb * (rg >= 30 ? 1 : 2))
     {
-        if (std::abs (db - rg) < 1e-6) continue;
+        if (yOf (db) < r.getY() + 40 || yOf (db) > r.getBottom() - 24) continue;   // bouton de plage en haut, fréquences en bas
         g.setColour (std::abs (db) < 1e-6 ? p.text2 : p.soft);
-        g.drawText ((db > 0 ? "+" : "") + String ((int) db), juce::Rectangle<float> (r.getRight() + 10, yOf (db) - 6, 26, 12),
-                    juce::Justification::centredLeft, false);
+        g.drawText ((db > 0 ? "+" : db < 0 ? U ("−") : String()) + String (std::abs ((int) db)), juce::Rectangle<float> (r.getRight() - 48, yOf (db) - 14, 40, 12),
+                    juce::Justification::centredRight, false);
     }
     auto rbx = rangeButton();
     g.setColour (p.cap); g.fillRoundedRectangle (rbx, 6);
     g.setColour (p.text); g.setFont (theme.ui (10, 500));
     g.drawText (U ("±") + String ((int) rg), rbx, juce::Justification::centred, false);
 
-    paintMeters (g);
     paintPiano (g);
 }
 
@@ -464,12 +492,12 @@ void EqDisplay::paintNode (juce::Graphics& g, int b) const
     const auto s = proc.getBandSpec (b, true);
     const auto pos = nodePos (b);
     const bool sel = selection.contains (b), hv = b == hover;
-    const float rad = sel ? 10.0f : hv ? 9.5f : 9.0f;
+    const float rad = sel ? 12.0f : hv ? 11.5f : 11.0f;   // poignée de 24 px (3 modules)
     juce::Path dot; dot.addEllipse (pos.x - rad, pos.y - rad, rad * 2, rad * 2);
     if (sel)
     {
         g.setColour (p.teal.withAlpha (0.28f));
-        g.fillEllipse (pos.x - 16, pos.y - 16, 32, 32);
+        g.fillEllipse (pos.x - 20, pos.y - 20, 40, 40);
         g.setColour (p.select); g.fillPath (dot);
         g.setColour (p.text); g.drawEllipse (pos.x - rad - 0.75f, pos.y - rad - 0.75f, rad * 2 + 1.5f, rad * 2 + 1.5f, 1.5f);
     }
@@ -481,17 +509,76 @@ void EqDisplay::paintNode (juce::Graphics& g, int b) const
         g.drawEllipse (pos.x - rad - 0.75f, pos.y - rad - 0.75f, rad * 2 + 1.5f, rad * 2 + 1.5f, 1.5f);
     }
     g.setColour (s.active || sel ? p.text : p.soft);
-    g.setFont (theme.ui (sel ? 10.0f : 9.5f, 600));
-    g.drawText (String (b + 1), juce::Rectangle<float> (pos.x - 10, pos.y - 6.5f, 20, 13), juce::Justification::centred, false);
+    g.setFont (theme.ui (12, 600));
+    g.drawText (String (b + 1), juce::Rectangle<float> (pos.x - 12, pos.y - 8.0f, 24, 16), juce::Justification::centred, false);
     if (s.place != Place::stereo)
     {
-        g.setColour (p.teal2); g.setFont (theme.ui (9, 600));
+        g.setColour (p.teal2); g.setFont (theme.ui (10, 600));
         g.drawText (P::placeShort()[(int) s.place], juce::Rectangle<float> (pos.x + rad - 1, pos.y - rad - 11, 14, 11), juce::Justification::centredLeft, false);
     }
     if (proc.getSolo() == b)
     {
         g.setColour (p.teal2); g.drawEllipse (pos.x - rad - 5, pos.y - rad - 5, rad * 2 + 10, rad * 2 + 10, 1.2f);
     }
+}
+
+// Crête du spectre la plus proche du curseur : maximum local à ±24 px, qui dépasse d'au moins 6 dB les creux
+// voisins (±48 px), au-dessus de −80 dB, et dont le sommet est à moins de 32 px du curseur en hauteur.
+int EqDisplay::findPeak (juce::Point<float> pos) const
+{
+    auto r = plot();
+    if (! r.contains (pos) || numCols < 8) return -1;
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const auto& a = *src;
+    const int c0 = (int) (pos.x - r.getX());
+    int best = -1; float bestScore = 1e9f;
+    for (int i = std::max (1, c0 - 24); i <= std::min (numCols - 2, c0 + 24); ++i)
+    {
+        const float v = a[(size_t) i];
+        if (v < -80.0f || v < a[(size_t) i - 1] || v < a[(size_t) i + 1]) continue;
+        float lo = v, hi = v;
+        for (int k = std::max (0, i - 48); k < i; ++k) lo = std::min (lo, a[(size_t) k]);
+        for (int k = i + 1; k <= std::min (numCols - 1, i + 48); ++k) hi = std::min (hi, a[(size_t) k]);
+        if (v - lo < 6.0f || v - hi < 6.0f) continue;
+        bool top = true;   // sommet du massif : rien de plus haut à ±6 px
+        for (int k = std::max (0, i - 6); k <= std::min (numCols - 1, i + 6); ++k) if (a[(size_t) k] > v) top = false;
+        if (! top) continue;
+        const float dy = std::abs (yAn (v) - pos.y);
+        if (dy > 32.0f) continue;
+        const float score = std::abs ((float) (i - c0)) + dy * 0.5f;
+        if (score < bestScore) { bestScore = score; best = i; }
+    }
+    return best;
+}
+
+double EqDisplay::peakFreq (int col) const
+{
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const auto& a = *src;
+    if (col < 1 || col >= numCols - 1) return colFreq[(size_t) juce::jlimit (0, numCols - 1, col)];
+    const double l = a[(size_t) col - 1], m = a[(size_t) col], h = a[(size_t) col + 1], den = l - 2.0 * m + h;
+    const double d = std::abs (den) < 1e-9 ? 0.0 : juce::jlimit (-0.5, 0.5, 0.5 * (l - h) / den);
+    return colFreq[(size_t) col] * std::pow (colFreq[(size_t) col + 1] / colFreq[(size_t) col], d);
+}
+
+void EqDisplay::paintGrab (juce::Graphics& g)
+{
+    if (grabCol < 0 || grabCol >= numCols) return;
+    const auto& p = theme.pal();
+    auto r = plot();
+    const auto* src = &anPost;
+    if (*std::max_element (anPost.begin(), anPost.end()) <= -119.0f) src = &anPre;
+    const float x = r.getX() + grabCol + 0.5f, y = juce::jlimit (r.getY() + 6, r.getBottom() - 6, yAn ((*src)[(size_t) grabCol]));
+    g.setColour (p.surface); g.fillEllipse (x - 5, y - 5, 10, 10);
+    g.setColour (p.text); g.drawEllipse (x - 4, y - 4, 8, 8, 2.0f);
+    const String t = params::fmtHz ((float) peakFreq (grabCol));
+    g.setFont (theme.ui (10, 600));
+    const float w = juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), t) + 12;
+    auto box = juce::Rectangle<float> (x - w * 0.5f, y - 28, w, 16).constrainedWithin (r.reduced (4));
+    g.setColour (p.cap); g.fillRoundedRectangle (box, 4);
+    g.setColour (p.text); g.drawText (t, box, juce::Justification::centred, false);
 }
 
 void EqDisplay::paintAnalyzer (juce::Graphics& g, const std::vector<float>& col, juce::Colour c, bool fill)
@@ -541,7 +628,7 @@ void EqDisplay::paintPiano (juce::Graphics& g)
         }
         else if (pc == 0 && x0 >= pa.getX())
         {
-            g.setColour (p.soft); g.setFont (theme.ui (7));
+            g.setColour (p.soft); g.setFont (theme.ui (8));
             g.drawText ("C" + String (m / 12 - 1), juce::Rectangle<float> (x0 + 1.5f, pa.getBottom() - 8, 18, 8), juce::Justification::centredLeft, false);
         }
     }
@@ -557,32 +644,25 @@ void EqDisplay::paintPiano (juce::Graphics& g)
     g.restoreState();
 }
 
-// Barres de sortie : piste 8 px, fond de fenêtre, bord « Rails » ; teal secondaire → ambre (82 %) → rouge
-void EqDisplay::paintMeters (juce::Graphics& g)
+// Niveaux de sortie : deux barres horizontales de 4 px (gauche, droite), fond de fenêtre ;
+// teal secondaire → ambre (82 %) → rouge. Échelle −60 … +6 dB.
+void EqDisplay::paintMeters (juce::Graphics& g, juce::Rectangle<float> area) const
 {
     const auto& p = theme.pal();
-    auto r = plot();
-    const float x = r.getRight() + 46, w = 8, top = r.getY() + 24, bot = r.getBottom();
-    g.setColour (p.soft); g.setFont (theme.ui (10, 600));
-    g.drawText ("Out", juce::Rectangle<float> (x - 2, r.getY() + 2, 30, 14), juce::Justification::centredLeft, false);
-    auto yM = [&] (float db) { return bot - (bot - top) * juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 66.0f); };
     for (int ch = 0; ch < 2; ++ch)
     {
-        const float xx = x + ch * (w + 4), v = ch == 0 ? meterL : meterR;
-        const auto track = juce::Rectangle<float> (xx, top, w, bot - top);
-        g.setColour (p.win); g.fillRoundedRectangle (track, 4);
+        const float v = ch == 0 ? meterL : meterR;
+        const auto track = juce::Rectangle<float> (area.getX(), area.getY() + ch * 8.0f, area.getWidth(), 4.0f);
+        g.setColour (p.rail); g.fillRoundedRectangle (track, 2);
         if (v > -60)
         {
-            const float yv = yM (v);
-            juce::ColourGradient grad (p.teal2, 0, bot, p.red, 0, top, false);
+            const float w = track.getWidth() * juce::jlimit (0.0f, 1.0f, (v + 60.0f) / 66.0f);
+            juce::ColourGradient grad (p.teal2, track.getX(), 0, p.red, track.getRight(), 0, false);
             grad.addColour (0.70, p.teal2);
             grad.addColour (0.82, p.orange);
             g.setGradientFill (grad);
-            juce::Path bar;   // départ arrondi, bout mobile coupé droit
-            bar.addRoundedRectangle (xx + 1, yv, w - 2, bot - 1 - yv, 3, 3, false, false, true, true);
-            g.fillPath (bar);
+            g.fillRoundedRectangle (track.withWidth (std::max (4.0f, w)), 2);
         }
-        g.setColour (p.rail); g.drawRoundedRectangle (track.reduced (0.5f), 4, 1.0f);
     }
 }
 
@@ -597,12 +677,12 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
     const String l1 = U ("Click on the curve to add a band"), l2 = U ("or right-click › Draw curve");
     {
         // voile discret derrière la consigne pour la lire par-dessus l'analyseur
-        juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (14, 600), l1, 0, 0);
+        juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (16, 600), l1, 0, 0);
         const float w = ga.getBoundingBox (0, -1, true).getWidth() + 28;
         g.setColour (p.surface.withAlpha (0.85f));
         g.fillRoundedRectangle (hint.withSizeKeepingCentre (w, 46).translated (0, 0.0f), 10);
     }
-    g.setColour (p.text); g.setFont (theme.ui (14, 600));
+    g.setColour (p.text); g.setFont (theme.ui (16, 600));
     g.drawText (l1, hint.removeFromTop (20), juce::Justification::centred, false);
     g.setColour (p.text2); g.setFont (theme.ui (12));
     g.drawText (l2, hint.withTrimmedTop (2), juce::Justification::centredTop, false);
@@ -613,7 +693,7 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
     juce::DropShadow (juce::Colours::black.withAlpha (0.55f), 32, { 0, 10 }).drawForPath (g, box);
     g.setColour (p.surface); g.fillPath (box);
     g.setColour (p.rail); g.strokePath (box, juce::PathStrokeType (1));
-    g.setColour (p.text); g.setFont (theme.ui (13, 600));
+    g.setColour (p.text); g.setFont (theme.ui (12, 600));
     g.drawText (U ("Gestures and shortcuts"), juce::Rectangle<float> (c.getX() + 16, c.getY() + 12, 240, 22), juce::Justification::centredLeft, false);
     auto x = helpClose();
     g.setColour (p.cap); g.fillEllipse (x);
@@ -629,11 +709,14 @@ void EqDisplay::paintEmpty (juce::Graphics& g)
         { "Alt + mouse wheel", "Dynamic EQ range" },
         { "Alt + click and hold", "Listen to the band alone" },
         { "Double-click", "Turn on / off" },
+        { "Double-click a knob", "Type a value (2k, A4, −3)" },
+        { "Alt + click a knob", "Default value" },
+        { "Click a spectrum peak", "New band on that peak" },
         { "Right-click", "Shape, slope, Mid/Side, drawing…" },
         { "Drag on empty space", "Multiple selection" },
         { "⌘Z · ⌘⇧Z", "Undo · redo" } };
     float y = c.getY() + 44;
-    const auto chipFont = theme.ui (11, 500), txtFont = theme.ui (11);
+    const auto chipFont = theme.ui (10, 500), txtFont = theme.ui (10);
     for (auto& row : rows)
     {
         const String k = U (row[0]);
@@ -660,11 +743,14 @@ void EqDisplay::paintReadout (juce::Graphics& g, int b)
     if (! s.active) l1 << U (" · off");
     String l2 = P::fmtHz ((float) s.freq);
     if (hasGain (s.shape)) l2 << U ("  ") << P::fmtDb ((float) s.gainDb) << " dB";
-    if (usesQ (s.shape, s.slope)) l2 << "  Q " << P::fmtQ ((float) s.q);
-    if (usesSlope (s.shape) && ! hasGain (s.shape)) l2 << U ("  ") << String (s.slope) << " dB/oct";
+    if (usesQ (s)) l2 << "  Q " << P::fmtQ ((float) s.q);
+    // (3.0 : Brickwall et pente libre des coupes)
+    if (isBrick (s)) l2 << U ("  Brickwall");
+    else if (isCut (s.shape) && s.slopeFree > 0.0) l2 << U ("  ") << String (cutSlope (s), 1) << " dB/oct";
+    else if (usesSlope (s.shape) && ! hasGain (s.shape)) l2 << U ("  ") << String (s.slope) << " dB/oct";
     l2 << U ("  ·  ") << noteName (midi) << String (noteOctave (midi)) << " " << (cents >= 0 ? "+" : "") << String (juce::roundToInt (cents)) << " ct";
-    juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (11, 600), l1, 0, 0);
-    juce::GlyphArrangement gb; gb.addLineOfText (theme.ui (11), l2, 0, 0);
+    juce::GlyphArrangement ga; ga.addLineOfText (theme.ui (10, 600), l1, 0, 0);
+    juce::GlyphArrangement gb; gb.addLineOfText (theme.ui (10), l2, 0, 0);
     const float w = std::max (ga.getBoundingBox (0, -1, true).getWidth(), gb.getBoundingBox (0, -1, true).getWidth()) + 20, h = 40;
     auto r = plot();
     float x = juce::jlimit (r.getX() + 4, r.getRight() - w - 4, pos.x - w / 2);
@@ -676,9 +762,9 @@ void EqDisplay::paintReadout (juce::Graphics& g, int b)
     g.setColour (p.cap); g.fillPath (bp);
     g.setColour (p.rail); g.strokePath (bp, juce::PathStrokeType (1));
     g.setColour (p.teal2); g.fillRoundedRectangle (box.getX() + 6, box.getY() + 8, 3, h - 16, 1.5f);
-    g.setColour (p.text); g.setFont (theme.ui (11, 600));
+    g.setColour (p.text); g.setFont (theme.ui (10, 600));
     g.drawText (l1, box.withTrimmedLeft (14).withHeight (20).translated (0, 2), juce::Justification::centredLeft, false);
-    g.setColour (p.text2); g.setFont (theme.ui (11));
+    g.setColour (p.text2); g.setFont (theme.ui (10));
     g.drawText (l2, box.withTrimmedLeft (14).withTrimmedTop (19).withHeight (17), juce::Justification::centredLeft, false);
 }
 
@@ -694,7 +780,7 @@ juce::Point<float> EqDisplay::nodePos (int b) const
 
 int EqDisplay::hitBand (juce::Point<float> pt) const
 {
-    int best = -1; float bd = 13.0f * 13.0f;
+    int best = -1; float bd = 14.0f * 14.0f;
     for (int b = maxBands; --b >= 0;)
     {
         if (! bandShown[(size_t) b]) continue;
@@ -762,23 +848,26 @@ void EqDisplay::endEdit()
 void EqDisplay::mouseMove (const juce::MouseEvent& e)
 {
     const int h = sketchMode ? -1 : hitBand (e.position);
-    if (h != hover) { hover = h; repaint(); }
+    const int gc = (sketchMode || h >= 0 || (helpShown() && helpCard().contains (e.position))) ? -1 : findPeak (e.position);
+    if (h != hover || gc != grabCol) { hover = h; grabCol = gc; repaint(); }
     if (sketchMode) setMouseCursor (juce::MouseCursor::CrosshairCursor);
     else if (rangeButton().contains (e.position) || (helpShown() && helpClose().expanded (4).contains (e.position))) setMouseCursor (juce::MouseCursor::PointingHandCursor);
     else if (helpShown() && helpCard().contains (e.position)) setMouseCursor (juce::MouseCursor::NormalCursor);
+    else if (grabCol >= 0) setMouseCursor (juce::MouseCursor::PointingHandCursor);
     else setMouseCursor (h >= 0 ? juce::MouseCursor::DraggingHandCursor
                                 : plot().contains (e.position) ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
 }
 
 void EqDisplay::mouseExit (const juce::MouseEvent&)
 {
-    if (hover >= 0) { hover = -1; repaint(); }
+    if (hover >= 0 || grabCol >= 0) { hover = -1; grabCol = -1; repaint(); }
 }
 
 void EqDisplay::mouseDown (const juce::MouseEvent& e)
 {
     grabKeyboardFocus();
     downPos = lastPos = e.position;
+    grabDown = grabCol;
     drag = Drag::none;
 
     if (rangeButton().contains (e.position))
@@ -903,16 +992,19 @@ void EqDisplay::mouseUp (const juce::MouseEvent& e)
     {
         // clic dans le vide : nouvelle bande (cloche ; coupe-bas / coupe-haut aux extrémités)
         auto r = plot();
-        const double f = fOf (e.position.x);
+        // clic sur une crête du spectre (« spectrum grab ») : cloche étroite à 0 dB, exactement sur la crête
+        const bool grab = grabDown >= 0;
+        const double f = grab ? peakFreq (grabDown) : fOf (e.position.x);
         const float rel = (e.position.x - r.getX()) / r.getWidth();
         Shape shape = Shape::bell;
-        if (rel < 0.035f) shape = Shape::lowCut;
-        else if (rel > 0.965f) shape = Shape::highCut;
+        if (! grab && rel < 0.035f) shape = Shape::lowCut;
+        else if (! grab && rel > 0.965f) shape = Shape::highCut;
         const double sc = std::max (0.01, proc.gainScale());
-        const float g = shape == Shape::bell ? (float) juce::jlimit (-30.0, 30.0, dbOf (e.position.y) / sc) : 0.0f;
+        const float g = grab ? 0.0f : shape == Shape::bell ? (float) juce::jlimit (-30.0, 30.0, dbOf (e.position.y) / sc) : 0.0f;
         proc.pushUndo();
         const int b = proc.createBand (shape, (float) juce::jlimit (fMin, fMax, f),
-                                       std::abs (g) < 0.15f ? 0.0f : g, shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
+                                       std::abs (g) < 0.15f ? 0.0f : g, grab ? 4.0f : shape == Shape::bell ? 1.0f : 0.71f, shape == Shape::bell ? 12 : 24);
+        grabCol = grabDown = -1;
         if (b < 0) { if (onMessage) onMessage (U ("All 24 bands are in use")); return; }
         createdBand = b; createdAt = juce::Time::getMillisecondCounter();
         select (b);
@@ -1006,6 +1098,9 @@ void EqDisplay::showBandMenu (int b, juce::Point<float>)
     m.addItem (on ? U ("Turn off") : U ("Turn on"), [apply, on] { apply (P::fOn, on ? 0.0f : 1.0f); });
     const bool dyn = proc.bandValue (b, P::fDyn) > 0.5f;
     m.addItem (U ("Dynamic EQ"), canBeDynamic (shape), dyn, [apply, dyn] { apply (P::fDyn, dyn ? 0.0f : 1.0f); });
+    // 3.0 : seuil automatique (le seuil suit le niveau moyen de la bande)
+    const bool thrAuto = proc.bandValue (b, P::fThrAuto) > 0.5f;
+    m.addItem (U ("Auto threshold"), canBeDynamic (shape) && dyn, thrAuto, [apply, thrAuto] { apply (P::fThrAuto, thrAuto ? 0.0f : 1.0f); });
     m.addItem (U ("Listen to this band"), true, proc.getSolo() == b, [safe, b]
     {
         if (safe != nullptr) { safe->proc.setSolo (safe->proc.getSolo() == b ? -1 : b); safe->refresh(); if (safe->onSelectionChanged) safe->onSelectionChanged(); }

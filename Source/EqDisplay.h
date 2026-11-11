@@ -44,10 +44,12 @@ public:
     std::function<void()> onCurvesChanged;   // poignées déplacées : le panneau flottant suit
 
     static constexpr double fMin = 20.0, fMax = 20000.0;
-    static constexpr float rightGutter = 72.0f, bottomGutter = 24.0f;
-    // Échelle dB comme Pro-Q : 0 dB au-dessus du milieu (y = 216 sur 520) pour laisser la place
-    // au panneau de bande en bas ; vers −7 dB la courbe passe derrière le panneau, la grille continue.
-    static constexpr float curveTop = 12.0f, curveBottom = 420.0f;
+    static constexpr float rightGutter = 0.0f, bottomGutter = 24.0f;
+    // 3.0 : écran 1072 × 400, 0 dB au centre (y = 200), 16 px par dB à ±12 dB (2 modules de 8 px)
+    static constexpr float curveTop = 8.0f, curveBottom = 392.0f;
+    // niveaux de sortie, dessinés dans la barre du bas (deux barres horizontales)
+    void paintMeters (juce::Graphics&, juce::Rectangle<float> area) const;
+    std::function<void()> onMeters;
     void paintNode (juce::Graphics&, int band) const;
     int hitBandAt (juce::Point<float> p) const { return hitBand (p); }
 
@@ -62,6 +64,21 @@ public:
         fitSketch();
     }
     void testHover (int b) { hover = b; repaint(); }
+    // tests : place le curseur sur la crête du spectre la plus haute ; rend sa fréquence (0 = aucune crête)
+    double testGrab()
+    {
+        auto r = plot(); int best = -1; float top = -200.0f;
+        for (int i = 8; i < numCols - 8; ++i)
+        {
+            const float v = anPost[(size_t) i];
+            const int c = findPeak ({ r.getX() + i + 0.5f, yAn (v) });
+            if (c == i && v > top) { top = v; best = i; }
+        }
+        grabCol = best; repaint();
+        return best < 0 ? 0.0 : peakFreq (best);
+    }
+    double testGrabNear (juce::Point<float> pos) const { const int c = findPeak (pos); return c < 0 ? 0.0 : peakFreq (c); }
+    juce::Point<float> testGrabPos() const { auto r = plot(); return { r.getX() + grabCol + 0.5f, yAn (anPost[(size_t) std::max (0, grabCol)]) }; }
 
 private:
     void timerCallback() override;
@@ -90,7 +107,6 @@ private:
     void paintAnalyzer (juce::Graphics&, const std::vector<float>& col, juce::Colour c, bool fill);
     void paintPiano (juce::Graphics&);
     void paintReadout (juce::Graphics&, int band);
-    void paintMeters (juce::Graphics&);
 
     Theme& theme;
     AudioLabEqProcessor& proc;
@@ -111,6 +127,11 @@ private:
     juce::dsp::FFT fft { fftOrder };
     std::vector<float> fftBuf, window;
     std::vector<float> anPre, anPost;
+    // « spectrum grab » : crête du spectre sous le curseur (colonne, −1 = aucune) ; un clic y pose une cloche
+    int grabCol = -1, grabDown = -1;
+    int findPeak (juce::Point<float> pos) const;
+    double peakFreq (int col) const;   // fréquence de la crête, affinée entre colonnes (parabole sur les dB)
+    void paintGrab (juce::Graphics&);
     bool analyzerLive = false;
     void analyse (const AudioLabEqProcessor::Tap& tap, std::vector<float>& col);
 
