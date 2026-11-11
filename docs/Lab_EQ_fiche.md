@@ -6,8 +6,8 @@ charte UI V2 (fiche 02). Fenêtre 1120 × 640, redimensionnable de 60 % à 200 %
 
 ## 3.0.0 (10/11/2026) : précision mesurée et nouvelle interface
 
-État au 10/11/2026 : terminée sur la branche `v3` du dépôt, fabriquée et validée sur GitHub
-(Mac, Windows, Linux). Pas encore publiée ni installée : la publication attend l'accord de Ludovic.
+Publiée le 11/11/2026 (release v3.0.0 sur GitHub, fabriquée et validée sur Mac, Windows et Linux),
+installée sur le Mac de Ludovic en VST3 et AU. L'AAX reste à construire sur le Mac.
 
 Aucune écoute n'a été faite pendant ce travail. Tout ce qui suit est mesuré par le banc de tests.
 Aucune supériorité sonore sur un autre égaliseur n'est affirmée ; le protocole d'écoute en aveugle
